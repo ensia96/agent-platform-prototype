@@ -4,11 +4,29 @@ import { RunWriter } from "./run-writer";
 import type { ProviderAdapter, ProviderMessage, ProviderRunInput } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
 import type { StoreAdapter } from "../store/types";
-import type { CreateRunResponse, Message, Run, RunEvent, RunEventType, Session } from "../shared/types";
+import type {
+  CreateRunResponse,
+  JsonObject,
+  Message,
+  ProviderProfile,
+  ProviderResolution,
+  Run,
+  RunEvent,
+  RunEventType,
+  RunOptions,
+  Session
+} from "../shared/types";
 
 export interface StartRunOptions {
   provider?: string;
   providerProfileId?: string;
+  runOptions?: RunOptions;
+}
+
+interface RunOptionPlan {
+  requestedRunOptions: RunOptions;
+  runOptions: RunOptions;
+  unsupportedRunOptions: string[];
 }
 
 export class KernelError extends Error {
@@ -79,6 +97,12 @@ export class Kernel {
     }
 
     const resolvedProvider = this.providers.resolveRun(options);
+    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, options.runOptions ?? {});
+    const providerResolution: ProviderResolution = {
+      ...resolvedProvider.providerResolution,
+      model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
+    };
+    const runMetadata = buildRunMetadata(providerResolution, optionPlan);
     const now = new Date().toISOString();
     const run = this.store.createRun({
       id: randomUUID(),
@@ -86,7 +110,8 @@ export class Kernel {
       provider: resolvedProvider.profile.id,
       status: "running",
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      metadata: runMetadata
     });
     this.store.touchSession(sessionId, now);
 
@@ -116,7 +141,8 @@ export class Kernel {
       role: "assistant",
       status: "streaming",
       createdAt: assistantCreatedAt,
-      updatedAt: assistantCreatedAt
+      updatedAt: assistantCreatedAt,
+      metadata: runMetadata
     });
 
     const userMessageWithParts = this.store.getMessage(userMessage.id)!;
@@ -129,7 +155,11 @@ export class Kernel {
       providerProfileId: resolvedProvider.profile.id,
       requestedProvider: options.provider ?? null,
       requestedProviderProfileId: options.providerProfileId ?? null,
-      providerResolution: resolvedProvider.providerResolution
+      providerResolution,
+      requestedRunOptions: optionPlan.requestedRunOptions,
+      runOptions: optionPlan.runOptions,
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions,
+      model: optionPlan.runOptions.model ?? null
     });
     this.emit(run, "user_message_created", { message: userMessageWithParts });
     this.emit(run, "assistant_message_created", { message: assistantMessageWithParts });
@@ -148,7 +178,10 @@ export class Kernel {
       sourceMessages: this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id),
       messages: toProviderMessages(this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id)),
       profile: resolvedProvider.profile,
-      credential: resolvedProvider.credential
+      credential: resolvedProvider.credential,
+      requestedRunOptions: optionPlan.requestedRunOptions,
+      runOptions: optionPlan.runOptions,
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions
     };
 
     queueMicrotask(() => {
@@ -159,7 +192,12 @@ export class Kernel {
       run,
       provider: resolvedProvider.adapter.id,
       providerProfileId: resolvedProvider.profile.id,
-      providerResolution: resolvedProvider.providerResolution,
+      providerResolution,
+      model: optionPlan.runOptions.model ?? null,
+      runOptions: optionPlan.runOptions,
+      requestedRunOptions: optionPlan.requestedRunOptions,
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions,
+      usage: null,
       assistantMessageId: assistantMessage.id
     };
   }
@@ -248,6 +286,133 @@ export class Kernel {
     this.eventBus.publish(event);
     return event;
   }
+}
+
+function buildRunOptionPlan(profile: ProviderProfile, requested: RunOptions): RunOptionPlan {
+  const requestedRunOptions = cleanRunOptions(requested);
+  const runOptions: RunOptions = {};
+  const unsupportedRunOptions: string[] = [];
+  const defaultModel = profile.defaultRunOptions?.model?.trim() || profile.model?.trim();
+
+  if (profile.type === "openai-compatible") {
+    const model = requestedRunOptions.model ?? defaultModel;
+    if (model) {
+      runOptions.model = model;
+    }
+    if (requestedRunOptions.temperature !== undefined) {
+      runOptions.temperature = requestedRunOptions.temperature;
+    }
+    if (requestedRunOptions.reasoningEffort) {
+      unsupportedRunOptions.push("reasoningEffort");
+    }
+    return { requestedRunOptions, runOptions, unsupportedRunOptions };
+  }
+
+  if (profile.type === "openai-chatgpt") {
+    const model = requestedRunOptions.model ?? defaultModel;
+    if (model) {
+      runOptions.model = model;
+    }
+    if (requestedRunOptions.temperature !== undefined) {
+      unsupportedRunOptions.push("temperature");
+    }
+    if (requestedRunOptions.reasoningEffort) {
+      unsupportedRunOptions.push("reasoningEffort");
+    }
+    return { requestedRunOptions, runOptions, unsupportedRunOptions };
+  }
+
+  if (requestedRunOptions.model) {
+    unsupportedRunOptions.push("model");
+  }
+  if (requestedRunOptions.temperature !== undefined) {
+    unsupportedRunOptions.push("temperature");
+  }
+  if (requestedRunOptions.reasoningEffort) {
+    unsupportedRunOptions.push("reasoningEffort");
+  }
+  return { requestedRunOptions, runOptions, unsupportedRunOptions };
+}
+
+function cleanRunOptions(options: RunOptions): RunOptions {
+  const output: RunOptions = {};
+  const model = options.model?.trim();
+  if (model) {
+    output.model = model;
+  }
+  if (options.reasoningEffort) {
+    output.reasoningEffort = options.reasoningEffort;
+  }
+  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
+    output.temperature = options.temperature;
+  }
+  return output;
+}
+
+function buildRunMetadata(providerResolution: ProviderResolution, optionPlan: RunOptionPlan): JsonObject {
+  const metadata: JsonObject = {
+    providerProfileId: providerResolution.providerProfileId,
+    providerProfileName: providerResolution.providerProfileName,
+    providerType: providerResolution.providerType,
+    requestedProvider: providerResolution.requestedProvider,
+    requestedProviderProfileId: providerResolution.requestedProviderProfileId,
+    providerResolution: providerResolutionToJson(providerResolution),
+    runOptions: runOptionsToJson(optionPlan.runOptions),
+    requestedRunOptions: runOptionsToJson(optionPlan.requestedRunOptions),
+    unsupportedRunOptions: optionPlan.unsupportedRunOptions
+  };
+
+  if (providerResolution.model) {
+    metadata.model = providerResolution.model;
+  }
+  if (optionPlan.unsupportedRunOptions.length > 0) {
+    metadata.optionSupportNote = "Unsupported run options are recorded as metadata only and are not sent to the provider.";
+  }
+  return metadata;
+}
+
+function providerResolutionToJson(resolution: ProviderResolution): JsonObject {
+  const output: JsonObject = {
+    requestedProvider: resolution.requestedProvider,
+    requestedProviderProfileId: resolution.requestedProviderProfileId,
+    providerProfileId: resolution.providerProfileId,
+    providerProfileName: resolution.providerProfileName,
+    providerType: resolution.providerType,
+    fallback: resolution.fallback ? fallbackToJson(resolution.fallback) : null
+  };
+  if (resolution.model) {
+    output.model = resolution.model;
+  }
+  if (resolution.baseUrl) {
+    output.baseUrl = resolution.baseUrl;
+  }
+  if (resolution.credentialRef) {
+    output.credentialRef = resolution.credentialRef;
+  }
+  return output;
+}
+
+function fallbackToJson(fallback: NonNullable<ProviderResolution["fallback"]>): JsonObject {
+  return {
+    fromProviderProfileId: fallback.fromProviderProfileId,
+    toProviderProfileId: fallback.toProviderProfileId,
+    reason: fallback.reason,
+    message: fallback.message
+  };
+}
+
+function runOptionsToJson(options: RunOptions): JsonObject {
+  const output: JsonObject = {};
+  if (options.model) {
+    output.model = options.model;
+  }
+  if (options.reasoningEffort) {
+    output.reasoningEffort = options.reasoningEffort;
+  }
+  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
+    output.temperature = options.temperature;
+  }
+  return output;
 }
 
 function toProviderMessages(messages: Message[]): ProviderMessage[] {

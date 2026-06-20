@@ -27,6 +27,7 @@ export interface CreateRunInput {
   createdAt: ISODateString;
   updatedAt: ISODateString;
   error?: string | null;
+  metadata?: JsonObject;
 }
 
 export interface CreateMessageInput {
@@ -37,6 +38,7 @@ export interface CreateMessageInput {
   status: MessageStatus;
   createdAt: ISODateString;
   updatedAt: ISODateString;
+  metadata?: JsonObject;
 }
 
 export interface AddMessagePartInput {
@@ -73,6 +75,7 @@ export interface StoreAdapter {
   createRun(input: CreateRunInput): Run;
   getRun(id: string): Run | null;
   updateRunStatus(id: string, status: RunStatus, error: string | null, updatedAt: ISODateString): void;
+  mergeRunMetadata(id: string, metadata: JsonObject, updatedAt: ISODateString): void;
 
   listMessages(sessionId: string): Message[];
   getMessage(id: string): Message | null;
@@ -81,6 +84,7 @@ export interface StoreAdapter {
   addMessagePart(input: AddMessagePartInput): void;
   upsertMessageTextPart(input: UpsertMessageTextPartInput): void;
   updateMessageStatus(id: string, status: MessageStatus, updatedAt: ISODateString, error?: string | null): void;
+  mergeMessageMetadata(id: string, metadata: JsonObject, updatedAt: ISODateString): void;
 
   appendEvent(input: AppendEventInput): RunEvent;
   listEvents(runId: string): RunEvent[];

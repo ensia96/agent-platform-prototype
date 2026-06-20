@@ -7,6 +7,7 @@ export type MessageRole = "system" | "user" | "assistant";
 export type MessagePartType = "text";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
 export type RunStatus = "running" | "completed" | "cancelled" | "failed";
+export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ProviderProfileType = "openai-compatible" | "openai-chatgpt" | "mock";
 export type ProviderProfileSource = "env" | "builtin" | "user";
 export type ProviderCredentialStatus = "present" | "missing" | "expired" | "not_required";
@@ -23,6 +24,27 @@ export type ProviderVendor = "openai" | "local";
 export type ProviderRuntime = "openai-compatible" | "chatgpt-codex" | "mock";
 export type ProviderAuthMode = "env-api-key" | "oauth-device" | "oauth-browser" | "none";
 export type ProviderBillingSource = "platform-api" | "consumer-subscription" | "local" | "third-party" | "unknown";
+export type RunOptionSupport = "supported" | "metadata-only" | "unsupported" | "provider-reported" | "unknown";
+
+export interface RunOptions {
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  temperature?: number;
+}
+
+export interface RunUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
+}
+
+export interface ProviderRunOptionSupport {
+  model: RunOptionSupport;
+  reasoningEffort: RunOptionSupport;
+  temperature: RunOptionSupport;
+  usage: RunOptionSupport;
+}
 
 export interface Session {
   id: string;
@@ -48,6 +70,10 @@ export interface Message {
   role: MessageRole;
   status: MessageStatus;
   error: string | null;
+  metadata: JsonObject;
+  model: string | null;
+  runOptions: RunOptions | null;
+  usage: RunUsage | null;
   createdAt: ISODateString;
   updatedAt: ISODateString;
   parts: MessagePart[];
@@ -58,6 +84,10 @@ export interface Run {
   sessionId: string;
   provider: string;
   status: RunStatus;
+  metadata: JsonObject;
+  model: string | null;
+  runOptions: RunOptions | null;
+  usage: RunUsage | null;
   createdAt: ISODateString;
   updatedAt: ISODateString;
   error: string | null;
@@ -86,6 +116,8 @@ export interface CreateRunRequest {
   text: string;
   provider?: string;
   providerProfileId?: string;
+  options?: RunOptions;
+  runOptions?: RunOptions;
 }
 
 export interface ProviderFallbackInfo {
@@ -112,6 +144,11 @@ export interface CreateRunResponse {
   provider: string;
   providerProfileId: string;
   providerResolution: ProviderResolution;
+  model: string | null;
+  runOptions: RunOptions;
+  requestedRunOptions: RunOptions;
+  unsupportedRunOptions: string[];
+  usage: RunUsage | null;
   assistantMessageId: string;
 }
 
@@ -147,6 +184,8 @@ export interface ProviderProfile {
   baseUrl?: string;
   endpoint?: string;
   model?: string;
+  defaultRunOptions?: RunOptions;
+  runOptionSupport?: ProviderRunOptionSupport;
   credentialRef?: string;
   experimental?: boolean;
   status: ProviderStatus;

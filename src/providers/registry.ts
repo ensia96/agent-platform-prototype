@@ -285,6 +285,12 @@ function createDefaultProfiles(env: NodeJS.ProcessEnv): ProviderProfile[] {
       billingSource: "local",
       source: "builtin",
       enabled: true,
+      runOptionSupport: {
+        model: "unsupported",
+        reasoningEffort: "metadata-only",
+        temperature: "unsupported",
+        usage: "unsupported"
+      },
       status: {
         state: "available",
         message: "Local mock provider is available and does not require credentials.",
@@ -303,6 +309,13 @@ function createDefaultProfiles(env: NodeJS.ProcessEnv): ProviderProfile[] {
       enabled: true,
       baseUrl: openAIBaseUrl,
       model: openAIModel,
+      defaultRunOptions: { model: openAIModel },
+      runOptionSupport: {
+        model: "supported",
+        reasoningEffort: "metadata-only",
+        temperature: "supported",
+        usage: "provider-reported"
+      },
       credentialRef: "env:OPENAI_API_KEY",
       status: {
         state: hasOpenAIKey ? "configured" : "missing_credential",
@@ -325,6 +338,13 @@ function createDefaultProfiles(env: NodeJS.ProcessEnv): ProviderProfile[] {
       enabled: true,
       endpoint: openAIChatGPTEndpoint,
       model: openAIChatGPTModel,
+      defaultRunOptions: { model: openAIChatGPTModel },
+      runOptionSupport: {
+        model: "supported",
+        reasoningEffort: "metadata-only",
+        temperature: "unsupported",
+        usage: "provider-reported"
+      },
       credentialRef: openAIChatGPTCredentialRef,
       experimental: true,
       status: {

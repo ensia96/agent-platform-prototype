@@ -11,6 +11,9 @@ import type {
   ProviderProfile,
   ProviderResolution,
   ProviderTestResponse,
+  ReasoningEffort,
+  RunOptions,
+  RunUsage,
   RunEvent,
   Session
 } from "../shared/types";
@@ -25,7 +28,13 @@ export function App() {
   const [input, setInput] = useState("");
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [providerProfileId, setProviderProfileId] = useState("");
+  const [modelOverride, setModelOverride] = useState("");
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
+  const [temperature, setTemperature] = useState("");
   const [lastProviderResolution, setLastProviderResolution] = useState<ProviderResolution | null>(null);
+  const [lastRunOptions, setLastRunOptions] = useState<RunOptions | null>(null);
+  const [lastRunUsage, setLastRunUsage] = useState<RunUsage | null>(null);
+  const [lastUnsupportedRunOptions, setLastUnsupportedRunOptions] = useState<string[]>([]);
   const [providerNotice, setProviderNotice] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
@@ -108,6 +117,7 @@ export function App() {
     setError(null);
     let sessionId = selectedSessionId;
     try {
+      const runOptions = buildRunOptionsFromForm(modelOverride, reasoningEffort, temperature);
       if (!sessionId) {
         const session = await requestJson<Session>("/api/sessions", { method: "POST" });
         setSessions((current) => [session, ...current]);
@@ -119,9 +129,16 @@ export function App() {
       const response = await requestJson<CreateRunResponse>(`/api/sessions/${sessionId}/runs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, providerProfileId: providerProfileId || undefined })
+        body: JSON.stringify({
+          text,
+          providerProfileId: providerProfileId || undefined,
+          runOptions: hasRunOptions(runOptions) ? runOptions : undefined
+        })
       });
       setLastProviderResolution(response.providerResolution);
+      setLastRunOptions(response.runOptions);
+      setLastRunUsage(response.usage);
+      setLastUnsupportedRunOptions(response.unsupportedRunOptions);
       setProviderNotice(providerResolutionNotice(response.providerResolution));
       setActiveRunId(response.run.id);
       openRunEvents(response.run.id);
@@ -175,11 +192,18 @@ export function App() {
 
   function applyRunEvent(event: RunEvent) {
     if (event.type === "run_started") {
-      const payload = event.payload as { providerResolution?: ProviderResolution };
+      const payload = event.payload as {
+        providerResolution?: ProviderResolution;
+        runOptions?: RunOptions;
+        unsupportedRunOptions?: string[];
+      };
       if (payload.providerResolution) {
         setLastProviderResolution(payload.providerResolution);
         setProviderNotice(providerResolutionNotice(payload.providerResolution));
       }
+      setLastRunOptions(payload.runOptions ?? null);
+      setLastRunUsage(null);
+      setLastUnsupportedRunOptions(payload.unsupportedRunOptions ?? []);
       return;
     }
 
@@ -200,7 +224,10 @@ export function App() {
     }
 
     if (event.type === "run_completed" || event.type === "run_cancelled" || event.type === "run_failed") {
-      const payload = event.payload as { messageId?: string; error?: string };
+      const payload = event.payload as { messageId?: string; error?: string; metadata?: Message["metadata"]; usage?: RunUsage };
+      if (payload.usage) {
+        setLastRunUsage(payload.usage);
+      }
       if (payload.messageId) {
         setMessages((current) =>
           current.map((message) =>
@@ -209,7 +236,9 @@ export function App() {
                   ...message,
                   status:
                     event.type === "run_completed" ? "completed" : event.type === "run_cancelled" ? "cancelled" : "failed",
-                  error: event.type === "run_failed" ? payload.error ?? message.error ?? "Run failed without an error message." : null
+                  error: event.type === "run_failed" ? payload.error ?? message.error ?? "Run failed without an error message." : null,
+                  metadata: payload.metadata ? { ...message.metadata, ...payload.metadata } : message.metadata,
+                  usage: payload.usage ?? message.usage ?? null
                 }
               : message
           )
@@ -306,37 +335,85 @@ export function App() {
             <h2>{selectedSession?.title ?? "No session"}</h2>
             <p className="muted">SQLite-backed local chat with SSE streaming.</p>
           </div>
-          <div className="providerPicker">
-            <label>
-              Provider
-              <select
-                value={providerProfileId || "mock"}
-                onChange={(event) => {
-                  setProviderProfileId(event.target.value);
-                  setProviderNotice(null);
-                }}
-                disabled={Boolean(activeRunId)}
-              >
-                {providers.length > 0 ? (
-                  providers.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {providerOptionLabel(profile)}
-                    </option>
-                  ))
-                ) : (
-                  <>
-                    <option value="mock">mock</option>
-                    <option value="openai-compatible">openai-compatible</option>
-                  </>
-                )}
-              </select>
-            </label>
-            {selectedProviderProfile && (
-              <p className="muted providerSummary">
-                {selectedProviderProfile.type}
-                {selectedProviderProfile.model ? ` · ${selectedProviderProfile.model}` : ""} · {selectedProviderProfile.status.state}
+          <div className="chatControls">
+            <div className="providerPicker">
+              <label>
+                Provider
+                <select
+                  value={providerProfileId || "mock"}
+                  onChange={(event) => {
+                    setProviderProfileId(event.target.value);
+                    setModelOverride("");
+                    setReasoningEffort("");
+                    setTemperature("");
+                    setProviderNotice(null);
+                  }}
+                  disabled={Boolean(activeRunId)}
+                >
+                  {providers.length > 0 ? (
+                    providers.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {providerOptionLabel(profile)}
+                      </option>
+                    ))
+                  ) : (
+                    <>
+                      <option value="mock">mock</option>
+                      <option value="openai-compatible">openai-compatible</option>
+                    </>
+                  )}
+                </select>
+              </label>
+              {selectedProviderProfile && (
+                <p className="muted providerSummary">
+                  {selectedProviderProfile.type}
+                  {selectedProviderProfile.model ? ` · default ${selectedProviderProfile.model}` : ""} · {selectedProviderProfile.status.state}
+                </p>
+              )}
+            </div>
+
+            <div className="runOptionsPanel" aria-label="Run options">
+              <label>
+                Model override
+                <input
+                  value={modelOverride}
+                  onChange={(event) => setModelOverride(event.target.value)}
+                  placeholder={selectedProviderProfile?.model ?? "provider default"}
+                  disabled={Boolean(activeRunId)}
+                />
+              </label>
+              <label>
+                Reasoning effort
+                <select
+                  value={reasoningEffort}
+                  onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort | "")}
+                  disabled={Boolean(activeRunId)}
+                >
+                  <option value="">provider/default</option>
+                  <option value="minimal">minimal</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                  <option value="xhigh">xhigh</option>
+                </select>
+              </label>
+              <label>
+                Temperature
+                <input
+                  type="number"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={temperature}
+                  onChange={(event) => setTemperature(event.target.value)}
+                  placeholder="default"
+                  disabled={Boolean(activeRunId)}
+                />
+              </label>
+              <p className="muted runOptionsNote">
+                Experimental: unsupported options are kept as metadata only. Raw thinking is not stored or shown.
               </p>
-            )}
+            </div>
           </div>
         </header>
 
@@ -346,6 +423,9 @@ export function App() {
             <div className="providerRunMeta">
               Last run: {lastProviderResolution.providerProfileName} ({lastProviderResolution.providerType}
               {lastProviderResolution.model ? ` · ${lastProviderResolution.model}` : ""})
+              {formatRunOptions(lastRunOptions) ? ` · options: ${formatRunOptions(lastRunOptions)}` : ""}
+              {lastUnsupportedRunOptions.length > 0 ? ` · metadata-only: ${lastUnsupportedRunOptions.join(", ")}` : ""}
+              {lastRunUsage ? ` · usage: ${formatUsage(lastRunUsage)}` : ""}
             </div>
           )}
           {error && <div className="error">{error}</div>}
@@ -409,8 +489,17 @@ function MessageBody({ message }: { message: Message }) {
         </div>
       )}
       {text && <pre>{text}</pre>}
+      {message.usage && <UsageSummary usage={message.usage} />}
     </>
   );
+}
+
+function UsageSummary({ usage }: { usage: RunUsage }) {
+  const summary = formatUsage(usage);
+  if (!summary) {
+    return null;
+  }
+  return <div className="usageSummary">Usage: {summary}</div>;
 }
 
 function SettingsPanel() {
@@ -637,8 +726,20 @@ function SettingsPanel() {
                     </dd>
                     {profile.model && (
                       <>
-                        <dt>Model</dt>
+                        <dt>Default model</dt>
                         <dd>{profile.model}</dd>
+                      </>
+                    )}
+                    {profile.defaultRunOptions && (
+                      <>
+                        <dt>Default options</dt>
+                        <dd>{formatRunOptions(profile.defaultRunOptions) || "none"}</dd>
+                      </>
+                    )}
+                    {profile.runOptionSupport && (
+                      <>
+                        <dt>Run options</dt>
+                        <dd>{formatRunOptionSupport(profile.runOptionSupport)}</dd>
                       </>
                     )}
                     {profile.baseUrl && (
@@ -655,6 +756,11 @@ function SettingsPanel() {
                     )}
                   </dl>
                   <p className="muted">{profile.status.message}</p>
+                  {isOpenAIChatGPT && (
+                    <p className="muted">
+                      Experimental ChatGPT/Codex OAuth runtime; billing and quota come from the consumer subscription channel.
+                    </p>
+                  )}
                   <div className="providerActions">
                     <button onClick={() => void testProvider(profile.id)} disabled={testingProviderId === profile.id}>
                       {testingProviderId === profile.id ? "Testing..." : "Test connection"}
@@ -758,6 +864,64 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 function providerOptionLabel(profile: ProviderProfile): string {
   const model = profile.model ? ` · ${profile.model}` : "";
   return `${profile.name}${model} · ${profile.status.state}`;
+}
+
+function buildRunOptionsFromForm(modelOverride: string, reasoningEffort: ReasoningEffort | "", temperature: string): RunOptions {
+  const runOptions: RunOptions = {};
+  const model = modelOverride.trim();
+  if (model) {
+    runOptions.model = model;
+  }
+  if (reasoningEffort) {
+    runOptions.reasoningEffort = reasoningEffort;
+  }
+  const temperatureText = temperature.trim();
+  if (temperatureText) {
+    const parsedTemperature = Number(temperatureText);
+    if (!Number.isFinite(parsedTemperature) || parsedTemperature < 0 || parsedTemperature > 2) {
+      throw new Error("Temperature must be a number between 0 and 2.");
+    }
+    runOptions.temperature = parsedTemperature;
+  }
+  return runOptions;
+}
+
+function hasRunOptions(options: RunOptions): boolean {
+  return Boolean(options.model || options.reasoningEffort || options.temperature !== undefined);
+}
+
+function formatRunOptions(options: RunOptions | null | undefined): string {
+  if (!options) {
+    return "";
+  }
+  const parts = [
+    options.model ? `model=${options.model}` : "",
+    options.reasoningEffort ? `reasoning=${options.reasoningEffort}` : "",
+    options.temperature !== undefined ? `temperature=${options.temperature}` : ""
+  ].filter(Boolean);
+  return parts.join(", ");
+}
+
+function formatUsage(usage: RunUsage | null | undefined): string {
+  if (!usage) {
+    return "";
+  }
+  const parts = [
+    usage.inputTokens !== undefined ? `input ${usage.inputTokens}` : "",
+    usage.outputTokens !== undefined ? `output ${usage.outputTokens}` : "",
+    usage.reasoningTokens !== undefined ? `reasoning ${usage.reasoningTokens}` : "",
+    usage.totalTokens !== undefined ? `total ${usage.totalTokens}` : ""
+  ].filter(Boolean);
+  return parts.join(" / ");
+}
+
+function formatRunOptionSupport(support: NonNullable<ProviderProfile["runOptionSupport"]>): string {
+  return [
+    `model ${support.model}`,
+    `reasoning ${support.reasoningEffort}`,
+    `temperature ${support.temperature}`,
+    `usage ${support.usage}`
+  ].join(" · ");
 }
 
 function providerResolutionNotice(resolution: ProviderResolution): string | null {

@@ -93,7 +93,7 @@ Useful environment variables:
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/runs` body `{ "text": "...", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt" }`
+- `POST /api/sessions/:id/runs` body `{ "text": "...", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
 
@@ -108,6 +108,16 @@ OPENAI_MODEL=gpt-4o-mini
 ```
 
 Then send runs with provider profile `openai-compatible` from the UI selector or API. Use `GET /api/providers` or the Settings → Providers panel to inspect profile status and run a `/models` connection test.
+
+### Run options and usage visibility
+
+Chat runs accept optional `runOptions` (or legacy-compatible `options`) for model override, reasoning effort, and temperature. Provider support is intentionally conservative:
+
+- `openai-compatible`: model override and temperature are sent to `/chat/completions`; reasoning effort is recorded in run metadata only unless a future profile capability explicitly supports it.
+- `openai-chatgpt`: model override is sent to the experimental ChatGPT/Codex payload; reasoning effort and temperature are currently metadata-only/unsupported to avoid breaking the known-good backend contract.
+- `mock`: options are accepted for UI/API consistency but are not sent to a model runtime.
+
+If a provider response or stream includes usage metadata, the daemon normalizes and stores available `inputTokens`, `outputTokens`, `reasoningTokens`, and `totalTokens`, then displays them in the Chat UI. The prototype does **not** store or render raw chain-of-thought/thinking text; only provider-reported usage/reasoning token counts or future provider-provided summaries should be surfaced.
 
 ### Experimental OpenAI ChatGPT/Codex OAuth profile
 

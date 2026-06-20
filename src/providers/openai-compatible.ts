@@ -1,4 +1,5 @@
 import type { ProviderAdapter, ProviderRunContext, ProviderRunInput } from "./types";
+import { extractRunUsage } from "./usage";
 import type { ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
 
 const defaultBaseUrl = "https://api.openai.com/v1";
@@ -127,10 +128,22 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
   async run(input: ProviderRunInput, context: ProviderRunContext): Promise<void> {
     const apiKey = input.credential.apiKey?.trim() ?? "";
     const baseUrl = getBaseUrl(input.profile);
-    const model = getModel(input.profile);
+    const model = getRunModel(input);
 
     if (!apiKey) {
       throw new Error(`${credentialRefLabel(input.profile)} is required for the openai-compatible provider`);
+    }
+
+    const requestBody: Record<string, unknown> = {
+      model,
+      stream: true,
+      messages: input.messages.map((message) => ({
+        role: message.role,
+        content: message.content
+      }))
+    };
+    if (typeof input.runOptions.temperature === "number" && Number.isFinite(input.runOptions.temperature)) {
+      requestBody.temperature = input.runOptions.temperature;
     }
 
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -139,14 +152,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model,
-        stream: true,
-        messages: input.messages.map((message) => ({
-          role: message.role,
-          content: message.content
-        }))
-      }),
+      body: JSON.stringify(requestBody),
       signal: context.signal
     });
 
@@ -225,6 +231,7 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext): Pr
       delta?: { content?: string };
       text?: string;
     }>;
+    usage?: unknown;
   };
 
   let parsed: OpenAIStreamEvent;
@@ -233,6 +240,11 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext): Pr
     parsed = JSON.parse(data) as OpenAIStreamEvent;
   } catch (error) {
     throw new Error(`Failed to parse OpenAI-compatible SSE event: ${trimForDisplay(data)} (${toErrorMessage(error)})`);
+  }
+
+  const usage = extractRunUsage(parsed);
+  if (usage) {
+    await context.writer.writeUsage(usage);
   }
 
   for (const choice of parsed.choices ?? []) {
@@ -255,6 +267,10 @@ function getBaseUrl(profile: ProviderProfile): string {
 
 function getModel(profile: ProviderProfile): string {
   return profile.model?.trim() || defaultModel;
+}
+
+function getRunModel(input: ProviderRunInput): string {
+  return input.runOptions.model?.trim() || getModel(input.profile);
 }
 
 function credentialRefLabel(profile: ProviderProfile): string {

@@ -1,4 +1,4 @@
-import type { Message, ProviderProfile, ProviderTestResponse, Session } from "../shared/types";
+import type { JsonObject, Message, ProviderProfile, ProviderTestResponse, RunOptions, RunUsage, Session } from "../shared/types";
 
 export interface ProviderMessage {
   role: "system" | "user" | "assistant";
@@ -11,6 +11,9 @@ export interface ProviderRunInput {
   sourceMessages: Message[];
   profile: ProviderProfile;
   credential: ProviderCredential;
+  requestedRunOptions: RunOptions;
+  runOptions: RunOptions;
+  unsupportedRunOptions: string[];
 }
 
 export interface ProviderCredential {
@@ -30,6 +33,8 @@ export interface ProviderOAuthCredential {
 
 export interface ProviderRunWriter {
   writeDelta(text: string): void | Promise<void>;
+  writeUsage(usage: RunUsage): void | Promise<void>;
+  writeMetadata(metadata: JsonObject): void | Promise<void>;
 }
 
 export interface ProviderRunContext {

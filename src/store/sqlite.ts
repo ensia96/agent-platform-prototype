@@ -21,7 +21,9 @@ import type {
   Run,
   RunEvent,
   RunEventType,
+  RunOptions,
   RunStatus,
+  RunUsage,
   Session
 } from "../shared/types";
 
@@ -40,6 +42,7 @@ type RunRow = {
   created_at: string;
   updated_at: string;
   error: string | null;
+  metadata_json: string;
 };
 
 type MessageRow = {
@@ -127,15 +130,15 @@ export class SQLiteStore implements StoreAdapter {
     this.db
       .prepare(
         `INSERT INTO runs (id, session_id, provider, status, created_at, updated_at, error, metadata_json)
-         VALUES (@id, @sessionId, @provider, @status, @createdAt, @updatedAt, @error, '{}')`
+         VALUES (@id, @sessionId, @provider, @status, @createdAt, @updatedAt, @error, @metadataJson)`
       )
-      .run({ ...input, error: input.error ?? null });
+      .run({ ...input, error: input.error ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
     return this.getRun(input.id)!;
   }
 
   getRun(id: string): Run | null {
     const row = this.db
-      .prepare("SELECT id, session_id, provider, status, created_at, updated_at, error FROM runs WHERE id = ?")
+      .prepare("SELECT id, session_id, provider, status, created_at, updated_at, error, metadata_json FROM runs WHERE id = ?")
       .get(id) as RunRow | undefined;
     return row ? rowToRun(row) : null;
   }
@@ -144,6 +147,12 @@ export class SQLiteStore implements StoreAdapter {
     this.db
       .prepare("UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ?")
       .run(status, error, updatedAt, id);
+  }
+
+  mergeRunMetadata(id: string, metadata: JsonObject, updatedAt: string): void {
+    const row = this.db.prepare("SELECT metadata_json FROM runs WHERE id = ?").get(id) as { metadata_json: string } | undefined;
+    const nextMetadata = { ...parseJsonObject(row?.metadata_json), ...metadata };
+    this.db.prepare("UPDATE runs SET metadata_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(nextMetadata), updatedAt, id);
   }
 
   listMessages(sessionId: string): Message[] {
@@ -212,9 +221,9 @@ export class SQLiteStore implements StoreAdapter {
     this.db
       .prepare(
         `INSERT INTO messages (id, session_id, run_id, role, status, created_at, updated_at, metadata_json)
-         VALUES (@id, @sessionId, @runId, @role, @status, @createdAt, @updatedAt, '{}')`
+         VALUES (@id, @sessionId, @runId, @role, @status, @createdAt, @updatedAt, @metadataJson)`
       )
-      .run({ ...input, runId: input.runId ?? null });
+      .run({ ...input, runId: input.runId ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
     return this.getMessage(input.id)!;
   }
 
@@ -255,6 +264,12 @@ export class SQLiteStore implements StoreAdapter {
     }
 
     this.db.prepare("UPDATE messages SET status = ?, updated_at = ? WHERE id = ?").run(status, updatedAt, id);
+  }
+
+  mergeMessageMetadata(id: string, metadata: JsonObject, updatedAt: string): void {
+    const row = this.db.prepare("SELECT metadata_json FROM messages WHERE id = ?").get(id) as { metadata_json: string } | undefined;
+    const nextMetadata = { ...parseJsonObject(row?.metadata_json), ...metadata };
+    this.db.prepare("UPDATE messages SET metadata_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(nextMetadata), updatedAt, id);
   }
 
   appendEvent(input: AppendEventInput): RunEvent {
@@ -458,11 +473,16 @@ function rowToSession(row: SessionRow): Session {
 }
 
 function rowToRun(row: RunRow): Run {
+  const metadata = parseJsonObject(row.metadata_json);
   return {
     id: row.id,
     sessionId: row.session_id,
     provider: row.provider,
     status: row.status,
+    metadata,
+    model: modelFromMetadata(metadata),
+    runOptions: runOptionsFromMetadata(metadata),
+    usage: usageFromMetadata(metadata),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     error: row.error
@@ -480,6 +500,10 @@ function rowToMessage(row: MessageRow, parts: MessagePart[]): Message {
     role: row.role,
     status: row.status,
     error,
+    metadata,
+    model: modelFromMetadata(metadata),
+    runOptions: runOptionsFromMetadata(metadata),
+    usage: usageFromMetadata(metadata),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     parts
@@ -525,4 +549,55 @@ function parseJsonObject(value: string | null | undefined): JsonObject {
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function modelFromMetadata(metadata: JsonObject): string | null {
+  return typeof metadata.model === "string" && metadata.model.trim() ? metadata.model : null;
+}
+
+function runOptionsFromMetadata(metadata: JsonObject): RunOptions | null {
+  const value = metadata.runOptions;
+  if (!isJsonObject(value)) {
+    return null;
+  }
+
+  const runOptions: RunOptions = {};
+  if (typeof value.model === "string" && value.model.trim()) {
+    runOptions.model = value.model;
+  }
+  if (isReasoningEffort(value.reasoningEffort)) {
+    runOptions.reasoningEffort = value.reasoningEffort;
+  }
+  if (typeof value.temperature === "number" && Number.isFinite(value.temperature)) {
+    runOptions.temperature = value.temperature;
+  }
+
+  return Object.keys(runOptions).length > 0 ? runOptions : null;
+}
+
+function usageFromMetadata(metadata: JsonObject): RunUsage | null {
+  const value = metadata.usage;
+  if (!isJsonObject(value)) {
+    return null;
+  }
+
+  const usage: RunUsage = {};
+  if (typeof value.inputTokens === "number" && Number.isFinite(value.inputTokens)) {
+    usage.inputTokens = value.inputTokens;
+  }
+  if (typeof value.outputTokens === "number" && Number.isFinite(value.outputTokens)) {
+    usage.outputTokens = value.outputTokens;
+  }
+  if (typeof value.reasoningTokens === "number" && Number.isFinite(value.reasoningTokens)) {
+    usage.reasoningTokens = value.reasoningTokens;
+  }
+  if (typeof value.totalTokens === "number" && Number.isFinite(value.totalTokens)) {
+    usage.totalTokens = value.totalTokens;
+  }
+
+  return Object.keys(usage).length > 0 ? usage : null;
+}
+
+function isReasoningEffort(value: unknown): value is RunOptions["reasoningEffort"] {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
 }

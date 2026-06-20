@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RunEventBus } from "./event-bus";
 import type { StoreAdapter } from "../store/types";
-import type { Run, RunEvent, RunEventType } from "../shared/types";
+import type { JsonObject, Run, RunEvent, RunEventType, RunUsage } from "../shared/types";
 import type { ProviderRunWriter } from "../providers/types";
 
 export interface RunWriterOptions {
@@ -18,6 +18,8 @@ export class RunWriter implements ProviderRunWriter {
   private readonly assistantMessageId: string;
   private text = "";
   private terminal = false;
+  private metadata: JsonObject;
+  private usage: RunUsage | null;
 
   constructor(options: RunWriterOptions) {
     this.store = options.store;
@@ -25,6 +27,8 @@ export class RunWriter implements ProviderRunWriter {
     this.run = options.run;
     this.assistantMessageId = options.assistantMessageId;
     this.text = options.store.getMessage(options.assistantMessageId)?.parts.map((part) => part.text).join("") ?? "";
+    this.metadata = { ...options.run.metadata };
+    this.usage = options.run.usage;
   }
 
   writeDelta(delta: string): void {
@@ -47,8 +51,29 @@ export class RunWriter implements ProviderRunWriter {
     });
   }
 
+  writeUsage(usage: RunUsage): void {
+    if (this.terminal) {
+      return;
+    }
+
+    this.usage = mergeRunUsage(this.usage, usage);
+    this.writeMetadata({ usage: runUsageToJsonObject(this.usage) });
+  }
+
+  writeMetadata(metadata: JsonObject): void {
+    if (this.terminal || Object.keys(metadata).length === 0) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    this.metadata = { ...this.metadata, ...metadata };
+    this.store.mergeRunMetadata(this.run.id, metadata, now);
+    this.store.mergeMessageMetadata(this.assistantMessageId, metadata, now);
+    this.store.touchSession(this.run.sessionId, now);
+  }
+
   complete(): void {
-    this.finish("completed", "run_completed", { messageId: this.assistantMessageId });
+    this.finish("completed", "run_completed", terminalPayload(this.assistantMessageId, this.metadata, this.usage));
   }
 
   cancel(): void {
@@ -56,10 +81,9 @@ export class RunWriter implements ProviderRunWriter {
   }
 
   fail(error: Error): void {
-    this.finish("failed", "run_failed", {
-      messageId: this.assistantMessageId,
-      error: error.message
-    });
+    const payload = terminalPayload(this.assistantMessageId, this.metadata, this.usage);
+    payload.error = error.message;
+    this.finish("failed", "run_failed", payload);
   }
 
   private finish(status: "completed" | "cancelled" | "failed", eventType: RunEventType, payload: unknown): void {
@@ -88,6 +112,53 @@ export class RunWriter implements ProviderRunWriter {
     this.eventBus.publish(event);
     return event;
   }
+}
+
+function terminalPayload(messageId: string, metadata: JsonObject, usage: RunUsage | null): JsonObject {
+  const payload: JsonObject = {
+    messageId,
+    metadata
+  };
+  if (usage) {
+    payload.usage = runUsageToJsonObject(usage);
+  }
+  return payload;
+}
+
+function runUsageToJsonObject(usage: RunUsage): JsonObject {
+  const output: JsonObject = {};
+  if (typeof usage.inputTokens === "number" && Number.isFinite(usage.inputTokens)) {
+    output.inputTokens = usage.inputTokens;
+  }
+  if (typeof usage.outputTokens === "number" && Number.isFinite(usage.outputTokens)) {
+    output.outputTokens = usage.outputTokens;
+  }
+  if (typeof usage.reasoningTokens === "number" && Number.isFinite(usage.reasoningTokens)) {
+    output.reasoningTokens = usage.reasoningTokens;
+  }
+  if (typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens)) {
+    output.totalTokens = usage.totalTokens;
+  }
+  return output;
+}
+
+function mergeRunUsage(current: RunUsage | null, update: RunUsage): RunUsage {
+  const usage: RunUsage = { ...(current ?? {}) };
+  if (typeof update.inputTokens === "number" && Number.isFinite(update.inputTokens)) {
+    usage.inputTokens = update.inputTokens;
+  }
+  if (typeof update.outputTokens === "number" && Number.isFinite(update.outputTokens)) {
+    usage.outputTokens = update.outputTokens;
+  }
+  if (typeof update.reasoningTokens === "number" && Number.isFinite(update.reasoningTokens)) {
+    usage.reasoningTokens = update.reasoningTokens;
+  }
+  if (typeof update.totalTokens === "number" && Number.isFinite(update.totalTokens)) {
+    usage.totalTokens = update.totalTokens;
+  } else if (usage.inputTokens !== undefined && usage.outputTokens !== undefined && usage.totalTokens === undefined) {
+    usage.totalTokens = usage.inputTokens + usage.outputTokens;
+  }
+  return usage;
 }
 
 function isErrorPayload(value: unknown): value is { error: string } {

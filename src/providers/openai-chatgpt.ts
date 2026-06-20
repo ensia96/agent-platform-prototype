@@ -1,4 +1,5 @@
 import { refreshOpenAIChatGPTCredential } from "./openai-chatgpt-auth";
+import { extractRunUsage } from "./usage";
 import {
   defaultOpenAIChatGPTEndpoint,
   defaultOpenAIChatGPTIssuer,
@@ -157,6 +158,8 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       stream: payload.stream,
       inputMessages: payload.input.length,
       hasInstructions: payload.instructions.trim().length > 0,
+      requestedReasoningEffort: input.requestedRunOptions.reasoningEffort ?? null,
+      reasoningEffortSent: false,
       accountIdPresent: Boolean(credential.accountId)
     });
 
@@ -218,8 +221,10 @@ function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestP
     }))
     .filter((message) => message.content.length > 0);
 
+  // The ChatGPT/Codex backend's public contract for reasoning effort is not stable.
+  // Keep requested reasoning effort in run metadata for now rather than risking the known-good payload shape.
   return {
-    model: getModel(input.profile),
+    model: getRunModel(input),
     instructions,
     store: false,
     stream: true,
@@ -295,6 +300,11 @@ async function handleStreamEvent(rawEvent: string, context: ProviderRunContext):
     throw new Error(formatProviderError("OpenAI ChatGPT Codex stream failed", streamError));
   }
 
+  const usage = extractRunUsage(parsed);
+  if (usage) {
+    await context.writer.writeUsage(usage);
+  }
+
   for (const delta of extractTextDeltas(parsed)) {
     await context.writer.writeDelta(delta);
   }
@@ -309,6 +319,9 @@ function extractTextDeltas(value: unknown): string[] {
 
   const deltas: string[] = [];
   const eventType = typeof value.type === "string" ? value.type : "";
+  if (isReasoningLikeEvent(eventType)) {
+    return deltas;
+  }
   const topLevelTextIsDelta = !eventType || eventType.endsWith(".delta") || eventType === "delta";
 
   if (topLevelTextIsDelta && typeof value.delta === "string" && value.delta) {
@@ -345,6 +358,10 @@ function extractTextDeltas(value: unknown): string[] {
   }
 
   return deltas;
+}
+
+function isReasoningLikeEvent(eventType: string): boolean {
+  return /reasoning|thinking|analysis|chain[_-]?of[_-]?thought/i.test(eventType);
 }
 
 function collectContentText(value: unknown, output: string[]): void {
@@ -559,6 +576,10 @@ function getEndpoint(profile: ProviderProfile): string {
 
 function getModel(profile: ProviderProfile): string {
   return profile.model?.trim() || defaultOpenAIChatGPTModel;
+}
+
+function getRunModel(input: ProviderRunInput): string {
+  return input.runOptions.model?.trim() || getModel(input.profile);
 }
 
 function trimForDisplay(value: string, maxLength = 500): string {

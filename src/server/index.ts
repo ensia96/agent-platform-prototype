@@ -17,12 +17,13 @@ import { SQLiteStore } from "../store/sqlite";
 import type {
   AdapterRegistryItem,
   AppSettingsResponse,
-  CreateRunRequest,
   DaemonStatus,
   JsonObject,
   JsonValue,
   OpenAIChatGPTAuthPollResponse,
   OpenAIChatGPTLogoutResponse,
+  ReasoningEffort,
+  RunOptions,
   RunEvent
 } from "../shared/types";
 
@@ -156,11 +157,12 @@ app.get("/api/sessions/:id/messages", (req, res, next) => {
 
 app.post("/api/sessions/:id/runs", (req, res, next) => {
   try {
-    const body = req.body as Partial<CreateRunRequest> | undefined;
+    const body = req.body as Record<string, unknown> | undefined;
     const text = typeof body?.text === "string" ? body.text : "";
     const provider = typeof body?.provider === "string" ? body.provider : undefined;
     const providerProfileId = typeof body?.providerProfileId === "string" ? body.providerProfileId : undefined;
-    res.status(202).json(kernel.startRun(req.params.id, text, { provider, providerProfileId }));
+    const runOptions = parseRunOptionsFromBody(body);
+    res.status(202).json(kernel.startRun(req.params.id, text, { provider, providerProfileId, runOptions }));
   } catch (error) {
     next(error);
   }
@@ -383,6 +385,59 @@ function extractSettingsPatch(body: unknown): JsonObject | null {
     patch[key] = value;
   }
   return patch;
+}
+
+function parseRunOptionsFromBody(body: Record<string, unknown> | undefined): RunOptions | undefined {
+  const rawOptions = body?.runOptions ?? body?.options;
+  if (rawOptions === undefined || rawOptions === null) {
+    return undefined;
+  }
+  if (!isPlainObject(rawOptions)) {
+    throw new KernelError("Run options must be a JSON object.", 400);
+  }
+
+  const options: RunOptions = {};
+  if ("model" in rawOptions) {
+    if (rawOptions.model !== null && rawOptions.model !== undefined) {
+      if (typeof rawOptions.model !== "string") {
+        throw new KernelError("Run option 'model' must be a string.", 400);
+      }
+      const model = rawOptions.model.trim();
+      if (model.length > 200) {
+        throw new KernelError("Run option 'model' must be 200 characters or fewer.", 400);
+      }
+      if (model) {
+        options.model = model;
+      }
+    }
+  }
+
+  if ("reasoningEffort" in rawOptions) {
+    if (rawOptions.reasoningEffort !== null && rawOptions.reasoningEffort !== undefined && rawOptions.reasoningEffort !== "") {
+      if (!isReasoningEffort(rawOptions.reasoningEffort)) {
+        throw new KernelError("Run option 'reasoningEffort' must be one of minimal, low, medium, high, xhigh.", 400);
+      }
+      options.reasoningEffort = rawOptions.reasoningEffort;
+    }
+  }
+
+  if ("temperature" in rawOptions) {
+    if (rawOptions.temperature !== null && rawOptions.temperature !== undefined && rawOptions.temperature !== "") {
+      if (typeof rawOptions.temperature !== "number" || !Number.isFinite(rawOptions.temperature)) {
+        throw new KernelError("Run option 'temperature' must be a finite number.", 400);
+      }
+      if (rawOptions.temperature < 0 || rawOptions.temperature > 2) {
+        throw new KernelError("Run option 'temperature' must be between 0 and 2.", 400);
+      }
+      options.temperature = rawOptions.temperature;
+    }
+  }
+
+  return options;
+}
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
 }
 
 function isValidSettingKey(key: string): boolean {

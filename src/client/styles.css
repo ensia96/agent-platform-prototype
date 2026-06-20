@@ -136,6 +136,31 @@ input {
   justify-items: end;
 }
 
+.chatControls {
+  display: grid;
+  gap: 10px;
+  justify-items: end;
+  max-width: 720px;
+}
+
+.runOptionsPanel {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.runOptionsPanel input,
+.runOptionsPanel select {
+  min-width: 130px;
+}
+
+.runOptionsNote {
+  flex-basis: 100%;
+  margin: 0;
+  text-align: right;
+}
+
 .providerSummary {
   margin: 0;
 }
@@ -229,6 +254,14 @@ input {
   font-size: 12px;
   margin-bottom: 6px;
   text-transform: uppercase;
+}
+
+.usageSummary {
+  border-top: 1px solid #e2e8f0;
+  color: #475569;
+  font-size: 12px;
+  margin-top: 10px;
+  padding-top: 8px;
 }
 
 .composer {
