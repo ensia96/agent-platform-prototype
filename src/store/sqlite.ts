@@ -11,6 +11,8 @@ import type {
   UpsertMessageTextPartInput
 } from "./types";
 import type {
+  JsonObject,
+  JsonValue,
   Message,
   MessagePart,
   MessagePartType,
@@ -68,6 +70,12 @@ type EventRow = {
   type: RunEventType;
   created_at: string;
   payload_json: string;
+};
+
+type SettingRow = {
+  key: string;
+  value_json: string;
+  updated_at: string;
 };
 
 export interface SQLiteStoreOptions {
@@ -273,6 +281,29 @@ export class SQLiteStore implements StoreAdapter {
     return rows.map(rowToEvent);
   }
 
+  listSettings(): JsonObject {
+    const rows = this.db
+      .prepare("SELECT key, value_json, updated_at FROM app_settings ORDER BY key ASC")
+      .all() as SettingRow[];
+    const settings: JsonObject = {};
+    for (const row of rows) {
+      settings[row.key] = JSON.parse(row.value_json) as JsonValue;
+    }
+    return settings;
+  }
+
+  setSetting(key: string, value: JsonValue, updatedAt: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO app_settings (key, value_json, updated_at)
+         VALUES (@key, @valueJson, @updatedAt)
+         ON CONFLICT(key) DO UPDATE SET
+           value_json = excluded.value_json,
+           updated_at = excluded.updated_at`
+      )
+      .run({ key, valueJson: JSON.stringify(value), updatedAt });
+  }
+
   private ensureSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -334,11 +365,18 @@ export class SQLiteStore implements StoreAdapter {
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
       CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts(message_id, seq);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_app_settings_updated_at ON app_settings(updated_at);
     `);
   }
 

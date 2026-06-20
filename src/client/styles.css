@@ -13,12 +13,14 @@ body {
 }
 
 button,
+input,
 select,
 textarea {
   font: inherit;
 }
 
 button,
+input,
 select {
   border: 1px solid #cbd5e1;
   border-radius: 8px;
@@ -30,6 +32,10 @@ select {
 button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+input {
+  cursor: text;
 }
 
 .appShell {
@@ -54,8 +60,26 @@ button:disabled {
 }
 
 .sidebar h1,
-.chatHeader h2 {
+.chatHeader h2,
+.settingsHeader h2 {
   margin: 0;
+}
+
+.tabList {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.tab.active {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 1px #2563eb;
+}
+
+.sidebarNote {
+  margin-top: 16px;
+  line-height: 1.5;
 }
 
 .sessionList {
@@ -174,4 +198,109 @@ button:disabled {
 .composerActions {
   margin-top: 8px;
   justify-content: flex-end;
+}
+
+.settingsPane {
+  height: 100vh;
+  overflow: auto;
+}
+
+.settingsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #d9e2ec;
+  padding: 16px 20px;
+}
+
+.settingsLoading {
+  margin: 12px 20px 0;
+}
+
+.settingsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  padding: 20px;
+}
+
+.settingsCard {
+  border: 1px solid #d9e2ec;
+  border-radius: 12px;
+  background: white;
+  padding: 16px;
+}
+
+.settingsCard h3 {
+  margin-top: 0;
+}
+
+.statusGrid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.statusGrid dt {
+  color: #64748b;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.statusGrid dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.registryList {
+  display: grid;
+  gap: 10px;
+}
+
+.registryItem {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.registryItem span {
+  float: right;
+  color: #475569;
+  font-size: 12px;
+}
+
+.registryItem p {
+  margin: 6px 0 0;
+}
+
+.registryItem code,
+.monospace,
+.settingsJson {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.registryItem code {
+  display: block;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+  color: #334155;
+}
+
+.settingEditor {
+  display: grid;
+  gap: 6px;
+  color: #475569;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+
+.settingsJson {
+  overflow: auto;
+  background: #f8fafc;
+  border-radius: 8px;
+  margin-bottom: 0;
+  padding: 10px;
 }

@@ -7,6 +7,10 @@
     "dev": "node scripts/dev.mjs",
     "dev:server": "tsx watch src/server/index.ts",
     "dev:client": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "start": "npm run build && node scripts/daemon.mjs start",
+    "stop": "node scripts/daemon.mjs stop",
+    "status": "node scripts/daemon.mjs status",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

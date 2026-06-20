@@ -1,5 +1,8 @@
 export type ISODateString = string;
 
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+export type JsonObject = Record<string, JsonValue>;
+
 export type MessageRole = "system" | "user" | "assistant";
 export type MessagePartType = "text";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
@@ -71,4 +74,40 @@ export interface CreateRunResponse {
   run: Run;
   provider: string;
   assistantMessageId: string;
+}
+
+export interface DaemonStatus {
+  status: "ok";
+  version: string;
+  pid: number;
+  startedAt: ISODateString;
+  uptimeSeconds: number;
+  mode: string;
+  port: number;
+  dbPath: string;
+}
+
+export interface ProviderProfileSummary {
+  id: string;
+  name: string;
+  type: "mock" | "openai-compatible";
+  source: "built-in" | "env" | "settings";
+  status: "available" | "configured" | "missing-credential" | "planned";
+  enabled: boolean;
+  baseUrl?: string;
+  model?: string;
+  credentialRef?: string;
+}
+
+export interface AdapterRegistryItem {
+  id: "opencode" | "claude-code" | "codex" | "gemini-cli";
+  name: string;
+  status: "planned" | "not-installed" | "installed";
+  description: string;
+}
+
+export interface AppSettingsResponse {
+  settings: JsonObject;
+  providerProfiles: ProviderProfileSummary[];
+  adapters: AdapterRegistryItem[];
 }

@@ -1,4 +1,6 @@
 import type {
+  JsonObject,
+  JsonValue,
   ISODateString,
   Message,
   MessageRole,
@@ -82,4 +84,7 @@ export interface StoreAdapter {
 
   appendEvent(input: AppendEventInput): RunEvent;
   listEvents(runId: string): RunEvent[];
+
+  listSettings(): JsonObject;
+  setSetting(key: string, value: JsonValue, updatedAt: ISODateString): void;
 }

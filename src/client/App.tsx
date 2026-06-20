@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import type { CreateRunResponse, Message, RunEvent, Session } from "../shared/types";
+import type { AppSettingsResponse, CreateRunResponse, DaemonStatus, Message, RunEvent, Session } from "../shared/types";
 
 type LoadState = "idle" | "loading" | "error";
+type Tab = "chat" | "settings";
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -12,6 +13,7 @@ export function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
   const eventsRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -215,24 +217,41 @@ export function App() {
       <aside className="sidebar">
         <div className="sidebarHeader">
           <h1>Prototype</h1>
-          <button onClick={createSession}>New</button>
+          {activeTab === "chat" && <button onClick={createSession}>New</button>}
         </div>
-        {loadState === "loading" && <p className="muted">Loading sessions...</p>}
-        <div className="sessionList">
-          {sessions.map((session) => (
-            <button
-              className={session.id === selectedSessionId ? "session active" : "session"}
-              key={session.id}
-              onClick={() => setSelectedSessionId(session.id)}
-            >
-              <strong>{session.title}</strong>
-              <span>{new Date(session.updatedAt).toLocaleString()}</span>
-            </button>
-          ))}
-        </div>
+
+        <nav className="tabList" aria-label="Dashboard sections">
+          <button className={activeTab === "chat" ? "tab active" : "tab"} onClick={() => setActiveTab("chat")}>
+            Chat
+          </button>
+          <button className={activeTab === "settings" ? "tab active" : "tab"} onClick={() => setActiveTab("settings")}>
+            Settings
+          </button>
+        </nav>
+
+        {activeTab === "chat" ? (
+          <>
+            {loadState === "loading" && <p className="muted">Loading sessions...</p>}
+            <div className="sessionList">
+              {sessions.map((session) => (
+                <button
+                  className={session.id === selectedSessionId ? "session active" : "session"}
+                  key={session.id}
+                  onClick={() => setSelectedSessionId(session.id)}
+                >
+                  <strong>{session.title}</strong>
+                  <span>{new Date(session.updatedAt).toLocaleString()}</span>
+                </button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="muted sidebarNote">Daemon lifecycle stays in the CLI. Settings and registries live here.</p>
+        )}
       </aside>
 
-      <section className="chatPane">
+      {activeTab === "chat" ? (
+        <section className="chatPane">
         <header className="chatHeader">
           <div>
             <h2>{selectedSession?.title ?? "No session"}</h2>
@@ -288,8 +307,147 @@ export function App() {
             )}
           </div>
         </form>
-      </section>
+        </section>
+      ) : (
+        <SettingsPanel />
+      )}
     </main>
+  );
+}
+
+function SettingsPanel() {
+  const [status, setStatus] = useState<DaemonStatus | null>(null);
+  const [settingsData, setSettingsData] = useState<AppSettingsResponse | null>(null);
+  const [instanceLabel, setInstanceLabel] = useState("");
+  const [loadState, setLoadState] = useState<LoadState>("idle");
+  const [saveState, setSaveState] = useState<LoadState>("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadDashboardSettings();
+  }, []);
+
+  async function loadDashboardSettings() {
+    setLoadState("loading");
+    setError(null);
+    try {
+      const [nextStatus, nextSettings] = await Promise.all([
+        requestJson<DaemonStatus>("/api/status"),
+        requestJson<AppSettingsResponse>("/api/settings")
+      ]);
+      setStatus(nextStatus);
+      setSettingsData(nextSettings);
+      setInstanceLabel(settingValueAsString(nextSettings.settings.instanceLabel));
+      setLoadState("idle");
+    } catch (requestError) {
+      setLoadState("error");
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function saveInstanceLabel() {
+    setSaveState("loading");
+    setError(null);
+    try {
+      const nextSettings = await requestJson<AppSettingsResponse>("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instanceLabel: instanceLabel.trim() || null })
+      });
+      setSettingsData(nextSettings);
+      setInstanceLabel(settingValueAsString(nextSettings.settings.instanceLabel));
+      setSaveState("idle");
+    } catch (requestError) {
+      setSaveState("error");
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  return (
+    <section className="settingsPane">
+      <header className="settingsHeader">
+        <div>
+          <h2>Settings</h2>
+          <p className="muted">Daemon status, provider profile placeholders, and adapter registry foundation.</p>
+        </div>
+        <button onClick={loadDashboardSettings} disabled={loadState === "loading"}>
+          Refresh
+        </button>
+      </header>
+
+      {error && <div className="error">{error}</div>}
+      {loadState === "loading" && <p className="muted settingsLoading">Loading settings...</p>}
+
+      <div className="settingsGrid">
+        <article className="settingsCard">
+          <h3>Daemon status</h3>
+          {status ? (
+            <dl className="statusGrid">
+              <dt>Status</dt>
+              <dd>{status.status}</dd>
+              <dt>Version</dt>
+              <dd>{status.version}</dd>
+              <dt>PID</dt>
+              <dd>{status.pid}</dd>
+              <dt>Started</dt>
+              <dd>{new Date(status.startedAt).toLocaleString()}</dd>
+              <dt>Uptime</dt>
+              <dd>{formatUptime(status.uptimeSeconds)}</dd>
+              <dt>Mode</dt>
+              <dd>{status.mode}</dd>
+              <dt>Port</dt>
+              <dd>{status.port}</dd>
+              <dt>DB path</dt>
+              <dd className="monospace">{status.dbPath}</dd>
+            </dl>
+          ) : (
+            <p className="muted">No daemon status loaded yet.</p>
+          )}
+        </article>
+
+        <article className="settingsCard">
+          <h3>Provider profiles</h3>
+          <div className="registryList">
+            {settingsData?.providerProfiles.map((profile) => (
+              <div className="registryItem" key={profile.id}>
+                <strong>{profile.name}</strong>
+                <span>{profile.status}</span>
+                <p className="muted">
+                  {profile.type} · {profile.source}
+                  {profile.model ? ` · ${profile.model}` : ""}
+                </p>
+                {profile.baseUrl && <code>{profile.baseUrl}</code>}
+              </div>
+            )) ?? <p className="muted">No provider profile data loaded yet.</p>}
+          </div>
+        </article>
+
+        <article className="settingsCard">
+          <h3>Adapter registry</h3>
+          <div className="registryList">
+            {settingsData?.adapters.map((adapter) => (
+              <div className="registryItem" key={adapter.id}>
+                <strong>{adapter.name}</strong>
+                <span>{adapter.status}</span>
+                <p className="muted">{adapter.description}</p>
+              </div>
+            )) ?? <p className="muted">No adapter registry data loaded yet.</p>}
+          </div>
+        </article>
+
+        <article className="settingsCard">
+          <h3>Stored app settings</h3>
+          <label className="settingEditor">
+            Instance label
+            <input value={instanceLabel} onChange={(event) => setInstanceLabel(event.target.value)} placeholder="Local daemon" />
+          </label>
+          <button onClick={saveInstanceLabel} disabled={saveState === "loading"}>
+            Save label
+          </button>
+          <pre className="settingsJson">{JSON.stringify(settingsData?.settings ?? {}, null, 2)}</pre>
+        </article>
+      </div>
+    </section>
   );
 }
 
@@ -322,6 +480,23 @@ function roleRank(role: Message["role"]): number {
 
 function isTerminalEvent(type: RunEvent["type"]): boolean {
   return type === "run_completed" || type === "run_cancelled" || type === "run_failed";
+}
+
+function settingValueAsString(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function formatUptime(seconds: number): string {
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m ${remainingSeconds}s`;
 }
 
 function toErrorMessage(error: unknown): string {
