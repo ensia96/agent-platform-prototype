@@ -5,6 +5,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RunEventBus } from "../kernel/event-bus";
 import { Kernel, KernelError } from "../kernel/kernel";
+import { OpenAIChatGPTAuthService } from "../providers/openai-chatgpt-auth";
+import {
+  defaultOpenAIChatGPTEndpoint,
+  defaultOpenAIChatGPTIssuer,
+  openAIChatGPTProfileId,
+  OpenAIChatGPTCredentialStore
+} from "../providers/openai-chatgpt-credentials";
 import { createDefaultProviderRegistry } from "../providers/registry";
 import { SQLiteStore } from "../store/sqlite";
 import type {
@@ -14,6 +21,8 @@ import type {
   DaemonStatus,
   JsonObject,
   JsonValue,
+  OpenAIChatGPTAuthPollResponse,
+  OpenAIChatGPTLogoutResponse,
   RunEvent
 } from "../shared/types";
 
@@ -29,12 +38,20 @@ const startedAt = new Date(startedAtMs).toISOString();
 const version = readPackageVersion(packageJsonPath);
 const port = parsePort(process.env.PORT);
 const dbPath = resolveDbPath(process.env.AGENT_PLATFORM_DB_PATH ?? process.env.DB_PATH);
+const runtimeDir = resolveRuntimeDir(process.env.AGENT_PLATFORM_RUNTIME_DIR);
 const mode = process.env.NODE_ENV || "development";
 const shouldServeDashboard = mode === "production" || process.env.AGENT_PLATFORM_DAEMON === "1";
 
 const store = new SQLiteStore({ dbPath });
 const eventBus = new RunEventBus();
-const providers = createDefaultProviderRegistry(process.env);
+const openAIChatGPTCredentials = new OpenAIChatGPTCredentialStore({ runtimeDir });
+const openAIChatGPTAuth = new OpenAIChatGPTAuthService({
+  credentialStore: openAIChatGPTCredentials,
+  issuer: process.env.OPENAI_CHATGPT_AUTH_ISSUER || defaultOpenAIChatGPTIssuer,
+  endpoint: process.env.OPENAI_CHATGPT_ENDPOINT || defaultOpenAIChatGPTEndpoint,
+  clientId: process.env.OPENAI_CHATGPT_CLIENT_ID
+});
+const providers = createDefaultProviderRegistry(process.env, { openAIChatGPTCredentials });
 const kernel = new Kernel({ store, eventBus, providers });
 const app = express();
 
@@ -78,6 +95,43 @@ app.post("/api/providers/:id/test", async (req, res, next) => {
       return;
     }
     res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/providers/openai-chatgpt/auth/start", async (_req, res, next) => {
+  try {
+    res.status(201).json(await openAIChatGPTAuth.startDeviceAuth());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/providers/openai-chatgpt/auth/poll", async (req, res, next) => {
+  try {
+    const attemptId = typeof req.body?.attemptId === "string" ? req.body.attemptId.trim() : "";
+    if (!attemptId) {
+      res.status(400).json({ error: "missing_attempt_id", message: "Body field 'attemptId' is required." });
+      return;
+    }
+
+    const result = await openAIChatGPTAuth.pollDeviceAuth(attemptId);
+    res.json(withOpenAIChatGPTProfile(result));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/providers/openai-chatgpt/logout", async (_req, res, next) => {
+  try {
+    await openAIChatGPTAuth.logout();
+    const response: OpenAIChatGPTLogoutResponse = {
+      providerProfileId: openAIChatGPTProfileId,
+      ok: true,
+      profile: getOpenAIChatGPTProfile()
+    };
+    res.json(response);
   } catch (error) {
     next(error);
   }
@@ -234,6 +288,18 @@ function getDaemonStatus(): DaemonStatus {
   };
 }
 
+function withOpenAIChatGPTProfile(response: OpenAIChatGPTAuthPollResponse): OpenAIChatGPTAuthPollResponse {
+  return response.status === "connected" ? { ...response, profile: getOpenAIChatGPTProfile() } : response;
+}
+
+function getOpenAIChatGPTProfile() {
+  const profile = providers.list().providers.find((item) => item.id === openAIChatGPTProfileId);
+  if (!profile) {
+    throw new Error("OpenAI ChatGPT provider profile is not registered.");
+  }
+  return profile;
+}
+
 function getSettingsResponse(): AppSettingsResponse {
   return {
     settings: store.listSettings(),
@@ -359,6 +425,11 @@ function parsePort(value: string | undefined): number {
 function resolveDbPath(value: string | undefined): string {
   const configuredPath = value?.trim();
   return configuredPath ? resolve(process.cwd(), configuredPath) : resolve(process.cwd(), "data", "app.db");
+}
+
+function resolveRuntimeDir(value: string | undefined): string {
+  const configuredPath = value?.trim();
+  return configuredPath ? resolve(process.cwd(), configuredPath) : resolve(process.cwd(), ".agent-platform");
 }
 
 function readPackageVersion(packagePath: string): string {

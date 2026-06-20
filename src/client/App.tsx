@@ -4,6 +4,9 @@ import type {
   CreateRunResponse,
   DaemonStatus,
   Message,
+  OpenAIChatGPTAuthPollResponse,
+  OpenAIChatGPTAuthStartResponse,
+  OpenAIChatGPTLogoutResponse,
   ProviderListResponse,
   ProviderProfile,
   ProviderResolution,
@@ -43,6 +46,12 @@ export function App() {
     }
     void loadMessages(selectedSessionId);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (activeTab === "chat") {
+      void loadProviders();
+    }
+  }, [activeTab]);
 
   async function loadSessions() {
     setLoadState("loading");
@@ -199,7 +208,8 @@ export function App() {
               ? {
                   ...message,
                   status:
-                    event.type === "run_completed" ? "completed" : event.type === "run_cancelled" ? "cancelled" : "failed"
+                    event.type === "run_completed" ? "completed" : event.type === "run_cancelled" ? "cancelled" : "failed",
+                  error: event.type === "run_failed" ? payload.error ?? message.error ?? "Run failed without an error message." : null
                 }
               : message
           )
@@ -349,7 +359,7 @@ export function App() {
                 <strong>{message.role}</strong>
                 <span>{message.status}</span>
               </div>
-              <pre>{messageText(message)}</pre>
+              <MessageBody message={message} />
             </article>
           ))}
         </div>
@@ -388,12 +398,31 @@ export function App() {
   );
 }
 
+function MessageBody({ message }: { message: Message }) {
+  const text = messageText(message);
+  return (
+    <>
+      {message.error && (
+        <div className="messageError">
+          <strong>Provider error</strong>
+          <pre>{message.error}</pre>
+        </div>
+      )}
+      {text && <pre>{text}</pre>}
+    </>
+  );
+}
+
 function SettingsPanel() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [settingsData, setSettingsData] = useState<AppSettingsResponse | null>(null);
   const [providersData, setProvidersData] = useState<ProviderListResponse | null>(null);
   const [providerTests, setProviderTests] = useState<Record<string, ProviderTestResponse>>({});
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
+  const [chatGPTAuthStart, setChatGPTAuthStart] = useState<OpenAIChatGPTAuthStartResponse | null>(null);
+  const [chatGPTAuthPoll, setChatGPTAuthPoll] = useState<OpenAIChatGPTAuthPollResponse | null>(null);
+  const [chatGPTAuthBusy, setChatGPTAuthBusy] = useState<"start" | "poll" | "logout" | null>(null);
+  const [copiedAuthCode, setCopiedAuthCode] = useState(false);
   const [instanceLabel, setInstanceLabel] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [saveState, setSaveState] = useState<LoadState>("idle");
@@ -456,6 +485,77 @@ function SettingsPanel() {
     }
   }
 
+  async function startOpenAIChatGPTAuth() {
+    setChatGPTAuthBusy("start");
+    setChatGPTAuthPoll(null);
+    setCopiedAuthCode(false);
+    setError(null);
+    try {
+      const result = await requestJson<OpenAIChatGPTAuthStartResponse>("/api/providers/openai-chatgpt/auth/start", {
+        method: "POST"
+      });
+      setChatGPTAuthStart(result);
+      window.open(result.verificationUrl, "_blank", "noopener,noreferrer");
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    } finally {
+      setChatGPTAuthBusy(null);
+    }
+  }
+
+  async function pollOpenAIChatGPTAuth() {
+    if (!chatGPTAuthStart) {
+      return;
+    }
+
+    setChatGPTAuthBusy("poll");
+    setError(null);
+    try {
+      const result = await requestJson<OpenAIChatGPTAuthPollResponse>("/api/providers/openai-chatgpt/auth/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ attemptId: chatGPTAuthStart.attemptId })
+      });
+      setChatGPTAuthPoll(result);
+      if (result.status === "connected") {
+        setChatGPTAuthStart(null);
+        await loadDashboardSettings();
+      }
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    } finally {
+      setChatGPTAuthBusy(null);
+    }
+  }
+
+  async function logoutOpenAIChatGPT() {
+    setChatGPTAuthBusy("logout");
+    setError(null);
+    try {
+      await requestJson<OpenAIChatGPTLogoutResponse>("/api/providers/openai-chatgpt/logout", { method: "POST" });
+      setChatGPTAuthStart(null);
+      setChatGPTAuthPoll(null);
+      await loadDashboardSettings();
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    } finally {
+      setChatGPTAuthBusy(null);
+    }
+  }
+
+  async function copyOpenAIChatGPTCode() {
+    if (!chatGPTAuthStart) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(chatGPTAuthStart.userCode);
+      setCopiedAuthCode(true);
+    } catch {
+      setCopiedAuthCode(false);
+    }
+  }
+
   return (
     <section className="settingsPane">
       <header className="settingsHeader">
@@ -506,15 +606,27 @@ function SettingsPanel() {
           <div className="registryList providerList">
             {providersData?.providers.map((profile) => {
               const testResult = providerTests[profile.id];
+              const isOpenAIChatGPT = profile.id === "openai-chatgpt";
               return (
                 <div className="registryItem providerItem" key={profile.id}>
                   <div className="registryItemHeader">
-                    <strong>{profile.name}</strong>
+                    <strong>
+                      {profile.name}
+                      {profile.experimental ? <span className="experimentalBadge">experimental</span> : null}
+                    </strong>
                     <span className={`statusBadge ${profile.status.state}`}>{profile.status.state}</span>
                   </div>
                   <dl className="providerDetails">
+                    <dt>Vendor</dt>
+                    <dd>{profile.vendor}</dd>
                     <dt>Type</dt>
                     <dd>{profile.type}</dd>
+                    <dt>Runtime</dt>
+                    <dd>{profile.runtime}</dd>
+                    <dt>Auth</dt>
+                    <dd>{profile.authMode}</dd>
+                    <dt>Billing</dt>
+                    <dd>{profile.billingSource}</dd>
                     <dt>Source</dt>
                     <dd>{profile.source}</dd>
                     <dt>Enabled</dt>
@@ -535,11 +647,63 @@ function SettingsPanel() {
                         <dd className="monospace">{profile.baseUrl}</dd>
                       </>
                     )}
+                    {profile.endpoint && (
+                      <>
+                        <dt>Endpoint</dt>
+                        <dd className="monospace">{profile.endpoint}</dd>
+                      </>
+                    )}
                   </dl>
                   <p className="muted">{profile.status.message}</p>
-                  <button onClick={() => void testProvider(profile.id)} disabled={testingProviderId === profile.id}>
-                    {testingProviderId === profile.id ? "Testing..." : "Test connection"}
-                  </button>
+                  <div className="providerActions">
+                    <button onClick={() => void testProvider(profile.id)} disabled={testingProviderId === profile.id}>
+                      {testingProviderId === profile.id ? "Testing..." : "Test connection"}
+                    </button>
+                    {isOpenAIChatGPT && (
+                      <>
+                        <button onClick={() => void startOpenAIChatGPTAuth()} disabled={chatGPTAuthBusy !== null}>
+                          {profile.status.state === "connected" ? "Reconnect" : "Connect"}
+                        </button>
+                        <button
+                          onClick={() => void logoutOpenAIChatGPT()}
+                          disabled={chatGPTAuthBusy !== null || profile.status.credentialStatus === "missing"}
+                        >
+                          Disconnect
+                        </button>
+                      </>
+                    )}
+                  </div>
+                  {isOpenAIChatGPT && chatGPTAuthStart && (
+                    <div className="authBox">
+                      <strong>Device authorization</strong>
+                      <p>{chatGPTAuthStart.instruction}</p>
+                      <dl className="providerDetails">
+                        <dt>URL</dt>
+                        <dd>
+                          <a href={chatGPTAuthStart.verificationUrl} target="_blank" rel="noreferrer">
+                            {chatGPTAuthStart.verificationUrl}
+                          </a>
+                        </dd>
+                        <dt>Code</dt>
+                        <dd className="authCode">{chatGPTAuthStart.userCode}</dd>
+                        <dt>Expires</dt>
+                        <dd>{new Date(chatGPTAuthStart.expiresAt).toLocaleString()}</dd>
+                      </dl>
+                      <div className="providerActions">
+                        <button onClick={() => void copyOpenAIChatGPTCode()}>{copiedAuthCode ? "Copied" : "Copy code"}</button>
+                        <button onClick={() => void pollOpenAIChatGPTAuth()} disabled={chatGPTAuthBusy !== null}>
+                          {chatGPTAuthBusy === "poll" ? "Checking..." : "Poll / Complete"}
+                        </button>
+                      </div>
+                      {chatGPTAuthPoll && (
+                        <div className={chatGPTAuthPoll.status === "connected" ? "testResult success" : "testResult failure"}>
+                          <strong>{chatGPTAuthPoll.status}</strong>
+                          <p>{chatGPTAuthPoll.message}</p>
+                          {chatGPTAuthPoll.retryAfterMs ? <span>retry after ~{Math.ceil(chatGPTAuthPoll.retryAfterMs / 1000)}s</span> : null}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {testResult && (
                     <div className={testResult.ok ? "testResult success" : "testResult failure"}>
                       <strong>{testResult.ok ? "Connected" : testResult.code ?? "Failed"}</strong>

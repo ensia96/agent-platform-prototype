@@ -70,7 +70,7 @@ export class RunWriter implements ProviderRunWriter {
     this.terminal = true;
     const now = new Date().toISOString();
     const error = status === "failed" && isErrorPayload(payload) ? payload.error : null;
-    this.store.updateMessageStatus(this.assistantMessageId, status, now);
+    this.store.updateMessageStatus(this.assistantMessageId, status, now, error);
     this.store.updateRunStatus(this.run.id, status, error, now);
     this.store.touchSession(this.run.sessionId, now);
     this.emit(eventType, payload);

@@ -7,10 +7,22 @@ export type MessageRole = "system" | "user" | "assistant";
 export type MessagePartType = "text";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
 export type RunStatus = "running" | "completed" | "cancelled" | "failed";
-export type ProviderProfileType = "openai-compatible" | "mock";
+export type ProviderProfileType = "openai-compatible" | "openai-chatgpt" | "mock";
 export type ProviderProfileSource = "env" | "builtin" | "user";
-export type ProviderCredentialStatus = "present" | "missing" | "not_required";
-export type ProviderStatusState = "available" | "configured" | "connected" | "missing_credential" | "disabled" | "error";
+export type ProviderCredentialStatus = "present" | "missing" | "expired" | "not_required";
+export type ProviderStatusState =
+  | "available"
+  | "configured"
+  | "connected"
+  | "needs_auth"
+  | "expired"
+  | "missing_credential"
+  | "disabled"
+  | "error";
+export type ProviderVendor = "openai" | "local";
+export type ProviderRuntime = "openai-compatible" | "chatgpt-codex" | "mock";
+export type ProviderAuthMode = "env-api-key" | "oauth-device" | "oauth-browser" | "none";
+export type ProviderBillingSource = "platform-api" | "consumer-subscription" | "local" | "third-party" | "unknown";
 
 export interface Session {
   id: string;
@@ -35,6 +47,7 @@ export interface Message {
   runId: string | null;
   role: MessageRole;
   status: MessageStatus;
+  error: string | null;
   createdAt: ISODateString;
   updatedAt: ISODateString;
   parts: MessagePart[];
@@ -125,11 +138,17 @@ export interface ProviderProfile {
   id: string;
   name: string;
   type: ProviderProfileType;
+  vendor: ProviderVendor;
+  runtime: ProviderRuntime;
+  authMode: ProviderAuthMode;
+  billingSource: ProviderBillingSource;
   source: ProviderProfileSource;
   enabled: boolean;
   baseUrl?: string;
+  endpoint?: string;
   model?: string;
   credentialRef?: string;
+  experimental?: boolean;
   status: ProviderStatus;
 }
 
@@ -144,11 +163,43 @@ export interface ProviderTestResponse {
   ok: boolean;
   profile: ProviderProfile;
   status: ProviderStatus;
-  code?: "missing_credential" | "connection_failed" | "unsupported_profile" | "unknown_profile";
+  code?:
+    | "missing_credential"
+    | "auth_required"
+    | "credential_expired"
+    | "refresh_failed"
+    | "connection_failed"
+    | "unsupported_profile"
+    | "unknown_profile";
   message: string;
   checkedAt: ISODateString;
   latencyMs?: number;
   details?: JsonObject;
+}
+
+export interface OpenAIChatGPTAuthStartResponse {
+  providerProfileId: string;
+  method: "device";
+  attemptId: string;
+  verificationUrl: string;
+  userCode: string;
+  instruction: string;
+  intervalSeconds: number;
+  expiresAt: ISODateString;
+}
+
+export interface OpenAIChatGPTAuthPollResponse {
+  providerProfileId: string;
+  status: "pending" | "connected" | "expired" | "failed";
+  message: string;
+  retryAfterMs?: number;
+  profile?: ProviderProfile;
+}
+
+export interface OpenAIChatGPTLogoutResponse {
+  providerProfileId: string;
+  ok: boolean;
+  profile: ProviderProfile;
 }
 
 export interface AdapterRegistryItem {

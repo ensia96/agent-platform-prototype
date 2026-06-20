@@ -50,6 +50,8 @@ type MessageRow = {
   status: MessageStatus;
   created_at: string;
   updated_at: string;
+  metadata_json: string;
+  run_error: string | null;
 };
 
 type MessagePartRow = {
@@ -147,12 +149,14 @@ export class SQLiteStore implements StoreAdapter {
   listMessages(sessionId: string): Message[] {
     const rows = this.db
       .prepare(
-        `SELECT id, session_id, run_id, role, status, created_at, updated_at
-         FROM messages
-         WHERE session_id = ?
-         ORDER BY created_at ASC,
-           CASE role WHEN 'system' THEN 0 WHEN 'user' THEN 1 WHEN 'assistant' THEN 2 ELSE 3 END,
-           id ASC`
+        `SELECT m.id, m.session_id, m.run_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+            r.error AS run_error
+         FROM messages m
+         LEFT JOIN runs r ON r.id = m.run_id
+         WHERE m.session_id = ?
+         ORDER BY m.created_at ASC,
+           CASE m.role WHEN 'system' THEN 0 WHEN 'user' THEN 1 WHEN 'assistant' THEN 2 ELSE 3 END,
+           m.id ASC`
       )
       .all(sessionId) as MessageRow[];
 
@@ -167,9 +171,11 @@ export class SQLiteStore implements StoreAdapter {
   getMessage(id: string): Message | null {
     const row = this.db
       .prepare(
-        `SELECT id, session_id, run_id, role, status, created_at, updated_at
-         FROM messages
-         WHERE id = ?`
+        `SELECT m.id, m.session_id, m.run_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+            r.error AS run_error
+         FROM messages m
+         LEFT JOIN runs r ON r.id = m.run_id
+         WHERE m.id = ?`
       )
       .get(id) as MessageRow | undefined;
 
@@ -184,11 +190,13 @@ export class SQLiteStore implements StoreAdapter {
   getAssistantMessageForRun(runId: string): Message | null {
     const row = this.db
       .prepare(
-        `SELECT id, session_id, run_id, role, status, created_at, updated_at
-         FROM messages
-         WHERE run_id = ? AND role = 'assistant'
-         ORDER BY created_at ASC
-         LIMIT 1`
+        `SELECT m.id, m.session_id, m.run_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+            r.error AS run_error
+         FROM messages m
+         LEFT JOIN runs r ON r.id = m.run_id
+         WHERE m.run_id = ? AND m.role = 'assistant'
+          ORDER BY m.created_at ASC
+          LIMIT 1`
       )
       .get(runId) as MessageRow | undefined;
 
@@ -231,7 +239,21 @@ export class SQLiteStore implements StoreAdapter {
       .run(input);
   }
 
-  updateMessageStatus(id: string, status: MessageStatus, updatedAt: string): void {
+  updateMessageStatus(id: string, status: MessageStatus, updatedAt: string, error?: string | null): void {
+    if (error !== undefined) {
+      const row = this.db.prepare("SELECT metadata_json FROM messages WHERE id = ?").get(id) as { metadata_json: string } | undefined;
+      const metadata = parseJsonObject(row?.metadata_json);
+      if (error) {
+        metadata.error = error;
+      } else {
+        delete metadata.error;
+      }
+      this.db
+        .prepare("UPDATE messages SET status = ?, updated_at = ?, metadata_json = ? WHERE id = ?")
+        .run(status, updatedAt, JSON.stringify(metadata), id);
+      return;
+    }
+
     this.db.prepare("UPDATE messages SET status = ?, updated_at = ? WHERE id = ?").run(status, updatedAt, id);
   }
 
@@ -375,9 +397,15 @@ export class SQLiteStore implements StoreAdapter {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         type TEXT NOT NULL,
+        vendor TEXT,
+        runtime TEXT,
+        auth_mode TEXT,
+        billing_source TEXT,
         base_url TEXT,
+        endpoint TEXT,
         model TEXT,
         credential_ref TEXT,
+        experimental INTEGER NOT NULL DEFAULT 0,
         enabled INTEGER NOT NULL DEFAULT 1,
         source TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -442,12 +470,16 @@ function rowToRun(row: RunRow): Run {
 }
 
 function rowToMessage(row: MessageRow, parts: MessagePart[]): Message {
+  const metadata = parseJsonObject(row.metadata_json);
+  const metadataError = typeof metadata.error === "string" && metadata.error.trim() ? metadata.error : null;
+  const error = row.status === "failed" ? metadataError ?? row.run_error ?? null : metadataError;
   return {
     id: row.id,
     sessionId: row.session_id,
     runId: row.run_id,
     role: row.role,
     status: row.status,
+    error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     parts
@@ -476,4 +508,21 @@ function rowToEvent(row: EventRow): RunEvent {
     createdAt: row.created_at,
     payload: JSON.parse(row.payload_json) as unknown
   };
+}
+
+function parseJsonObject(value: string | null | undefined): JsonObject {
+  if (!value) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return isJsonObject(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

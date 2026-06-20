@@ -80,7 +80,7 @@ export interface StoreAdapter {
   createMessage(input: CreateMessageInput): Message;
   addMessagePart(input: AddMessagePartInput): void;
   upsertMessageTextPart(input: UpsertMessageTextPartInput): void;
-  updateMessageStatus(id: string, status: MessageStatus, updatedAt: ISODateString): void;
+  updateMessageStatus(id: string, status: MessageStatus, updatedAt: ISODateString, error?: string | null): void;
 
   appendEvent(input: AppendEventInput): RunEvent;
   listEvents(runId: string): RunEvent[];

@@ -14,7 +14,7 @@ During development the React dashboard still runs through Vite and proxies `/api
 - Express local API server
 - SQLite via `better-sqlite3`
 - Server-Sent Events for run streaming
-- Provider profiles: built-in mock and env-backed OpenAI-compatible `/chat/completions`
+- Provider profiles: built-in mock, env-backed OpenAI-compatible `/chat/completions`, and experimental OpenAI ChatGPT/Codex OAuth
 
 ## Setup
 
@@ -61,6 +61,7 @@ The daemon writes runtime state under `.agent-platform/`:
 .agent-platform/
   daemon.pid
   daemon.json
+  credentials/openai-chatgpt.json
   logs/daemon.log
 ```
 
@@ -73,6 +74,10 @@ Useful environment variables:
 - `OPENAI_API_KEY`: optional API key for the env-backed OpenAI-compatible profile
 - `OPENAI_BASE_URL`: optional OpenAI-compatible base URL (default `https://api.openai.com/v1`)
 - `OPENAI_MODEL`: optional chat model (default `gpt-4o-mini`)
+- `OPENAI_CHATGPT_MODEL`: optional experimental ChatGPT/Codex model (default `gpt-5.5`)
+- `OPENAI_CHATGPT_ENDPOINT`: optional experimental ChatGPT/Codex endpoint override (default `https://chatgpt.com/backend-api/codex/responses`)
+- `OPENAI_CHATGPT_AUTH_ISSUER`: optional auth issuer override (default `https://auth.openai.com`)
+- `OPENAI_CHATGPT_DEBUG=1`: optional sanitized runtime diagnostics for request shape and provider failures; OAuth tokens/account values are redacted
 
 ## API
 
@@ -82,14 +87,17 @@ Useful environment variables:
 - `PATCH /api/settings` body JSON object, stored in SQLite `app_settings` as key/value JSON
 - `GET /api/providers` returns provider profiles, status, and the default profile id
 - `POST /api/providers/:id/test` tests a provider profile without storing secrets
+- `POST /api/providers/openai-chatgpt/auth/start` starts the experimental ChatGPT/Codex device authorization flow
+- `POST /api/providers/openai-chatgpt/auth/poll` body `{ "attemptId": "..." }` polls/completes that device authorization flow
+- `POST /api/providers/openai-chatgpt/logout` removes the local ChatGPT OAuth credential file
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/runs` body `{ "text": "...", "providerProfileId": "mock" | "openai-compatible" }`
+- `POST /api/sessions/:id/runs` body `{ "text": "...", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt" }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
 
-The initial OpenAI-compatible profile is env-backed. Only the credential reference (`env:OPENAI_API_KEY`) is surfaced through the API/UI; the API key value is read by the server process at runtime and is not stored in SQLite.
+The OpenAI-compatible profile is env-backed. Only the credential reference (`env:OPENAI_API_KEY`) is surfaced through the API/UI; the API key value is read by the server process at runtime and is not stored in SQLite.
 
 If `OPENAI_API_KEY` is missing, the default provider profile is `mock`. If a run explicitly requests `openai-compatible` without a key, the kernel falls back to mock and includes fallback metadata in the run response and `run_started` event. To try an OpenAI-compatible endpoint, set:
 
@@ -101,6 +109,30 @@ OPENAI_MODEL=gpt-4o-mini
 
 Then send runs with provider profile `openai-compatible` from the UI selector or API. Use `GET /api/providers` or the Settings → Providers panel to inspect profile status and run a `/models` connection test.
 
+### Experimental OpenAI ChatGPT/Codex OAuth profile
+
+`openai-chatgpt` is a separate OpenAI provider channel from `openai-compatible`:
+
+| Profile | Runtime/channel | Auth | Billing/quota source |
+| --- | --- | --- | --- |
+| `openai-compatible` | OpenAI-compatible `/chat/completions` | `OPENAI_API_KEY` env var | OpenAI Platform API credits/billing |
+| `openai-chatgpt` | ChatGPT/Codex backend (`https://chatgpt.com/backend-api/codex/responses`) | OAuth device authorization via `auth.openai.com` | ChatGPT/Codex consumer subscription quota |
+
+This path is experimental and may break if OpenAI changes the ChatGPT/Codex backend, OAuth device endpoints, required headers, model availability, or policy. It does **not** scrape browser cookies or read web session tokens; it only uses the OAuth/device flow.
+
+To connect:
+
+1. Start the daemon/dev server.
+2. Open Settings → Providers → OpenAI ChatGPT.
+3. Click **Connect**.
+4. Open the returned verification URL and enter the displayed user code.
+5. Click **Poll / Complete** until the status becomes connected.
+6. Select `OpenAI ChatGPT` in the Chat provider selector and run a message.
+
+OAuth access/refresh tokens are written only to `.agent-platform/credentials/openai-chatgpt.json` with `0600` file permissions. The SQLite DB stores no token values; API/UI responses expose only `credentialRef=file:openai-chatgpt` and status such as `needs_auth`, `connected`, `expired`, or `error`. If the access token expires, test/run attempts refresh it with the stored refresh token and rewrites the credential file.
+
+If `openai-chatgpt` is selected before connecting, the run fails explicitly with an auth-required error. It does not silently fall back to mock. Failed assistant messages expose the stored run/provider error instead of only showing `failed`.
+
 ## Architecture
 
 ```text
@@ -110,8 +142,8 @@ Package scripts
 Browser dashboard
   -> Express daemon API/SSE
   -> Kernel
-      -> ProviderRegistry (env-backed profiles, credential resolution, fallback metadata)
-      -> ProviderAdapter (mock/openai-compatible)
+      -> ProviderRegistry (env/file-backed profiles, credential resolution, fallback metadata)
+      -> ProviderAdapter (mock/openai-compatible/openai-chatgpt)
       -> StoreAdapter (SQLite)
       -> app_settings key/value JSON
 ```
@@ -123,18 +155,19 @@ The kernel deals in store/provider interfaces and an event bus. SQLite details l
 The React UI has two tabs:
 
 - `Chat`: existing session/run streaming flow
-- `Settings`: daemon status, provider profiles with credential presence and connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
+- `Settings`: daemon status, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
 
 - The event log is append-only in `events`.
 - `messages` and `message_parts` are the current read projection used to restore sessions after reload/reopen.
-- `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets are never written there.
-- `.agent-platform/` contains local runtime pid/metadata/log files and is ignored by git.
+- `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets and OAuth token values are never written there.
+- `.agent-platform/` contains local runtime pid/metadata/log/credential files and is ignored by git.
 - This is a prototype: no auth, no migration framework, and no multi-process run coordination.
 
 ## Next TODO
 
 - Add a safe `restart` lifecycle command if it becomes necessary.
 - Promote provider profiles from env/builtin records to user-managed persisted records.
+- Validate the experimental `openai-chatgpt` runtime against a real ChatGPT/Codex subscription login and adjust the request/stream payload if OpenAI changes the backend contract.
 - Add adapter install/status flows behind dashboard APIs.

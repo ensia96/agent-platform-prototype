@@ -15,6 +15,17 @@ export interface ProviderRunInput {
 
 export interface ProviderCredential {
   apiKey?: string;
+  oauth?: ProviderOAuthCredential;
+}
+
+export interface ProviderOAuthCredential {
+  type: "oauth";
+  access: string;
+  refresh?: string;
+  expiresAt?: number;
+  accountId?: string;
+  scope?: string;
+  credentialRef?: string;
 }
 
 export interface ProviderRunWriter {

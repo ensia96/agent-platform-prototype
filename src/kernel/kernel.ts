@@ -223,7 +223,13 @@ export class Kernel {
       if (controller.signal.aborted || isAbortLike(error)) {
         writer.cancel();
       } else {
-        writer.fail(toError(error));
+        const runError = toError(error);
+        console.error("Provider run failed", {
+          runId: run.id,
+          provider: provider.id,
+          error: runError.message
+        });
+        writer.fail(runError);
       }
     } finally {
       this.controllers.delete(run.id);

@@ -215,6 +215,22 @@ input {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+.messageError {
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  background: #fef2f2;
+  color: #991b1b;
+  margin-bottom: 8px;
+  padding: 10px;
+}
+
+.messageError strong {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+}
+
 .composer {
   border-top: 1px solid #d9e2ec;
   background: #f8fafc;
@@ -276,6 +292,12 @@ input {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.registryItemHeader strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .cardHeaderRow h3 {
@@ -345,7 +367,10 @@ input {
   margin-top: 12px;
 }
 
-.providerItem button {
+.providerActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 10px;
 }
 
@@ -387,6 +412,12 @@ input {
   color: #92400e;
 }
 
+.statusBadge.needs_auth,
+.statusBadge.expired {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .statusBadge.error,
 .statusBadge.disabled {
   background: #fee2e2;
@@ -413,6 +444,36 @@ input {
   background: #fef2f2;
   border: 1px solid #fecaca;
   color: #991b1b;
+}
+
+.experimentalBadge {
+  border-radius: 999px;
+  background: #ede9fe;
+  color: #5b21b6 !important;
+  float: none !important;
+  font-size: 11px !important;
+  font-weight: 600;
+  padding: 2px 7px;
+  text-transform: uppercase;
+}
+
+.authBox {
+  border: 1px solid #bfdbfe;
+  border-radius: 10px;
+  background: #eff6ff;
+  margin-top: 10px;
+  padding: 10px;
+}
+
+.authBox p {
+  margin: 6px 0;
+}
+
+.authCode {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
 }
 
 .settingEditor {
