@@ -4,6 +4,8 @@ import type {
   JsonValue,
   ISODateString,
   Message,
+  MessagePart,
+  MessagePartType,
   MessageRole,
   MessageStatus,
   Run,
@@ -47,7 +49,10 @@ export interface AddMessagePartInput {
   id: string;
   messageId: string;
   seq: number;
+  type?: MessagePartType;
   text: string;
+  content?: JsonObject;
+  metadata?: JsonObject;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
@@ -96,7 +101,7 @@ export interface StoreAdapter {
   getMessage(id: string): Message | null;
   getAssistantMessageForRun(runId: string): Message | null;
   createMessage(input: CreateMessageInput): Message;
-  addMessagePart(input: AddMessagePartInput): void;
+  addMessagePart(input: AddMessagePartInput): MessagePart;
   upsertMessageTextPart(input: UpsertMessageTextPartInput): void;
   updateMessageStatus(id: string, status: MessageStatus, updatedAt: ISODateString, error?: string | null): void;
   mergeMessageMetadata(id: string, metadata: JsonObject, updatedAt: ISODateString): void;

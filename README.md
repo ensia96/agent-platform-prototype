@@ -124,6 +124,22 @@ Chat runs accept optional `runOptions` (or legacy-compatible `options`) for mode
 
 If a provider response or stream includes usage metadata, the daemon normalizes and stores available `inputTokens`, `outputTokens`, `reasoningTokens`, and `totalTokens`, then displays them in the Chat UI. The prototype does **not** store or render raw chain-of-thought/thinking text; only provider-reported usage/reasoning token counts or future provider-provided summaries should be surfaced.
 
+### Structured messages and tool event model
+
+Messages are no longer limited to a single text projection. `message_parts` keeps a backward-compatible `text` fallback and can also store structured `content_json` plus safe `metadata_json` for these part types:
+
+- `text`
+- `error`
+- `reasoning_summary` (sanitized summary/usage metadata only; no raw thinking)
+- `tool_call`
+- `tool_result`
+- `command_output`
+- `file_ref`
+
+The run event log remains append-only and now reserves event names for future tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, and `permission.denied`.
+
+This is only the container for future capabilities. Shell execution, MCP connections, skill manifests, permission approval UI, and subagents are intentionally not implemented yet. Structured payloads and metadata must stay sanitized: API keys, OAuth tokens, credential material, and raw chain-of-thought must not be stored in message parts or events.
+
 ### Context Builder and main agent
 
 Every run now passes through a provider-neutral Context Builder before the provider adapter is called. The builder combines:
@@ -134,7 +150,7 @@ Every run now passes through a provider-neutral Context Builder before the provi
 - provider profile selection and effective run options
 - optional current, unsent input for preview requests
 
-The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `messages`, `runOptions`, `providerProfileId`, and metadata. Provider adapters then translate that context into their native request shape: OpenAI-compatible receives a chat `system` message plus context messages, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions` and text history to `input`.
+The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `messages`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning metadata are skipped by default. Provider adapters then translate that context into their native request shape: OpenAI-compatible receives a chat `system` message plus context messages, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions` and text history to `input`.
 
 The default agent is persisted in SQLite `agent_definitions`:
 
@@ -153,7 +169,7 @@ curl -X PATCH http://127.0.0.1:8787/api/agents/main \
 
 Use the Chat tab's **Context Preview** button to inspect the system prompt, text messages, and effective run options that would be sent for the selected session/agent/provider. Preview responses never include API keys, OAuth tokens, or credential values.
 
-Tools, skills, files, MCP, and subagents are intentionally not implemented yet. `AgentDefinition` and `BuiltContext` only keep optional `skillIds`/`toolIds` slots so those control-plane layers can be added later without changing the provider contract again.
+Tools, skills, files, MCP, permissions, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
 
 ### Experimental OpenAI ChatGPT/Codex OAuth profile
 
@@ -207,7 +223,7 @@ The React UI has two tabs:
 ## Notes
 
 - The event log is append-only in `events`.
-- `messages` and `message_parts` are the current read projection used to restore sessions after reload/reopen.
+- `messages` and structured `message_parts` are the current read projection used to restore sessions after reload/reopen.
 - `agent_definitions` stores the default `main` agent and future agent rows; it must not contain API keys, OAuth tokens, or credential material.
 - `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets and OAuth token values are never written there.
 - `.agent-platform/` contains local runtime pid/metadata/log/credential files and is ignored by git.
@@ -219,5 +235,5 @@ The React UI has two tabs:
 - Promote provider profiles from env/builtin records to user-managed persisted records.
 - Validate the experimental `openai-chatgpt` runtime against a real ChatGPT/Codex subscription login and adjust the request/stream payload if OpenAI changes the backend contract.
 - Add token counting/trimming and explicit context budget controls to the Context Builder.
-- Add real tools/skills/files/subagents on top of the existing optional context slots.
+- Add real shell tools, MCP providers, skills, permission gates, files, and subagents on top of the structured message/event container.
 - Add adapter install/status flows behind dashboard APIs.

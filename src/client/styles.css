@@ -292,6 +292,85 @@ input {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+.messageParts {
+  display: grid;
+  gap: 8px;
+}
+
+.messagePart {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.messagePart summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.messagePart strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.messagePartError,
+.partErrorText {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.messagePartReasoning {
+  border-color: #ddd6fe;
+  background: #f5f3ff;
+  color: #4c1d95;
+}
+
+.messagePartTool,
+.messagePartToolResult {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.messagePartCommand {
+  border-color: #d1d5db;
+  background: #111827;
+  color: #f9fafb;
+}
+
+.messagePartCommand .muted {
+  color: #cbd5e1;
+}
+
+.messagePartFile {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.partDetails {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 8px;
+  margin: 8px 0;
+}
+
+.partDetails dt,
+.contextPartTypes {
+  color: #64748b;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.partDetails dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.jsonPreview {
+  margin-top: 8px;
+}
+
 .messageError {
   border: 1px solid #fecaca;
   border-radius: 10px;

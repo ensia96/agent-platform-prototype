@@ -4,7 +4,14 @@ export type JsonValue = string | number | boolean | null | JsonValue[] | { [key:
 export type JsonObject = Record<string, JsonValue>;
 
 export type MessageRole = "system" | "user" | "assistant";
-export type MessagePartType = "text";
+export type MessagePartType =
+  | "text"
+  | "error"
+  | "reasoning_summary"
+  | "tool_call"
+  | "tool_result"
+  | "command_output"
+  | "file_ref";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
 export type RunStatus = "running" | "completed" | "cancelled" | "failed";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -51,6 +58,14 @@ export interface ContextMessage {
   content: string;
   source?: "session" | "current" | "synthetic";
   messageId?: string;
+  parts?: ContextMessagePart[];
+  metadata?: JsonObject;
+}
+
+export interface ContextMessagePart {
+  type: MessagePartType;
+  text: string;
+  sourcePartId?: string;
   metadata?: JsonObject;
 }
 
@@ -97,10 +112,67 @@ export interface MessagePart {
   messageId: string;
   seq: number;
   type: MessagePartType;
+  /**
+   * Provider/UI-safe fallback text. Structured parts keep their full public payload in
+   * `content`; never store API keys, OAuth tokens, or raw chain-of-thought here.
+   */
   text: string;
+  content: MessagePartContent;
+  metadata: JsonObject;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
+
+export type MessagePartContent = JsonObject;
+export type TextMessagePartContent = JsonObject & { text: string };
+export type ErrorMessagePartContent = JsonObject & {
+  message: string;
+  code?: string;
+  source?: "provider" | "runtime" | "tool" | "system";
+  retryable?: boolean;
+};
+export type ReasoningSummaryMessagePartContent = JsonObject & {
+  summary?: string;
+  usage?: JsonObject;
+};
+export type ToolCallMessagePartContent = JsonObject & {
+  callId: string;
+  toolId: string;
+  toolName?: string;
+  provider?: "native" | "shell" | "mcp" | "skill" | "subagent" | "internal";
+  status?: "created" | "pending" | "running" | "completed" | "failed" | "cancelled";
+  /** Sanitized public tool input only. Never persist credentials, tokens, or secret env values. */
+  input?: JsonObject;
+  inputSummary?: string;
+};
+export type ToolResultMessagePartContent = JsonObject & {
+  callId: string;
+  toolId?: string;
+  toolName?: string;
+  status: "completed" | "failed" | "cancelled";
+  output?: string;
+  outputSummary?: string;
+  error?: string;
+};
+export type CommandOutputMessagePartContent = JsonObject & {
+  commandId?: string;
+  callId?: string;
+  stream?: "stdout" | "stderr" | "combined";
+  /** Sanitized display text only; redact secrets before storing command output. */
+  text?: string;
+  exitCode?: number;
+  cwd?: string;
+  truncated?: boolean;
+};
+export type FileRefMessagePartContent = JsonObject & {
+  path?: string;
+  uri?: string;
+  name?: string;
+  mimeType?: string;
+  lineStart?: number;
+  lineEnd?: number;
+  sizeBytes?: number;
+};
 
 export interface Message {
   id: string;
@@ -132,14 +204,71 @@ export interface Run {
   error: string | null;
 }
 
-export type RunEventType =
-  | "run_started"
-  | "user_message_created"
-  | "assistant_message_created"
-  | "delta"
-  | "run_completed"
-  | "run_cancelled"
-  | "run_failed";
+export const CORE_RUN_EVENT_TYPES = [
+  "run_started",
+  "user_message_created",
+  "assistant_message_created",
+  "delta",
+  "run_completed",
+  "run_cancelled",
+  "run_failed"
+] as const;
+
+export const TOOL_RUN_EVENT_TYPES = [
+  "tool_call.created",
+  "tool_call.updated",
+  "tool_call.delta",
+  "tool.started",
+  "tool.stdout.delta",
+  "tool.stderr.delta",
+  "tool.completed",
+  "tool.failed",
+  "tool_result.created"
+] as const;
+
+export const PERMISSION_RUN_EVENT_TYPES = ["permission.requested", "permission.approved", "permission.denied"] as const;
+
+export const RUN_EVENT_TYPES = [...CORE_RUN_EVENT_TYPES, ...TOOL_RUN_EVENT_TYPES, ...PERMISSION_RUN_EVENT_TYPES] as const;
+
+export type CoreRunEventType = (typeof CORE_RUN_EVENT_TYPES)[number];
+export type ToolRunEventType = (typeof TOOL_RUN_EVENT_TYPES)[number];
+export type PermissionRunEventType = (typeof PERMISSION_RUN_EVENT_TYPES)[number];
+export type RunEventType = (typeof RUN_EVENT_TYPES)[number];
+
+export function isRunEventType(type: string): type is RunEventType {
+  return (RUN_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+export function isToolRunEventType(type: string): type is ToolRunEventType {
+  return (TOOL_RUN_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+export function isPermissionRunEventType(type: string): type is PermissionRunEventType {
+  return (PERMISSION_RUN_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+export function isTerminalRunEventType(type: string): type is "run_completed" | "run_cancelled" | "run_failed" {
+  return type === "run_completed" || type === "run_cancelled" || type === "run_failed";
+}
+
+export type ToolRunEventPayload = JsonObject & {
+  messageId?: string;
+  partId?: string;
+  callId?: string;
+  toolId?: string;
+  toolName?: string;
+  status?: string;
+  stream?: "stdout" | "stderr" | "combined";
+  text?: string;
+  error?: string;
+};
+
+export type PermissionRunEventPayload = JsonObject & {
+  requestId?: string;
+  scope?: string;
+  reason?: string;
+  status?: "requested" | "approved" | "denied";
+};
 
 export interface RunEvent<TPayload = unknown> {
   id: string;

@@ -570,6 +570,21 @@ function contextMessageToJson(message: BuiltContext["messages"][number]): JsonOb
   if (message.messageId) {
     output.messageId = message.messageId;
   }
+  if (message.parts) {
+    output.parts = message.parts.map((part) => {
+      const partOutput: JsonObject = {
+        type: part.type,
+        text: part.text
+      };
+      if (part.sourcePartId) {
+        partOutput.sourcePartId = part.sourcePartId;
+      }
+      if (part.metadata) {
+        partOutput.metadata = part.metadata;
+      }
+      return partOutput;
+    });
+  }
   if (message.metadata) {
     output.metadata = message.metadata;
   }

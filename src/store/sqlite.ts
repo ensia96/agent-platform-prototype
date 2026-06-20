@@ -65,6 +65,8 @@ type MessagePartRow = {
   seq: number;
   type: MessagePartType;
   text: string;
+  content_json: string;
+  metadata_json: string;
   created_at: string;
   updated_at: string;
 };
@@ -243,25 +245,33 @@ export class SQLiteStore implements StoreAdapter {
     return this.getMessage(input.id)!;
   }
 
-  addMessagePart(input: AddMessagePartInput): void {
+  addMessagePart(input: AddMessagePartInput): MessagePart {
     this.db
       .prepare(
-        `INSERT INTO message_parts (id, message_id, seq, type, text, created_at, updated_at, metadata_json)
-         VALUES (@id, @messageId, @seq, 'text', @text, @createdAt, @updatedAt, '{}')`
+        `INSERT INTO message_parts (id, message_id, seq, type, text, content_json, metadata_json, created_at, updated_at)
+         VALUES (@id, @messageId, @seq, @type, @text, @contentJson, @metadataJson, @createdAt, @updatedAt)`
       )
-      .run(input);
+      .run({
+        ...input,
+        type: input.type ?? "text",
+        contentJson: JSON.stringify(input.content ?? textPartContent(input.text)),
+        metadataJson: JSON.stringify(input.metadata ?? {})
+      });
+    return this.getPartsByMessageIds([input.messageId]).get(input.messageId)?.find((part) => part.id === input.id)!;
   }
 
   upsertMessageTextPart(input: UpsertMessageTextPartInput): void {
     this.db
       .prepare(
-        `INSERT INTO message_parts (id, message_id, seq, type, text, created_at, updated_at, metadata_json)
-         VALUES (@id, @messageId, 0, 'text', @text, @updatedAt, @updatedAt, '{}')
-         ON CONFLICT(message_id, seq) DO UPDATE SET
-           text = excluded.text,
-           updated_at = excluded.updated_at`
+        `INSERT INTO message_parts (id, message_id, seq, type, text, content_json, metadata_json, created_at, updated_at)
+         VALUES (@id, @messageId, 0, 'text', @text, @contentJson, '{}', @updatedAt, @updatedAt)
+          ON CONFLICT(message_id, seq) DO UPDATE SET
+            type = 'text',
+            text = excluded.text,
+            content_json = excluded.content_json,
+            updated_at = excluded.updated_at`
       )
-      .run(input);
+      .run({ ...input, contentJson: JSON.stringify(textPartContent(input.text)) });
   }
 
   updateMessageStatus(id: string, status: MessageStatus, updatedAt: string, error?: string | null): void {
@@ -471,6 +481,7 @@ export class SQLiteStore implements StoreAdapter {
         seq INTEGER NOT NULL,
         type TEXT NOT NULL,
         text TEXT NOT NULL,
+        content_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -540,7 +551,21 @@ export class SQLiteStore implements StoreAdapter {
       CREATE INDEX IF NOT EXISTS idx_provider_profiles_source ON provider_profiles(source, updated_at);
       CREATE INDEX IF NOT EXISTS idx_agent_definitions_updated_at ON agent_definitions(updated_at);
     `);
+    this.ensureMessagePartStructuredColumns();
     this.seedDefaultAgents();
+  }
+
+  private ensureMessagePartStructuredColumns(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(message_parts)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+
+    if (!columns.has("content_json")) {
+      this.db.exec("ALTER TABLE message_parts ADD COLUMN content_json TEXT NOT NULL DEFAULT '{}'");
+    }
+    if (!columns.has("metadata_json")) {
+      this.db.exec("ALTER TABLE message_parts ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'");
+    }
   }
 
   private seedDefaultAgents(): void {
@@ -573,7 +598,7 @@ export class SQLiteStore implements StoreAdapter {
     const placeholders = messageIds.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
-        `SELECT id, message_id, seq, type, text, created_at, updated_at
+        `SELECT id, message_id, seq, type, text, content_json, metadata_json, created_at, updated_at
          FROM message_parts
          WHERE message_id IN (${placeholders})
          ORDER BY message_id ASC, seq ASC`
@@ -638,12 +663,15 @@ function rowToMessage(row: MessageRow, parts: MessagePart[]): Message {
 }
 
 function rowToMessagePart(row: MessagePartRow): MessagePart {
+  const content = parseJsonObject(row.content_json);
   return {
     id: row.id,
     messageId: row.message_id,
     seq: row.seq,
     type: row.type,
     text: row.text,
+    content: Object.keys(content).length > 0 ? content : textPartContent(row.text),
+    metadata: parseJsonObject(row.metadata_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -688,6 +716,10 @@ function parseJsonObject(value: string | null | undefined): JsonObject {
   } catch {
     return {};
   }
+}
+
+function textPartContent(text: string): JsonObject {
+  return { text };
 }
 
 function isJsonObject(value: unknown): value is JsonObject {

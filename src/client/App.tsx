@@ -7,6 +7,7 @@ import type {
   CreateRunResponse,
   DaemonStatus,
   Message,
+  MessagePart,
   OpenAIChatGPTAuthPollResponse,
   OpenAIChatGPTAuthStartResponse,
   OpenAIChatGPTLogoutResponse,
@@ -272,6 +273,22 @@ export function App() {
       return;
     }
 
+    if (event.type === "tool_call.created" || event.type === "tool_result.created") {
+      const payload = event.payload as { messageId?: string; part?: MessagePart };
+      if (payload.messageId && payload.part) {
+        upsertMessagePart(payload.messageId, payload.part);
+      }
+      return;
+    }
+
+    if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
+      const payload = event.payload as { messageId?: string; partId?: string; text?: string };
+      if (payload.messageId && payload.partId && payload.text) {
+        appendPartDelta(payload.messageId, payload.partId, payload.text);
+      }
+      return;
+    }
+
     if (event.type === "run_completed" || event.type === "run_cancelled" || event.type === "run_failed") {
       const payload = event.payload as { messageId?: string; error?: string; metadata?: Message["metadata"]; usage?: RunUsage };
       if (payload.usage) {
@@ -314,23 +331,70 @@ export function App() {
           return message;
         }
 
-        const [firstPart, ...rest] = message.parts;
-        const nextPart = firstPart
-          ? { ...firstPart, text: firstPart.text + delta }
+        const textPart = message.parts.find((part) => part.type === "text");
+        const nextPart = textPart
+          ? {
+              ...textPart,
+              text: textPart.text + delta,
+              content: { ...textPart.content, text: textPart.text + delta },
+              updatedAt: new Date().toISOString()
+            }
           : {
               id: `${messageId}:local-text`,
               messageId,
               seq: 0,
               type: "text" as const,
               text: delta,
+              content: { text: delta },
+              metadata: {},
               createdAt: new Date().toISOString(),
               updatedAt: new Date().toISOString()
             };
 
+        const nextParts = textPart
+          ? message.parts.map((part) => (part.id === textPart.id ? nextPart : part))
+          : [nextPart, ...message.parts];
+
         return {
           ...message,
           status: "streaming",
-          parts: [nextPart, ...rest]
+          parts: nextParts.sort(compareParts)
+        };
+      })
+    );
+  }
+
+  function upsertMessagePart(messageId: string, part: MessagePart) {
+    setMessages((current) =>
+      current.map((message) => {
+        if (message.id !== messageId) {
+          return message;
+        }
+        const exists = message.parts.some((item) => item.id === part.id);
+        const parts = exists ? message.parts.map((item) => (item.id === part.id ? part : item)) : [...message.parts, part];
+        return { ...message, parts: parts.sort(compareParts) };
+      })
+    );
+  }
+
+  function appendPartDelta(messageId: string, partId: string, delta: string) {
+    setMessages((current) =>
+      current.map((message) => {
+        if (message.id !== messageId) {
+          return message;
+        }
+        return {
+          ...message,
+          parts: message.parts.map((part) =>
+            part.id === partId
+              ? {
+                  ...part,
+                  text: part.text + delta,
+                  content: { ...part.content, text: `${partText(part)}${delta}` },
+                  updatedAt: new Date().toISOString()
+                }
+              : part
+          )
         };
       })
     );
@@ -553,7 +617,6 @@ export function App() {
 }
 
 function MessageBody({ message }: { message: Message }) {
-  const text = messageText(message);
   return (
     <>
       {message.error && (
@@ -562,9 +625,107 @@ function MessageBody({ message }: { message: Message }) {
           <pre>{message.error}</pre>
         </div>
       )}
-      {text && <pre>{text}</pre>}
+      <div className="messageParts">
+        {message.parts.map((part) => (
+          <MessagePartView key={part.id} part={part} />
+        ))}
+      </div>
       {message.usage && <UsageSummary usage={message.usage} />}
     </>
+  );
+}
+
+function MessagePartView({ part }: { part: MessagePart }) {
+  if (part.type === "text") {
+    const text = partText(part);
+    return text ? <pre className="messageTextPart">{text}</pre> : null;
+  }
+
+  if (part.type === "error") {
+    return (
+      <div className="messagePart messagePartError">
+        <strong>Error</strong>
+        <pre>{partString(part, "message") || part.text || "Unknown error"}</pre>
+      </div>
+    );
+  }
+
+  if (part.type === "reasoning_summary") {
+    const usage = usageFromPart(part);
+    const summary = partString(part, "summary") || part.text;
+    return (
+      <details className="messagePart messagePartReasoning">
+        <summary>Reasoning metadata</summary>
+        {summary && <pre>{summary}</pre>}
+        {usage && <UsageSummary usage={usage} />}
+      </details>
+    );
+  }
+
+  if (part.type === "tool_call") {
+    return (
+      <details className="messagePart messagePartTool" open>
+        <summary>Tool call · {partString(part, "toolName") || partString(part, "toolId") || "unknown"}</summary>
+        <dl className="partDetails">
+          <dt>Call ID</dt>
+          <dd>{partString(part, "callId") || "unknown"}</dd>
+          <dt>Status</dt>
+          <dd>{partString(part, "status") || "created"}</dd>
+          {partString(part, "provider") && (
+            <>
+              <dt>Provider</dt>
+              <dd>{partString(part, "provider")}</dd>
+            </>
+          )}
+        </dl>
+        {partString(part, "inputSummary") && <pre>{partString(part, "inputSummary")}</pre>}
+        <JsonPreview value={part.content.input} label="Input" />
+      </details>
+    );
+  }
+
+  if (part.type === "tool_result") {
+    return (
+      <details className="messagePart messagePartToolResult" open>
+        <summary>
+          Tool result · {partString(part, "toolName") || partString(part, "toolId") || partString(part, "callId") || "unknown"} ·{" "}
+          {partString(part, "status") || "completed"}
+        </summary>
+        {(partString(part, "outputSummary") || partString(part, "output") || part.text) && (
+          <pre>{partString(part, "outputSummary") || partString(part, "output") || part.text}</pre>
+        )}
+        {partString(part, "error") && <pre className="partErrorText">{partString(part, "error")}</pre>}
+      </details>
+    );
+  }
+
+  if (part.type === "command_output") {
+    return (
+      <div className="messagePart messagePartCommand">
+        <strong>
+          Command output{partString(part, "stream") ? ` · ${partString(part, "stream")}` : ""}
+          {partNumber(part, "exitCode") !== null ? ` · exit ${partNumber(part, "exitCode")}` : ""}
+        </strong>
+        {partString(part, "cwd") && <span className="muted monospace">cwd: {partString(part, "cwd")}</span>}
+        <pre>{partString(part, "text") || part.text}</pre>
+      </div>
+    );
+  }
+
+  if (part.type === "file_ref") {
+    return (
+      <div className="messagePart messagePartFile">
+        <strong>File reference</strong>
+        <span className="monospace">{fileRefLabel(part)}</span>
+      </div>
+    );
+  }
+
+  return (
+    <details className="messagePart">
+      <summary>{part.type}</summary>
+      <pre>{part.text || JSON.stringify(part.content, null, 2)}</pre>
+    </details>
   );
 }
 
@@ -602,6 +763,9 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
                   {index + 1}. {message.role}
                   {message.source ? ` · ${message.source}` : ""}
                 </strong>
+                {message.parts && message.parts.length > 0 && (
+                  <span className="muted contextPartTypes">parts: {message.parts.map((part) => part.type).join(", ")}</span>
+                )}
                 <pre>{message.content}</pre>
               </div>
             ))
@@ -1127,8 +1291,70 @@ function providerResolutionNotice(resolution: ProviderResolution): string | null
   return `Provider fallback: ${resolution.fallback.message}`;
 }
 
-function messageText(message: Message): string {
-  return message.parts.map((part) => part.text).join("");
+function JsonPreview({ value, label }: { value: unknown; label: string }) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return (
+    <details className="jsonPreview">
+      <summary>{label}</summary>
+      <pre>{JSON.stringify(value, null, 2)}</pre>
+    </details>
+  );
+}
+
+function partText(part: MessagePart): string {
+  return part.text || partString(part, "text");
+}
+
+function partString(part: MessagePart, key: string): string {
+  const value = part.content[key];
+  return typeof value === "string" ? value : "";
+}
+
+function partNumber(part: MessagePart, key: string): number | null {
+  const value = part.content[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function usageFromPart(part: MessagePart): RunUsage | null {
+  const value = part.content.usage;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+
+  const usage: RunUsage = {};
+  const usageRecord = value as Record<string, unknown>;
+  if (typeof usageRecord.inputTokens === "number" && Number.isFinite(usageRecord.inputTokens)) {
+    usage.inputTokens = usageRecord.inputTokens;
+  }
+  if (typeof usageRecord.outputTokens === "number" && Number.isFinite(usageRecord.outputTokens)) {
+    usage.outputTokens = usageRecord.outputTokens;
+  }
+  if (typeof usageRecord.reasoningTokens === "number" && Number.isFinite(usageRecord.reasoningTokens)) {
+    usage.reasoningTokens = usageRecord.reasoningTokens;
+  }
+  if (typeof usageRecord.totalTokens === "number" && Number.isFinite(usageRecord.totalTokens)) {
+    usage.totalTokens = usageRecord.totalTokens;
+  }
+  return Object.keys(usage).length > 0 ? usage : null;
+}
+
+function fileRefLabel(part: MessagePart): string {
+  const location = partString(part, "path") || partString(part, "uri") || partString(part, "name") || part.text || "unknown";
+  const lineStart = partNumber(part, "lineStart");
+  const lineEnd = partNumber(part, "lineEnd");
+  if (lineStart !== null && lineEnd !== null) {
+    return `${location}:${lineStart}-${lineEnd}`;
+  }
+  if (lineStart !== null) {
+    return `${location}:${lineStart}`;
+  }
+  return location;
+}
+
+function compareParts(a: MessagePart, b: MessagePart): number {
+  return a.seq - b.seq || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
 }
 
 function compareMessages(a: Message, b: Message): number {

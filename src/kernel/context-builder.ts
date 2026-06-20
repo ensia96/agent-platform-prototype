@@ -3,8 +3,11 @@ import type {
   BuiltContext,
   ContextBuildResult,
   ContextMessage,
+  ContextMessagePart,
   JsonObject,
   Message,
+  MessagePart,
+  MessagePartType,
   RunOptions,
   Session
 } from "../shared/types";
@@ -51,7 +54,7 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
     });
   }
 
-  // TODO: add token counting, history trimming, file context, tools, skills, and subagent context slots.
+  // TODO: add token counting, history trimming, explicit file expansion, tools list injection, skills, and subagent context slots.
   const builtAt = input.builtAt ?? new Date().toISOString();
   const runOptions = cleanRunOptions(input.runOptions ?? {});
   const metadata: JsonObject = {
@@ -96,24 +99,148 @@ function messageToContextMessage(message: Message, warnings: string[], skippedMe
     return null;
   }
 
-  const content = message.parts.map((part) => part.text).join("");
+  const contextParts = message.parts.map((part) => partToContextPart(part));
+  const includedParts = contextParts.filter((part) => part.text.trim().length > 0);
+  const content = includedParts.map((part) => part.text).join("\n\n");
   if (!content.trim()) {
     skippedMessageIds.push(message.id);
     return null;
   }
+
+  const sourcePartTypes = uniquePartTypes(message.parts.map((part) => part.type));
+  const includedPartTypes = uniquePartTypes(includedParts.map((part) => part.type));
+  const skippedPartTypes = uniquePartTypes(
+    contextParts.filter((part) => !part.text.trim()).map((part) => part.type)
+  );
 
   return {
     role: message.role,
     content,
     source: "session",
     messageId: message.id,
+    parts: contextParts,
     metadata: {
       status: message.status,
       createdAt: message.createdAt,
       updatedAt: message.updatedAt,
+      sourcePartTypes,
+      includedPartTypes,
+      skippedPartTypes,
       ...(message.runId ? { runId: message.runId } : {})
     }
   };
+}
+
+function partToContextPart(part: MessagePart): ContextMessagePart {
+  const { text, skipReason } = partContextText(part);
+  const metadata: JsonObject = {
+    seq: part.seq,
+    includeInContext: Boolean(text.trim())
+  };
+  if (skipReason) {
+    metadata.skipReason = skipReason;
+  }
+
+  return {
+    type: part.type,
+    text,
+    sourcePartId: part.id,
+    metadata
+  };
+}
+
+function partContextText(part: MessagePart): { text: string; skipReason?: string } {
+  if (part.type === "text") {
+    return { text: part.text || partString(part, "text") };
+  }
+
+  if (part.type === "tool_result") {
+    const status = partString(part, "status");
+    const error = partString(part, "error");
+    if (status === "failed" || status === "cancelled" || error) {
+      return { text: "", skipReason: "failed_tool_result" };
+    }
+
+    const body = partString(part, "outputSummary") || partString(part, "output") || part.text;
+    if (!body.trim()) {
+      return { text: "", skipReason: "empty_tool_result" };
+    }
+
+    const label = ["tool result", partString(part, "toolName") || partString(part, "toolId"), partString(part, "callId")]
+      .filter(Boolean)
+      .join(" · ");
+    return { text: `[${label}]\n${body}` };
+  }
+
+  if (part.type === "command_output") {
+    const body = partString(part, "text") || part.text;
+    if (!body.trim()) {
+      return { text: "", skipReason: "empty_command_output" };
+    }
+
+    const header = [
+      "command output",
+      partString(part, "stream"),
+      partNumber(part, "exitCode") !== null ? `exit ${partNumber(part, "exitCode")}` : "",
+      partString(part, "cwd")
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return { text: `[${header}]\n${body}` };
+  }
+
+  if (part.type === "file_ref") {
+    const location = fileReferenceLabel(part);
+    if (!location) {
+      return { text: "", skipReason: "empty_file_ref" };
+    }
+    return { text: `[file reference] ${location}` };
+  }
+
+  if (part.type === "error") {
+    return { text: "", skipReason: "error_part" };
+  }
+
+  if (part.type === "reasoning_summary") {
+    return { text: "", skipReason: "reasoning_metadata_only" };
+  }
+
+  if (part.type === "tool_call") {
+    return { text: "", skipReason: "tool_call_without_result" };
+  }
+
+  return { text: "", skipReason: "unsupported_part_type" };
+}
+
+function partString(part: MessagePart, key: string): string {
+  const value = part.content[key];
+  return typeof value === "string" ? value : "";
+}
+
+function partNumber(part: MessagePart, key: string): number | null {
+  const value = part.content[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function fileReferenceLabel(part: MessagePart): string {
+  const location = partString(part, "path") || partString(part, "uri") || part.text;
+  if (!location.trim()) {
+    return "";
+  }
+
+  const lineStart = partNumber(part, "lineStart");
+  const lineEnd = partNumber(part, "lineEnd");
+  if (lineStart !== null && lineEnd !== null) {
+    return `${location}:${lineStart}-${lineEnd}`;
+  }
+  if (lineStart !== null) {
+    return `${location}:${lineStart}`;
+  }
+  return location;
+}
+
+function uniquePartTypes(types: MessagePartType[]): MessagePartType[] {
+  return [...new Set(types)];
 }
 
 function cleanRunOptions(options: RunOptions): RunOptions {
