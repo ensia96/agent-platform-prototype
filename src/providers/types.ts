@@ -1,4 +1,4 @@
-import type { Message, Session } from "../shared/types";
+import type { Message, ProviderProfile, ProviderTestResponse, Session } from "../shared/types";
 
 export interface ProviderMessage {
   role: "system" | "user" | "assistant";
@@ -9,6 +9,12 @@ export interface ProviderRunInput {
   session: Session;
   messages: ProviderMessage[];
   sourceMessages: Message[];
+  profile: ProviderProfile;
+  credential: ProviderCredential;
+}
+
+export interface ProviderCredential {
+  apiKey?: string;
 }
 
 export interface ProviderRunWriter {
@@ -23,6 +29,6 @@ export interface ProviderRunContext {
 export interface ProviderAdapter {
   id: string;
   label: string;
-  available(): boolean;
+  test(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderTestResponse>;
   run(input: ProviderRunInput, context: ProviderRunContext): Promise<void>;
 }

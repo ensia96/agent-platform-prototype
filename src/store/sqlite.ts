@@ -371,12 +371,27 @@ export class SQLiteStore implements StoreAdapter {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS provider_profiles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL,
+        base_url TEXT,
+        model TEXT,
+        credential_ref TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+
       CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
       CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts(message_id, seq);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
       CREATE INDEX IF NOT EXISTS idx_app_settings_updated_at ON app_settings(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_provider_profiles_source ON provider_profiles(source, updated_at);
     `);
   }
 

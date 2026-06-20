@@ -14,7 +14,7 @@ During development the React dashboard still runs through Vite and proxies `/api
 - Express local API server
 - SQLite via `better-sqlite3`
 - Server-Sent Events for run streaming
-- Provider adapters: mock and OpenAI-compatible `/chat/completions`
+- Provider profiles: built-in mock and env-backed OpenAI-compatible `/chat/completions`
 
 ## Setup
 
@@ -70,6 +70,9 @@ Useful environment variables:
 
 - `PORT`: daemon API port (default `8787`)
 - `AGENT_PLATFORM_DB_PATH` or `DB_PATH`: override SQLite path (default `data/app.db`)
+- `OPENAI_API_KEY`: optional API key for the env-backed OpenAI-compatible profile
+- `OPENAI_BASE_URL`: optional OpenAI-compatible base URL (default `https://api.openai.com/v1`)
+- `OPENAI_MODEL`: optional chat model (default `gpt-4o-mini`)
 
 ## API
 
@@ -77,14 +80,18 @@ Useful environment variables:
 - `GET /api/status`
 - `GET /api/settings`
 - `PATCH /api/settings` body JSON object, stored in SQLite `app_settings` as key/value JSON
+- `GET /api/providers` returns provider profiles, status, and the default profile id
+- `POST /api/providers/:id/test` tests a provider profile without storing secrets
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/runs` body `{ "text": "...", "provider": "mock" | "openai-compatible" }`
+- `POST /api/sessions/:id/runs` body `{ "text": "...", "providerProfileId": "mock" | "openai-compatible" }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
 
-If `OPENAI_API_KEY` is missing, or the requested provider is `mock`, the kernel uses the mock streaming provider. To try an OpenAI-compatible endpoint, set:
+The initial OpenAI-compatible profile is env-backed. Only the credential reference (`env:OPENAI_API_KEY`) is surfaced through the API/UI; the API key value is read by the server process at runtime and is not stored in SQLite.
+
+If `OPENAI_API_KEY` is missing, the default provider profile is `mock`. If a run explicitly requests `openai-compatible` without a key, the kernel falls back to mock and includes fallback metadata in the run response and `run_started` event. To try an OpenAI-compatible endpoint, set:
 
 ```env
 OPENAI_API_KEY=...
@@ -92,7 +99,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-Then send runs with provider `openai-compatible` from the UI selector or API.
+Then send runs with provider profile `openai-compatible` from the UI selector or API. Use `GET /api/providers` or the Settings → Providers panel to inspect profile status and run a `/models` connection test.
 
 ## Architecture
 
@@ -103,6 +110,7 @@ Package scripts
 Browser dashboard
   -> Express daemon API/SSE
   -> Kernel
+      -> ProviderRegistry (env-backed profiles, credential resolution, fallback metadata)
       -> ProviderAdapter (mock/openai-compatible)
       -> StoreAdapter (SQLite)
       -> app_settings key/value JSON
@@ -115,17 +123,18 @@ The kernel deals in store/provider interfaces and an event bus. SQLite details l
 The React UI has two tabs:
 
 - `Chat`: existing session/run streaming flow
-- `Settings`: daemon status, provider profile placeholder/current env summary, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
+- `Settings`: daemon status, provider profiles with credential presence and connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
 
 - The event log is append-only in `events`.
 - `messages` and `message_parts` are the current read projection used to restore sessions after reload/reopen.
+- `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets are never written there.
 - `.agent-platform/` contains local runtime pid/metadata/log files and is ignored by git.
 - This is a prototype: no auth, no migration framework, and no multi-process run coordination.
 
 ## Next TODO
 
 - Add a safe `restart` lifecycle command if it becomes necessary.
-- Promote provider profiles from placeholders/env summary to persisted settings-backed records.
+- Promote provider profiles from env/builtin records to user-managed persisted records.
 - Add adapter install/status flows behind dashboard APIs.

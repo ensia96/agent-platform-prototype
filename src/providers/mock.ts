@@ -1,11 +1,26 @@
-import type { ProviderAdapter, ProviderRunContext, ProviderRunInput } from "./types";
+import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput } from "./types";
+import type { ProviderProfile, ProviderTestResponse } from "../shared/types";
 
 export class MockProvider implements ProviderAdapter {
   readonly id = "mock";
   readonly label = "Mock streaming provider";
 
-  available(): boolean {
-    return true;
+  async test(profile: ProviderProfile, _credential: ProviderCredential): Promise<ProviderTestResponse> {
+    const checkedAt = new Date().toISOString();
+    const status = {
+      state: "available" as const,
+      message: "The local mock provider is always available and does not require credentials.",
+      credentialStatus: "not_required" as const,
+      checkedAt
+    };
+
+    return {
+      ok: true,
+      profile: { ...profile, status },
+      status,
+      message: status.message,
+      checkedAt
+    };
   }
 
   async run(input: ProviderRunInput, context: ProviderRunContext): Promise<void> {

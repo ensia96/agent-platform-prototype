@@ -1,5 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import type { AppSettingsResponse, CreateRunResponse, DaemonStatus, Message, RunEvent, Session } from "../shared/types";
+import type {
+  AppSettingsResponse,
+  CreateRunResponse,
+  DaemonStatus,
+  Message,
+  ProviderListResponse,
+  ProviderProfile,
+  ProviderResolution,
+  ProviderTestResponse,
+  RunEvent,
+  Session
+} from "../shared/types";
 
 type LoadState = "idle" | "loading" | "error";
 type Tab = "chat" | "settings";
@@ -9,7 +20,10 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [provider, setProvider] = useState("mock");
+  const [providers, setProviders] = useState<ProviderProfile[]>([]);
+  const [providerProfileId, setProviderProfileId] = useState("");
+  const [lastProviderResolution, setLastProviderResolution] = useState<ProviderResolution | null>(null);
+  const [providerNotice, setProviderNotice] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -18,6 +32,7 @@ export function App() {
 
   useEffect(() => {
     void loadSessions();
+    void loadProviders();
     return () => eventsRef.current?.close();
   }, []);
 
@@ -47,6 +62,18 @@ export function App() {
     setError(null);
     try {
       setMessages(await requestJson<Message[]>(`/api/sessions/${sessionId}/messages`));
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function loadProviders() {
+    try {
+      const response = await requestJson<ProviderListResponse>("/api/providers");
+      setProviders(response.providers);
+      setProviderProfileId((current) =>
+        response.providers.some((profile) => profile.id === current) ? current : response.defaultProviderProfileId
+      );
     } catch (requestError) {
       setError(toErrorMessage(requestError));
     }
@@ -83,8 +110,10 @@ export function App() {
       const response = await requestJson<CreateRunResponse>(`/api/sessions/${sessionId}/runs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, provider })
+        body: JSON.stringify({ text, providerProfileId: providerProfileId || undefined })
       });
+      setLastProviderResolution(response.providerResolution);
+      setProviderNotice(providerResolutionNotice(response.providerResolution));
       setActiveRunId(response.run.id);
       openRunEvents(response.run.id);
       void loadSessions();
@@ -136,6 +165,15 @@ export function App() {
   }
 
   function applyRunEvent(event: RunEvent) {
+    if (event.type === "run_started") {
+      const payload = event.payload as { providerResolution?: ProviderResolution };
+      if (payload.providerResolution) {
+        setLastProviderResolution(payload.providerResolution);
+        setProviderNotice(providerResolutionNotice(payload.providerResolution));
+      }
+      return;
+    }
+
     if (event.type === "user_message_created" || event.type === "assistant_message_created") {
       const payload = event.payload as { message?: Message };
       if (payload.message) {
@@ -211,6 +249,7 @@ export function App() {
   }
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
+  const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
 
   return (
     <main className="appShell">
@@ -257,16 +296,50 @@ export function App() {
             <h2>{selectedSession?.title ?? "No session"}</h2>
             <p className="muted">SQLite-backed local chat with SSE streaming.</p>
           </div>
-          <label>
-            Provider
-            <select value={provider} onChange={(event) => setProvider(event.target.value)} disabled={Boolean(activeRunId)}>
-              <option value="mock">mock</option>
-              <option value="openai-compatible">openai-compatible</option>
-            </select>
-          </label>
+          <div className="providerPicker">
+            <label>
+              Provider
+              <select
+                value={providerProfileId || "mock"}
+                onChange={(event) => {
+                  setProviderProfileId(event.target.value);
+                  setProviderNotice(null);
+                }}
+                disabled={Boolean(activeRunId)}
+              >
+                {providers.length > 0 ? (
+                  providers.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {providerOptionLabel(profile)}
+                    </option>
+                  ))
+                ) : (
+                  <>
+                    <option value="mock">mock</option>
+                    <option value="openai-compatible">openai-compatible</option>
+                  </>
+                )}
+              </select>
+            </label>
+            {selectedProviderProfile && (
+              <p className="muted providerSummary">
+                {selectedProviderProfile.type}
+                {selectedProviderProfile.model ? ` · ${selectedProviderProfile.model}` : ""} · {selectedProviderProfile.status.state}
+              </p>
+            )}
+          </div>
         </header>
 
-        {error && <div className="error">{error}</div>}
+        <div className="chatBanners">
+          {providerNotice && <div className="providerNotice">{providerNotice}</div>}
+          {lastProviderResolution && (
+            <div className="providerRunMeta">
+              Last run: {lastProviderResolution.providerProfileName} ({lastProviderResolution.providerType}
+              {lastProviderResolution.model ? ` · ${lastProviderResolution.model}` : ""})
+            </div>
+          )}
+          {error && <div className="error">{error}</div>}
+        </div>
 
         <div className="messages">
           {messages.length === 0 && <p className="muted empty">Create a session and send a message.</p>}
@@ -318,6 +391,9 @@ export function App() {
 function SettingsPanel() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [settingsData, setSettingsData] = useState<AppSettingsResponse | null>(null);
+  const [providersData, setProvidersData] = useState<ProviderListResponse | null>(null);
+  const [providerTests, setProviderTests] = useState<Record<string, ProviderTestResponse>>({});
+  const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [instanceLabel, setInstanceLabel] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [saveState, setSaveState] = useState<LoadState>("idle");
@@ -331,12 +407,14 @@ function SettingsPanel() {
     setLoadState("loading");
     setError(null);
     try {
-      const [nextStatus, nextSettings] = await Promise.all([
+      const [nextStatus, nextSettings, nextProviders] = await Promise.all([
         requestJson<DaemonStatus>("/api/status"),
-        requestJson<AppSettingsResponse>("/api/settings")
+        requestJson<AppSettingsResponse>("/api/settings"),
+        requestJson<ProviderListResponse>("/api/providers")
       ]);
       setStatus(nextStatus);
       setSettingsData(nextSettings);
+      setProvidersData(nextProviders);
       setInstanceLabel(settingValueAsString(nextSettings.settings.instanceLabel));
       setLoadState("idle");
     } catch (requestError) {
@@ -363,12 +441,27 @@ function SettingsPanel() {
     }
   }
 
+  async function testProvider(profileId: string) {
+    setTestingProviderId(profileId);
+    setError(null);
+    try {
+      const result = await requestJson<ProviderTestResponse>(`/api/providers/${encodeURIComponent(profileId)}/test`, {
+        method: "POST"
+      });
+      setProviderTests((current) => ({ ...current, [profileId]: result }));
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    } finally {
+      setTestingProviderId(null);
+    }
+  }
+
   return (
     <section className="settingsPane">
       <header className="settingsHeader">
         <div>
           <h2>Settings</h2>
-          <p className="muted">Daemon status, provider profile placeholders, and adapter registry foundation.</p>
+          <p className="muted">Daemon status, provider profiles, and adapter registry foundation.</p>
         </div>
         <button onClick={loadDashboardSettings} disabled={loadState === "loading"}>
           Refresh
@@ -406,19 +499,57 @@ function SettingsPanel() {
         </article>
 
         <article className="settingsCard">
-          <h3>Provider profiles</h3>
-          <div className="registryList">
-            {settingsData?.providerProfiles.map((profile) => (
-              <div className="registryItem" key={profile.id}>
-                <strong>{profile.name}</strong>
-                <span>{profile.status}</span>
-                <p className="muted">
-                  {profile.type} · {profile.source}
-                  {profile.model ? ` · ${profile.model}` : ""}
-                </p>
-                {profile.baseUrl && <code>{profile.baseUrl}</code>}
-              </div>
-            )) ?? <p className="muted">No provider profile data loaded yet.</p>}
+          <div className="cardHeaderRow">
+            <h3>Providers</h3>
+            {providersData && <span className="muted">default: {providersData.defaultProviderProfileId}</span>}
+          </div>
+          <div className="registryList providerList">
+            {providersData?.providers.map((profile) => {
+              const testResult = providerTests[profile.id];
+              return (
+                <div className="registryItem providerItem" key={profile.id}>
+                  <div className="registryItemHeader">
+                    <strong>{profile.name}</strong>
+                    <span className={`statusBadge ${profile.status.state}`}>{profile.status.state}</span>
+                  </div>
+                  <dl className="providerDetails">
+                    <dt>Type</dt>
+                    <dd>{profile.type}</dd>
+                    <dt>Source</dt>
+                    <dd>{profile.source}</dd>
+                    <dt>Enabled</dt>
+                    <dd>{profile.enabled ? "yes" : "no"}</dd>
+                    <dt>Credential</dt>
+                    <dd>
+                      {profile.credentialRef ?? "not required"} · {profile.status.credentialStatus}
+                    </dd>
+                    {profile.model && (
+                      <>
+                        <dt>Model</dt>
+                        <dd>{profile.model}</dd>
+                      </>
+                    )}
+                    {profile.baseUrl && (
+                      <>
+                        <dt>Base URL</dt>
+                        <dd className="monospace">{profile.baseUrl}</dd>
+                      </>
+                    )}
+                  </dl>
+                  <p className="muted">{profile.status.message}</p>
+                  <button onClick={() => void testProvider(profile.id)} disabled={testingProviderId === profile.id}>
+                    {testingProviderId === profile.id ? "Testing..." : "Test connection"}
+                  </button>
+                  {testResult && (
+                    <div className={testResult.ok ? "testResult success" : "testResult failure"}>
+                      <strong>{testResult.ok ? "Connected" : testResult.code ?? "Failed"}</strong>
+                      <p>{testResult.message}</p>
+                      {typeof testResult.latencyMs === "number" && <span>{testResult.latencyMs}ms</span>}
+                    </div>
+                  )}
+                </div>
+              );
+            }) ?? <p className="muted">No provider profile data loaded yet.</p>}
           </div>
         </article>
 
@@ -454,10 +585,22 @@ function SettingsPanel() {
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(body?.error || `${response.status} ${response.statusText}`);
+    const body = (await response.json().catch(() => null)) as { error?: string; message?: string } | null;
+    throw new Error(body?.message || body?.error || `${response.status} ${response.statusText}`);
   }
   return (await response.json()) as T;
+}
+
+function providerOptionLabel(profile: ProviderProfile): string {
+  const model = profile.model ? ` · ${profile.model}` : "";
+  return `${profile.name}${model} · ${profile.status.state}`;
+}
+
+function providerResolutionNotice(resolution: ProviderResolution): string | null {
+  if (!resolution.fallback) {
+    return null;
+  }
+  return `Provider fallback: ${resolution.fallback.message}`;
 }
 
 function messageText(message: Message): string {

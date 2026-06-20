@@ -7,6 +7,10 @@ export type MessageRole = "system" | "user" | "assistant";
 export type MessagePartType = "text";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
 export type RunStatus = "running" | "completed" | "cancelled" | "failed";
+export type ProviderProfileType = "openai-compatible" | "mock";
+export type ProviderProfileSource = "env" | "builtin" | "user";
+export type ProviderCredentialStatus = "present" | "missing" | "not_required";
+export type ProviderStatusState = "available" | "configured" | "connected" | "missing_credential" | "disabled" | "error";
 
 export interface Session {
   id: string;
@@ -68,11 +72,33 @@ export interface RunEvent<TPayload = unknown> {
 export interface CreateRunRequest {
   text: string;
   provider?: string;
+  providerProfileId?: string;
+}
+
+export interface ProviderFallbackInfo {
+  fromProviderProfileId: string | null;
+  toProviderProfileId: string;
+  reason: "missing_credential" | "disabled" | "unavailable" | "unknown_profile";
+  message: string;
+}
+
+export interface ProviderResolution {
+  requestedProvider: string | null;
+  requestedProviderProfileId: string | null;
+  providerProfileId: string;
+  providerProfileName: string;
+  providerType: ProviderProfileType;
+  model?: string;
+  baseUrl?: string;
+  credentialRef?: string;
+  fallback: ProviderFallbackInfo | null;
 }
 
 export interface CreateRunResponse {
   run: Run;
   provider: string;
+  providerProfileId: string;
+  providerResolution: ProviderResolution;
   assistantMessageId: string;
 }
 
@@ -87,16 +113,42 @@ export interface DaemonStatus {
   dbPath: string;
 }
 
-export interface ProviderProfileSummary {
+export interface ProviderStatus {
+  state: ProviderStatusState;
+  message: string;
+  credentialStatus: ProviderCredentialStatus;
+  checkedAt?: ISODateString;
+  errorCode?: string;
+}
+
+export interface ProviderProfile {
   id: string;
   name: string;
-  type: "mock" | "openai-compatible";
-  source: "built-in" | "env" | "settings";
-  status: "available" | "configured" | "missing-credential" | "planned";
+  type: ProviderProfileType;
+  source: ProviderProfileSource;
   enabled: boolean;
   baseUrl?: string;
   model?: string;
   credentialRef?: string;
+  status: ProviderStatus;
+}
+
+export type ProviderProfileSummary = ProviderProfile;
+
+export interface ProviderListResponse {
+  providers: ProviderProfile[];
+  defaultProviderProfileId: string;
+}
+
+export interface ProviderTestResponse {
+  ok: boolean;
+  profile: ProviderProfile;
+  status: ProviderStatus;
+  code?: "missing_credential" | "connection_failed" | "unsupported_profile" | "unknown_profile";
+  message: string;
+  checkedAt: ISODateString;
+  latencyMs?: number;
+  details?: JsonObject;
 }
 
 export interface AdapterRegistryItem {

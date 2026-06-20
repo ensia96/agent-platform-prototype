@@ -14,7 +14,6 @@ import type {
   DaemonStatus,
   JsonObject,
   JsonValue,
-  ProviderProfileSummary,
   RunEvent
 } from "../shared/types";
 
@@ -67,6 +66,23 @@ app.patch("/api/settings", (req, res) => {
   res.json(getSettingsResponse());
 });
 
+app.get("/api/providers", (_req, res) => {
+  res.json(providers.list());
+});
+
+app.post("/api/providers/:id/test", async (req, res, next) => {
+  try {
+    const result = await providers.testProfile(req.params.id);
+    if (!result) {
+      res.status(404).json({ error: "unknown_profile", message: `Provider profile '${req.params.id}' was not found.` });
+      return;
+    }
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/sessions", (_req, res) => {
   res.json(kernel.listSessions());
 });
@@ -89,7 +105,8 @@ app.post("/api/sessions/:id/runs", (req, res, next) => {
     const body = req.body as Partial<CreateRunRequest> | undefined;
     const text = typeof body?.text === "string" ? body.text : "";
     const provider = typeof body?.provider === "string" ? body.provider : undefined;
-    res.status(202).json(kernel.startRun(req.params.id, text, provider));
+    const providerProfileId = typeof body?.providerProfileId === "string" ? body.providerProfileId : undefined;
+    res.status(202).json(kernel.startRun(req.params.id, text, { provider, providerProfileId }));
   } catch (error) {
     next(error);
   }
@@ -220,34 +237,9 @@ function getDaemonStatus(): DaemonStatus {
 function getSettingsResponse(): AppSettingsResponse {
   return {
     settings: store.listSettings(),
-    providerProfiles: getProviderProfiles(process.env),
+    providerProfiles: providers.list().providers,
     adapters: getAdapterRegistry()
   };
-}
-
-function getProviderProfiles(env: NodeJS.ProcessEnv): ProviderProfileSummary[] {
-  const hasOpenAIKey = Boolean(env.OPENAI_API_KEY?.trim());
-  return [
-    {
-      id: "mock",
-      name: "Mock streaming provider",
-      type: "mock",
-      source: "built-in",
-      status: "available",
-      enabled: true
-    },
-    {
-      id: "openai-compatible",
-      name: "OpenAI-compatible provider",
-      type: "openai-compatible",
-      source: "env",
-      status: hasOpenAIKey ? "configured" : "missing-credential",
-      enabled: hasOpenAIKey,
-      baseUrl: env.OPENAI_BASE_URL?.trim() || "https://api.openai.com/v1",
-      model: env.OPENAI_MODEL?.trim() || "gpt-4o-mini",
-      credentialRef: "env:OPENAI_API_KEY"
-    }
-  ];
 }
 
 function getAdapterRegistry(): AdapterRegistryItem[] {

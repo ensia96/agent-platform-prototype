@@ -112,7 +112,7 @@ input {
 
 .chatPane {
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-width: 0;
   height: 100vh;
 }
@@ -128,6 +128,40 @@ input {
   gap: 8px;
   color: #475569;
   font-size: 13px;
+}
+
+.providerPicker {
+  display: grid;
+  gap: 4px;
+  justify-items: end;
+}
+
+.providerSummary {
+  margin: 0;
+}
+
+.chatBanners {
+  min-height: 0;
+}
+
+.providerNotice,
+.providerRunMeta {
+  margin: 12px 20px 0;
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 13px;
+}
+
+.providerNotice {
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.providerRunMeta {
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #1e40af;
 }
 
 .error {
@@ -236,6 +270,18 @@ input {
   margin-top: 0;
 }
 
+.cardHeaderRow,
+.registryItemHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.cardHeaderRow h3 {
+  margin-bottom: 0;
+}
+
 .statusGrid {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -272,6 +318,12 @@ input {
   font-size: 12px;
 }
 
+.registryItemHeader span,
+.testResult span,
+.cardHeaderRow span {
+  float: none;
+}
+
 .registryItem p {
   margin: 6px 0 0;
 }
@@ -287,6 +339,80 @@ input {
   margin-top: 6px;
   overflow-wrap: anywhere;
   color: #334155;
+}
+
+.providerList {
+  margin-top: 12px;
+}
+
+.providerItem button {
+  margin-top: 10px;
+}
+
+.providerDetails {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 10px;
+  margin: 10px 0;
+}
+
+.providerDetails dt {
+  color: #64748b;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.providerDetails dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.statusBadge {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+}
+
+.statusBadge.available,
+.statusBadge.connected,
+.statusBadge.configured {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.statusBadge.missing_credential {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.statusBadge.error,
+.statusBadge.disabled {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.testResult {
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 10px;
+}
+
+.testResult p {
+  margin: 4px 0;
+}
+
+.testResult.success {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  color: #166534;
+}
+
+.testResult.failure {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
 }
 
 .settingEditor {

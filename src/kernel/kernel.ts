@@ -6,6 +6,11 @@ import type { ProviderRegistry } from "../providers/registry";
 import type { StoreAdapter } from "../store/types";
 import type { CreateRunResponse, Message, Run, RunEvent, RunEventType, Session } from "../shared/types";
 
+export interface StartRunOptions {
+  provider?: string;
+  providerProfileId?: string;
+}
+
 export class KernelError extends Error {
   constructor(message: string, readonly statusCode = 500) {
     super(message);
@@ -66,19 +71,19 @@ export class Kernel {
     return run;
   }
 
-  startRun(sessionId: string, text: string, requestedProvider?: string): CreateRunResponse {
+  startRun(sessionId: string, text: string, options: StartRunOptions = {}): CreateRunResponse {
     const session = this.getSession(sessionId);
     const prompt = text.trim();
     if (!prompt) {
       throw new KernelError("Run text is required", 400);
     }
 
-    const provider = this.providers.resolve(requestedProvider);
+    const resolvedProvider = this.providers.resolveRun(options);
     const now = new Date().toISOString();
     const run = this.store.createRun({
       id: randomUUID(),
       sessionId,
-      provider: provider.id,
+      provider: resolvedProvider.profile.id,
       status: "running",
       createdAt: now,
       updatedAt: now
@@ -120,8 +125,11 @@ export class Kernel {
     this.emit(run, "run_started", {
       runId: run.id,
       sessionId,
-      provider: provider.id,
-      requestedProvider: requestedProvider ?? null
+      provider: resolvedProvider.adapter.id,
+      providerProfileId: resolvedProvider.profile.id,
+      requestedProvider: options.provider ?? null,
+      requestedProviderProfileId: options.providerProfileId ?? null,
+      providerResolution: resolvedProvider.providerResolution
     });
     this.emit(run, "user_message_created", { message: userMessageWithParts });
     this.emit(run, "assistant_message_created", { message: assistantMessageWithParts });
@@ -138,16 +146,20 @@ export class Kernel {
     const providerInput: ProviderRunInput = {
       session,
       sourceMessages: this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id),
-      messages: toProviderMessages(this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id))
+      messages: toProviderMessages(this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id)),
+      profile: resolvedProvider.profile,
+      credential: resolvedProvider.credential
     };
 
     queueMicrotask(() => {
-      void this.executeRun(run, provider, providerInput, controller, writer);
+      void this.executeRun(run, resolvedProvider.adapter, providerInput, controller, writer);
     });
 
     return {
       run,
-      provider: provider.id,
+      provider: resolvedProvider.adapter.id,
+      providerProfileId: resolvedProvider.profile.id,
+      providerResolution: resolvedProvider.providerResolution,
       assistantMessageId: assistantMessage.id
     };
   }
