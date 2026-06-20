@@ -9,7 +9,7 @@ import {
   type OpenAIChatGPTCredentialStore
 } from "./openai-chatgpt-credentials";
 import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput } from "./types";
-import type { ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
+import type { BuiltContext, ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
 
 const refreshSkewMs = 60_000;
 const defaultCodexInstructions =
@@ -208,18 +208,12 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
 }
 
 function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestPayload {
-  const systemInstructions = input.messages
+  const systemInstructions = input.context.messages
     .filter((message) => message.role === "system")
     .map((message) => message.content.trim())
     .filter(Boolean);
-  const instructions = [defaultCodexInstructions, ...systemInstructions].join("\n\n").trim();
-  const inputMessages = input.messages
-    .filter((message) => message.role !== "system")
-    .map((message) => ({
-      role: normalizeInputRole(message.role),
-      content: message.content.trim()
-    }))
-    .filter((message) => message.content.length > 0);
+  const instructions = [defaultCodexInstructions, input.context.systemPrompt.trim(), ...systemInstructions].filter(Boolean).join("\n\n").trim();
+  const inputMessages = buildCodexInputMessages(input.context);
 
   // The ChatGPT/Codex backend's public contract for reasoning effort is not stable.
   // Keep requested reasoning effort in run metadata for now rather than risking the known-good payload shape.
@@ -230,6 +224,16 @@ function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestP
     stream: true,
     input: inputMessages
   };
+}
+
+function buildCodexInputMessages(context: BuiltContext): Array<{ role: "user" | "assistant"; content: string }> {
+  return context.messages
+    .filter((message) => message.role !== "system")
+    .map((message) => ({
+      role: normalizeInputRole(message.role),
+      content: message.content.trim()
+    }))
+    .filter((message) => message.content.length > 0);
 }
 
 async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<void> {
@@ -579,7 +583,7 @@ function getModel(profile: ProviderProfile): string {
 }
 
 function getRunModel(input: ProviderRunInput): string {
-  return input.runOptions.model?.trim() || getModel(input.profile);
+  return input.context.runOptions.model?.trim() || input.runOptions.model?.trim() || getModel(input.profile);
 }
 
 function trimForDisplay(value: string, maxLength = 500): string {

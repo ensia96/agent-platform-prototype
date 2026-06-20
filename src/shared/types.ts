@@ -32,6 +32,45 @@ export interface RunOptions {
   temperature?: number;
 }
 
+export interface AgentDefinition {
+  id: string;
+  name: string;
+  description: string | null;
+  systemPrompt: string;
+  modelProfileId: string | null;
+  defaultRunOptions: RunOptions | null;
+  skillIds: string[];
+  toolIds: string[];
+  metadata: JsonObject;
+  createdAt: ISODateString;
+  updatedAt: ISODateString;
+}
+
+export interface ContextMessage {
+  role: MessageRole;
+  content: string;
+  source?: "session" | "current" | "synthetic";
+  messageId?: string;
+  metadata?: JsonObject;
+}
+
+export interface BuiltContext {
+  agent: AgentDefinition;
+  systemPrompt: string;
+  messages: ContextMessage[];
+  runOptions: RunOptions;
+  providerProfileId?: string;
+  skillIds?: string[];
+  toolIds?: string[];
+  metadata: JsonObject;
+}
+
+export interface ContextBuildResult {
+  context: BuiltContext;
+  warnings: string[];
+  skippedMessageIds: string[];
+}
+
 export interface RunUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -114,8 +153,24 @@ export interface RunEvent<TPayload = unknown> {
 
 export interface CreateRunRequest {
   text: string;
+  agentId?: string;
   provider?: string;
   providerProfileId?: string;
+  options?: RunOptions;
+  runOptions?: RunOptions;
+}
+
+export interface AgentListResponse {
+  agents: AgentDefinition[];
+  defaultAgentId: string;
+}
+
+export interface ContextPreviewRequest {
+  sessionId?: string;
+  agentId?: string;
+  provider?: string;
+  providerProfileId?: string;
+  text?: string;
   options?: RunOptions;
   runOptions?: RunOptions;
 }
@@ -141,6 +196,8 @@ export interface ProviderResolution {
 
 export interface CreateRunResponse {
   run: Run;
+  agentId: string;
+  agentName: string;
   provider: string;
   providerProfileId: string;
   providerResolution: ProviderResolution;
@@ -150,6 +207,12 @@ export interface CreateRunResponse {
   unsupportedRunOptions: string[];
   usage: RunUsage | null;
   assistantMessageId: string;
+}
+
+export interface ContextPreviewResponse extends ContextBuildResult {
+  providerResolution: ProviderResolution;
+  requestedRunOptions: RunOptions;
+  unsupportedRunOptions: string[];
 }
 
 export interface DaemonStatus {

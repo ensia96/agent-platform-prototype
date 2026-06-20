@@ -3,6 +3,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { defaultAgentId } from "../kernel/context-builder";
 import { RunEventBus } from "../kernel/event-bus";
 import { Kernel, KernelError } from "../kernel/kernel";
 import { OpenAIChatGPTAuthService } from "../providers/openai-chatgpt-auth";
@@ -16,6 +17,7 @@ import { createDefaultProviderRegistry } from "../providers/registry";
 import { SQLiteStore } from "../store/sqlite";
 import type {
   AdapterRegistryItem,
+  AgentListResponse,
   AppSettingsResponse,
   DaemonStatus,
   JsonObject,
@@ -42,6 +44,17 @@ const dbPath = resolveDbPath(process.env.AGENT_PLATFORM_DB_PATH ?? process.env.D
 const runtimeDir = resolveRuntimeDir(process.env.AGENT_PLATFORM_RUNTIME_DIR);
 const mode = process.env.NODE_ENV || "development";
 const shouldServeDashboard = mode === "production" || process.env.AGENT_PLATFORM_DAEMON === "1";
+
+type AgentDefinitionPatch = {
+  name?: string;
+  description?: string | null;
+  systemPrompt?: string;
+  modelProfileId?: string | null;
+  defaultRunOptions?: RunOptions | null;
+  skillIds?: string[];
+  toolIds?: string[];
+  metadata?: JsonObject;
+};
 
 const store = new SQLiteStore({ dbPath });
 const eventBus = new RunEventBus();
@@ -82,6 +95,50 @@ app.patch("/api/settings", (req, res) => {
     store.setSetting(key, value, updatedAt);
   }
   res.json(getSettingsResponse());
+});
+
+app.get("/api/agents", (_req, res) => {
+  const response: AgentListResponse = {
+    agents: kernel.listAgentDefinitions(),
+    defaultAgentId
+  };
+  res.json(response);
+});
+
+app.get("/api/agents/:id", (req, res, next) => {
+  try {
+    res.json(kernel.getAgentDefinition(req.params.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/agents/:id", (req, res, next) => {
+  try {
+    const patch = parseAgentDefinitionPatch(req.body);
+    res.json(
+      kernel.updateAgentDefinition({
+        id: req.params.id,
+        ...patch,
+        updatedAt: new Date().toISOString()
+      })
+    );
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/context/preview", (req, res, next) => {
+  try {
+    const body = requestBodyObject(req.body);
+    const sessionId = optionalString(body.sessionId);
+    if (!sessionId) {
+      throw new KernelError("Context preview requires body field 'sessionId'.", 400);
+    }
+    res.json(buildContextPreview(sessionId, body));
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/providers", (_req, res) => {
@@ -147,6 +204,14 @@ app.post("/api/sessions", (req, res) => {
   res.status(201).json(kernel.createSession(title));
 });
 
+app.post("/api/sessions/:id/context/preview", (req, res, next) => {
+  try {
+    res.json(buildContextPreview(req.params.id, requestBodyObject(req.body)));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/sessions/:id/messages", (req, res, next) => {
   try {
     res.json(kernel.listMessages(req.params.id));
@@ -159,10 +224,11 @@ app.post("/api/sessions/:id/runs", (req, res, next) => {
   try {
     const body = req.body as Record<string, unknown> | undefined;
     const text = typeof body?.text === "string" ? body.text : "";
+    const agentId = typeof body?.agentId === "string" ? body.agentId : undefined;
     const provider = typeof body?.provider === "string" ? body.provider : undefined;
     const providerProfileId = typeof body?.providerProfileId === "string" ? body.providerProfileId : undefined;
     const runOptions = parseRunOptionsFromBody(body);
-    res.status(202).json(kernel.startRun(req.params.id, text, { provider, providerProfileId, runOptions }));
+    res.status(202).json(kernel.startRun(req.params.id, text, { agentId, provider, providerProfileId, runOptions }));
   } catch (error) {
     next(error);
   }
@@ -310,6 +376,17 @@ function getSettingsResponse(): AppSettingsResponse {
   };
 }
 
+function buildContextPreview(sessionId: string, body: Record<string, unknown>) {
+  const runOptions = parseRunOptionsFromBody(body);
+  return kernel.previewContext(sessionId, {
+    agentId: optionalString(body.agentId),
+    provider: optionalString(body.provider),
+    providerProfileId: optionalString(body.providerProfileId),
+    runOptions,
+    text: optionalString(body.text)
+  });
+}
+
 function getAdapterRegistry(): AdapterRegistryItem[] {
   return [
     {
@@ -387,8 +464,107 @@ function extractSettingsPatch(body: unknown): JsonObject | null {
   return patch;
 }
 
+function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
+  if (!isPlainObject(body)) {
+    throw new KernelError("PATCH /api/agents/:id expects a JSON object.", 400);
+  }
+
+  const allowedKeys = new Set([
+    "name",
+    "description",
+    "systemPrompt",
+    "modelProfileId",
+    "defaultRunOptions",
+    "skillIds",
+    "toolIds",
+    "metadata"
+  ]);
+  for (const key of Object.keys(body)) {
+    if (!allowedKeys.has(key)) {
+      throw new KernelError(`Unsupported agent definition field '${key}'.`, 400);
+    }
+  }
+
+  const patch: AgentDefinitionPatch = {};
+  if ("name" in body) {
+    if (typeof body.name !== "string") {
+      throw new KernelError("Agent field 'name' must be a string.", 400);
+    }
+    const name = body.name.trim();
+    if (!name || name.length > 120) {
+      throw new KernelError("Agent field 'name' must be 1-120 characters.", 400);
+    }
+    patch.name = name;
+  }
+
+  if ("description" in body) {
+    if (body.description === null || body.description === undefined) {
+      patch.description = null;
+    } else if (typeof body.description === "string") {
+      const description = body.description.trim();
+      if (description.length > 1000) {
+        throw new KernelError("Agent field 'description' must be 1000 characters or fewer.", 400);
+      }
+      patch.description = description || null;
+    } else {
+      throw new KernelError("Agent field 'description' must be a string or null.", 400);
+    }
+  }
+
+  if ("systemPrompt" in body) {
+    if (typeof body.systemPrompt !== "string") {
+      throw new KernelError("Agent field 'systemPrompt' must be a string.", 400);
+    }
+    if (!body.systemPrompt.trim() || body.systemPrompt.length > 20_000) {
+      throw new KernelError("Agent field 'systemPrompt' must be 1-20000 characters.", 400);
+    }
+    patch.systemPrompt = body.systemPrompt;
+  }
+
+  if ("modelProfileId" in body) {
+    if (body.modelProfileId === null || body.modelProfileId === undefined || body.modelProfileId === "") {
+      patch.modelProfileId = null;
+    } else if (typeof body.modelProfileId === "string") {
+      const modelProfileId = body.modelProfileId.trim();
+      if (modelProfileId.length > 120) {
+        throw new KernelError("Agent field 'modelProfileId' must be 120 characters or fewer.", 400);
+      }
+      patch.modelProfileId = modelProfileId || null;
+    } else {
+      throw new KernelError("Agent field 'modelProfileId' must be a string or null.", 400);
+    }
+  }
+
+  if ("defaultRunOptions" in body) {
+    patch.defaultRunOptions = body.defaultRunOptions === null ? null : parseRunOptionsValue(body.defaultRunOptions) ?? {};
+  }
+
+  if ("skillIds" in body) {
+    patch.skillIds = parseStringList(body.skillIds, "skillIds");
+  }
+  if ("toolIds" in body) {
+    patch.toolIds = parseStringList(body.toolIds, "toolIds");
+  }
+
+  if ("metadata" in body) {
+    if (!isPlainObject(body.metadata) || !isJsonValue(body.metadata)) {
+      throw new KernelError("Agent field 'metadata' must be a JSON object.", 400);
+    }
+    if (containsSensitiveKey(body.metadata)) {
+      throw new KernelError("Agent metadata must not contain credential, token, secret, or API key fields.", 400);
+    }
+    patch.metadata = body.metadata;
+  }
+
+  return patch;
+}
+
 function parseRunOptionsFromBody(body: Record<string, unknown> | undefined): RunOptions | undefined {
   const rawOptions = body?.runOptions ?? body?.options;
+  return parseRunOptionsValue(rawOptions);
+}
+
+function parseRunOptionsValue(rawOptions: unknown): RunOptions | undefined {
   if (rawOptions === undefined || rawOptions === null) {
     return undefined;
   }
@@ -470,6 +646,54 @@ function isJsonValue(value: unknown): value is JsonValue {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requestBodyObject(body: unknown): Record<string, unknown> {
+  return isPlainObject(body) ? body : {};
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseStringList(value: unknown, fieldName: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new KernelError(`Agent field '${fieldName}' must be an array of strings.`, 400);
+  }
+  if (value.length > 100) {
+    throw new KernelError(`Agent field '${fieldName}' must contain 100 IDs or fewer.`, 400);
+  }
+  const output: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      throw new KernelError(`Agent field '${fieldName}' must be an array of strings.`, 400);
+    }
+    const trimmed = item.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed.length > 120) {
+      throw new KernelError(`Agent field '${fieldName}' IDs must be 120 characters or fewer.`, 400);
+    }
+    if (!output.includes(trimmed)) {
+      output.push(trimmed);
+    }
+  }
+  return output;
+}
+
+function containsSensitiveKey(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(containsSensitiveKey);
+  }
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  return Object.entries(value).some(([key, nested]) => isSensitiveMetadataKey(key) || containsSensitiveKey(nested));
+}
+
+function isSensitiveMetadataKey(key: string): boolean {
+  return /authorization|cookie|token|secret|api[_-]?key|credential|password|refresh|access/i.test(key);
 }
 
 function parsePort(value: string | undefined): number {

@@ -1,6 +1,6 @@
 import type { ProviderAdapter, ProviderRunContext, ProviderRunInput } from "./types";
 import { extractRunUsage } from "./usage";
-import type { ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
+import type { BuiltContext, ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
 
 const defaultBaseUrl = "https://api.openai.com/v1";
 const defaultModel = "gpt-4o-mini";
@@ -137,13 +137,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     const requestBody: Record<string, unknown> = {
       model,
       stream: true,
-      messages: input.messages.map((message) => ({
-        role: message.role,
-        content: message.content
-      }))
+      messages: buildOpenAICompatibleMessages(input.context)
     };
-    if (typeof input.runOptions.temperature === "number" && Number.isFinite(input.runOptions.temperature)) {
-      requestBody.temperature = input.runOptions.temperature;
+    if (typeof input.context.runOptions.temperature === "number" && Number.isFinite(input.context.runOptions.temperature)) {
+      requestBody.temperature = input.context.runOptions.temperature;
     }
 
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -270,7 +267,25 @@ function getModel(profile: ProviderProfile): string {
 }
 
 function getRunModel(input: ProviderRunInput): string {
-  return input.runOptions.model?.trim() || getModel(input.profile);
+  return input.context.runOptions.model?.trim() || input.runOptions.model?.trim() || getModel(input.profile);
+}
+
+function buildOpenAICompatibleMessages(context: BuiltContext): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+  const systemPrompt = context.systemPrompt.trim();
+  if (systemPrompt) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+
+  for (const message of context.messages) {
+    const content = message.content.trim();
+    if (!content) {
+      continue;
+    }
+    messages.push({ role: message.role, content });
+  }
+
+  return messages;
 }
 
 function credentialRefLabel(profile: ProviderProfile): string {

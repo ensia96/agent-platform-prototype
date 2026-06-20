@@ -1,4 +1,5 @@
 import type {
+  AgentDefinition,
   JsonObject,
   JsonValue,
   ISODateString,
@@ -8,6 +9,7 @@ import type {
   Run,
   RunEvent,
   RunEventType,
+  RunOptions,
   RunStatus,
   Session
 } from "../shared/types";
@@ -66,6 +68,19 @@ export interface AppendEventInput {
   payload: unknown;
 }
 
+export interface UpdateAgentDefinitionInput {
+  id: string;
+  name?: string;
+  description?: string | null;
+  systemPrompt?: string;
+  modelProfileId?: string | null;
+  defaultRunOptions?: RunOptions | null;
+  skillIds?: string[];
+  toolIds?: string[];
+  metadata?: JsonObject;
+  updatedAt: ISODateString;
+}
+
 export interface StoreAdapter {
   listSessions(): Session[];
   getSession(id: string): Session | null;
@@ -88,6 +103,10 @@ export interface StoreAdapter {
 
   appendEvent(input: AppendEventInput): RunEvent;
   listEvents(runId: string): RunEvent[];
+
+  listAgentDefinitions(): AgentDefinition[];
+  getAgentDefinition(id: string): AgentDefinition | null;
+  updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition | null;
 
   listSettings(): JsonObject;
   setSetting(key: string, value: JsonValue, updatedAt: ISODateString): void;

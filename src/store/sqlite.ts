@@ -8,9 +8,11 @@ import type {
   CreateRunInput,
   CreateSessionInput,
   StoreAdapter,
+  UpdateAgentDefinitionInput,
   UpsertMessageTextPartInput
 } from "./types";
 import type {
+  AgentDefinition,
   JsonObject,
   JsonValue,
   Message,
@@ -80,6 +82,20 @@ type EventRow = {
 type SettingRow = {
   key: string;
   value_json: string;
+  updated_at: string;
+};
+
+type AgentDefinitionRow = {
+  id: string;
+  name: string;
+  description: string | null;
+  system_prompt: string;
+  model_profile_id: string | null;
+  default_run_options_json: string;
+  skill_ids_json: string;
+  tool_ids_json: string;
+  metadata_json: string;
+  created_at: string;
   updated_at: string;
 };
 
@@ -318,6 +334,79 @@ export class SQLiteStore implements StoreAdapter {
     return rows.map(rowToEvent);
   }
 
+  listAgentDefinitions(): AgentDefinition[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, name, description, system_prompt, model_profile_id, default_run_options_json,
+                skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
+         FROM agent_definitions
+         ORDER BY CASE id WHEN 'main' THEN 0 ELSE 1 END, name ASC, id ASC`
+      )
+      .all() as AgentDefinitionRow[];
+    return rows.map(rowToAgentDefinition);
+  }
+
+  getAgentDefinition(id: string): AgentDefinition | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, name, description, system_prompt, model_profile_id, default_run_options_json,
+                skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
+         FROM agent_definitions
+         WHERE id = ?`
+      )
+      .get(id) as AgentDefinitionRow | undefined;
+    return row ? rowToAgentDefinition(row) : null;
+  }
+
+  updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition | null {
+    const current = this.getAgentDefinition(input.id);
+    if (!current) {
+      return null;
+    }
+
+    const next: AgentDefinition = {
+      ...current,
+      name: input.name ?? current.name,
+      description: input.description !== undefined ? input.description : current.description,
+      systemPrompt: input.systemPrompt ?? current.systemPrompt,
+      modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
+      defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
+      skillIds: input.skillIds ?? current.skillIds,
+      toolIds: input.toolIds ?? current.toolIds,
+      metadata: input.metadata ?? current.metadata,
+      updatedAt: input.updatedAt
+    };
+
+    this.db
+      .prepare(
+        `UPDATE agent_definitions
+         SET name = @name,
+             description = @description,
+             system_prompt = @systemPrompt,
+             model_profile_id = @modelProfileId,
+             default_run_options_json = @defaultRunOptionsJson,
+             skill_ids_json = @skillIdsJson,
+             tool_ids_json = @toolIdsJson,
+             metadata_json = @metadataJson,
+             updated_at = @updatedAt
+         WHERE id = @id`
+      )
+      .run({
+        id: next.id,
+        name: next.name,
+        description: next.description,
+        systemPrompt: next.systemPrompt,
+        modelProfileId: next.modelProfileId,
+        defaultRunOptionsJson: JSON.stringify(runOptionsToJsonObject(next.defaultRunOptions ?? {})),
+        skillIdsJson: JSON.stringify(next.skillIds),
+        toolIdsJson: JSON.stringify(next.toolIds),
+        metadataJson: JSON.stringify(next.metadata),
+        updatedAt: next.updatedAt
+      });
+
+    return this.getAgentDefinition(input.id);
+  }
+
   listSettings(): JsonObject {
     const rows = this.db
       .prepare("SELECT key, value_json, updated_at FROM app_settings ORDER BY key ASC")
@@ -428,6 +517,20 @@ export class SQLiteStore implements StoreAdapter {
         metadata_json TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS agent_definitions (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        system_prompt TEXT NOT NULL,
+        model_profile_id TEXT,
+        default_run_options_json TEXT NOT NULL DEFAULT '{}',
+        skill_ids_json TEXT NOT NULL DEFAULT '[]',
+        tool_ids_json TEXT NOT NULL DEFAULT '[]',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
       CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
@@ -435,7 +538,31 @@ export class SQLiteStore implements StoreAdapter {
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
       CREATE INDEX IF NOT EXISTS idx_app_settings_updated_at ON app_settings(updated_at);
       CREATE INDEX IF NOT EXISTS idx_provider_profiles_source ON provider_profiles(source, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_agent_definitions_updated_at ON agent_definitions(updated_at);
     `);
+    this.seedDefaultAgents();
+  }
+
+  private seedDefaultAgents(): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO agent_definitions (
+           id, name, description, system_prompt, model_profile_id, default_run_options_json,
+           skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
+         )
+         VALUES (@id, @name, @description, @systemPrompt, NULL, '{}', '[]', '[]', @metadataJson, @createdAt, @updatedAt)
+         ON CONFLICT(id) DO NOTHING`
+      )
+      .run({
+        id: "main",
+        name: "Mango",
+        description: "Default main assistant agent.",
+        systemPrompt: "You are Mango, a helpful local assistant. Be concise, safe, and ask clarifying questions when requirements are unclear.",
+        metadataJson: JSON.stringify({ builtin: true, version: 1 }),
+        createdAt: now,
+        updatedAt: now
+      });
   }
 
   private getPartsByMessageIds(messageIds: string[]): Map<string, MessagePart[]> {
@@ -534,6 +661,22 @@ function rowToEvent(row: EventRow): RunEvent {
   };
 }
 
+function rowToAgentDefinition(row: AgentDefinitionRow): AgentDefinition {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    systemPrompt: row.system_prompt,
+    modelProfileId: row.model_profile_id,
+    defaultRunOptions: runOptionsFromJsonObject(parseJsonObject(row.default_run_options_json)),
+    skillIds: parseStringArray(row.skill_ids_json),
+    toolIds: parseStringArray(row.tool_ids_json),
+    metadata: parseJsonObject(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
 function parseJsonObject(value: string | null | undefined): JsonObject {
   if (!value) {
     return {};
@@ -561,6 +704,10 @@ function runOptionsFromMetadata(metadata: JsonObject): RunOptions | null {
     return null;
   }
 
+  return runOptionsFromJsonObject(value);
+}
+
+function runOptionsFromJsonObject(value: JsonObject): RunOptions | null {
   const runOptions: RunOptions = {};
   if (typeof value.model === "string" && value.model.trim()) {
     runOptions.model = value.model;
@@ -573,6 +720,36 @@ function runOptionsFromMetadata(metadata: JsonObject): RunOptions | null {
   }
 
   return Object.keys(runOptions).length > 0 ? runOptions : null;
+}
+
+function runOptionsToJsonObject(options: RunOptions): JsonObject {
+  const output: JsonObject = {};
+  if (options.model) {
+    output.model = options.model;
+  }
+  if (options.reasoningEffort) {
+    output.reasoningEffort = options.reasoningEffort;
+  }
+  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
+    output.temperature = options.temperature;
+  }
+  return output;
+}
+
+function parseStringArray(value: string | null | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  } catch {
+    return [];
+  }
 }
 
 function usageFromMetadata(metadata: JsonObject): RunUsage | null {

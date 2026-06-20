@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import type {
+  AgentDefinition,
+  AgentListResponse,
   AppSettingsResponse,
+  ContextPreviewResponse,
   CreateRunResponse,
   DaemonStatus,
   Message,
@@ -27,6 +30,8 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
+  const [agents, setAgents] = useState<AgentDefinition[]>([]);
+  const [agentId, setAgentId] = useState("main");
   const [providerProfileId, setProviderProfileId] = useState("");
   const [modelOverride, setModelOverride] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
@@ -36,6 +41,8 @@ export function App() {
   const [lastRunUsage, setLastRunUsage] = useState<RunUsage | null>(null);
   const [lastUnsupportedRunOptions, setLastUnsupportedRunOptions] = useState<string[]>([]);
   const [providerNotice, setProviderNotice] = useState<string | null>(null);
+  const [contextPreview, setContextPreview] = useState<ContextPreviewResponse | null>(null);
+  const [contextPreviewState, setContextPreviewState] = useState<LoadState>("idle");
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +52,7 @@ export function App() {
   useEffect(() => {
     void loadSessions();
     void loadProviders();
+    void loadAgents();
     return () => eventsRef.current?.close();
   }, []);
 
@@ -59,6 +67,7 @@ export function App() {
   useEffect(() => {
     if (activeTab === "chat") {
       void loadProviders();
+      void loadAgents();
     }
   }, [activeTab]);
 
@@ -97,6 +106,16 @@ export function App() {
     }
   }
 
+  async function loadAgents() {
+    try {
+      const response = await requestJson<AgentListResponse>("/api/agents");
+      setAgents(response.agents);
+      setAgentId((current) => (response.agents.some((agent) => agent.id === current) ? current : response.defaultAgentId));
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    }
+  }
+
   async function createSession() {
     setError(null);
     try {
@@ -126,11 +145,13 @@ export function App() {
       }
 
       setInput("");
+      setContextPreview(null);
       const response = await requestJson<CreateRunResponse>(`/api/sessions/${sessionId}/runs`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text,
+          agentId: agentId || "main",
           providerProfileId: providerProfileId || undefined,
           runOptions: hasRunOptions(runOptions) ? runOptions : undefined
         })
@@ -158,6 +179,34 @@ export function App() {
     try {
       await requestJson(`/api/runs/${activeRunId}/cancel`, { method: "POST" });
     } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function previewContext() {
+    if (!selectedSessionId) {
+      setError("Create or select a session before previewing context.");
+      return;
+    }
+
+    setContextPreviewState("loading");
+    setError(null);
+    try {
+      const runOptions = buildRunOptionsFromForm(modelOverride, reasoningEffort, temperature);
+      const response = await requestJson<ContextPreviewResponse>(`/api/sessions/${selectedSessionId}/context/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentId: agentId || "main",
+          providerProfileId: providerProfileId || undefined,
+          runOptions: hasRunOptions(runOptions) ? runOptions : undefined,
+          text: input.trim() || undefined
+        })
+      });
+      setContextPreview(response);
+      setContextPreviewState("idle");
+    } catch (requestError) {
+      setContextPreviewState("error");
       setError(toErrorMessage(requestError));
     }
   }
@@ -288,6 +337,7 @@ export function App() {
   }
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
+  const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
   const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
 
   return (
@@ -336,6 +386,26 @@ export function App() {
             <p className="muted">SQLite-backed local chat with SSE streaming.</p>
           </div>
           <div className="chatControls">
+            <div className="agentPicker">
+              <label>
+                Agent
+                <select value={agentId || "main"} onChange={(event) => setAgentId(event.target.value)} disabled={Boolean(activeRunId)}>
+                  {agents.length > 0 ? (
+                    agents.map((agent) => (
+                      <option key={agent.id} value={agent.id}>
+                        {agent.name} ({agent.id})
+                      </option>
+                    ))
+                  ) : (
+                    <option value="main">Mango (main)</option>
+                  )}
+                </select>
+              </label>
+              <p className="muted providerSummary">
+                {selectedAgent ? `System prompt: ${selectedAgent.systemPrompt.slice(0, 96)}${selectedAgent.systemPrompt.length > 96 ? "…" : ""}` : "Main agent"}
+              </p>
+            </div>
+
             <div className="providerPicker">
               <label>
                 Provider
@@ -429,6 +499,7 @@ export function App() {
             </div>
           )}
           {error && <div className="error">{error}</div>}
+          {contextPreview && <ContextPreviewPanel preview={contextPreview} />}
         </div>
 
         <div className="messages">
@@ -459,6 +530,9 @@ export function App() {
             rows={3}
           />
           <div className="composerActions">
+            <button type="button" onClick={() => void previewContext()} disabled={Boolean(activeRunId) || contextPreviewState === "loading"}>
+              {contextPreviewState === "loading" ? "Previewing..." : "Context Preview"}
+            </button>
             {activeRunId ? (
               <button type="button" onClick={cancelRun}>
                 Cancel
@@ -502,10 +576,48 @@ function UsageSummary({ usage }: { usage: RunUsage }) {
   return <div className="usageSummary">Usage: {summary}</div>;
 }
 
+function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
+  return (
+    <details className="contextPreview" open>
+      <summary>
+        Context preview · {preview.context.agent.name} · {preview.context.messages.length} messages · {preview.providerResolution.providerProfileName}
+      </summary>
+      <div className="contextPreviewGrid">
+        <section>
+          <h4>System prompt</h4>
+          <pre>{preview.context.systemPrompt}</pre>
+        </section>
+        <section>
+          <h4>Run options</h4>
+          <pre>{JSON.stringify(preview.context.runOptions, null, 2)}</pre>
+        </section>
+        <section className="contextMessagesPreview">
+          <h4>Messages</h4>
+          {preview.context.messages.length === 0 ? (
+            <p className="muted">No text messages in context.</p>
+          ) : (
+            preview.context.messages.map((message, index) => (
+              <div className="contextMessage" key={`${message.messageId ?? "current"}-${index}`}>
+                <strong>
+                  {index + 1}. {message.role}
+                  {message.source ? ` · ${message.source}` : ""}
+                </strong>
+                <pre>{message.content}</pre>
+              </div>
+            ))
+          )}
+        </section>
+      </div>
+      {preview.warnings.length > 0 && <p className="muted">Warnings: {preview.warnings.join(" ")}</p>}
+    </details>
+  );
+}
+
 function SettingsPanel() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [settingsData, setSettingsData] = useState<AppSettingsResponse | null>(null);
   const [providersData, setProvidersData] = useState<ProviderListResponse | null>(null);
+  const [agentsData, setAgentsData] = useState<AgentListResponse | null>(null);
   const [providerTests, setProviderTests] = useState<Record<string, ProviderTestResponse>>({});
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [chatGPTAuthStart, setChatGPTAuthStart] = useState<OpenAIChatGPTAuthStartResponse | null>(null);
@@ -513,8 +625,11 @@ function SettingsPanel() {
   const [chatGPTAuthBusy, setChatGPTAuthBusy] = useState<"start" | "poll" | "logout" | null>(null);
   const [copiedAuthCode, setCopiedAuthCode] = useState(false);
   const [instanceLabel, setInstanceLabel] = useState("");
+  const [mainAgentName, setMainAgentName] = useState("");
+  const [mainAgentSystemPrompt, setMainAgentSystemPrompt] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [saveState, setSaveState] = useState<LoadState>("idle");
+  const [agentSaveState, setAgentSaveState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -525,15 +640,18 @@ function SettingsPanel() {
     setLoadState("loading");
     setError(null);
     try {
-      const [nextStatus, nextSettings, nextProviders] = await Promise.all([
+      const [nextStatus, nextSettings, nextProviders, nextAgents] = await Promise.all([
         requestJson<DaemonStatus>("/api/status"),
         requestJson<AppSettingsResponse>("/api/settings"),
-        requestJson<ProviderListResponse>("/api/providers")
+        requestJson<ProviderListResponse>("/api/providers"),
+        requestJson<AgentListResponse>("/api/agents")
       ]);
       setStatus(nextStatus);
       setSettingsData(nextSettings);
       setProvidersData(nextProviders);
+      setAgentsData(nextAgents);
       setInstanceLabel(settingValueAsString(nextSettings.settings.instanceLabel));
+      applyMainAgentDraft(nextAgents.agents.find((agent) => agent.id === nextAgents.defaultAgentId) ?? nextAgents.agents[0] ?? null);
       setLoadState("idle");
     } catch (requestError) {
       setLoadState("error");
@@ -555,6 +673,41 @@ function SettingsPanel() {
       setSaveState("idle");
     } catch (requestError) {
       setSaveState("error");
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  function applyMainAgentDraft(agent: AgentDefinition | null) {
+    setMainAgentName(agent?.name ?? "Mango");
+    setMainAgentSystemPrompt(agent?.systemPrompt ?? "");
+  }
+
+  async function saveMainAgent() {
+    setAgentSaveState("loading");
+    setError(null);
+    try {
+      const agent = await requestJson<AgentDefinition>("/api/agents/main", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: mainAgentName.trim() || "Mango",
+          systemPrompt: mainAgentSystemPrompt
+        })
+      });
+      setAgentsData((current) =>
+        current
+          ? {
+              ...current,
+              agents: current.agents.some((item) => item.id === agent.id)
+                ? current.agents.map((item) => (item.id === agent.id ? agent : item))
+                : [agent, ...current.agents]
+            }
+          : { agents: [agent], defaultAgentId: agent.id }
+      );
+      applyMainAgentDraft(agent);
+      setAgentSaveState("idle");
+    } catch (requestError) {
+      setAgentSaveState("error");
       setError(toErrorMessage(requestError));
     }
   }
@@ -685,6 +838,49 @@ function SettingsPanel() {
           ) : (
             <p className="muted">No daemon status loaded yet.</p>
           )}
+        </article>
+
+        <article className="settingsCard agentSettingsCard">
+          <div className="cardHeaderRow">
+            <h3>Main Agent</h3>
+            {agentsData && <span className="muted">default: {agentsData.defaultAgentId}</span>}
+          </div>
+          <p className="muted">
+            The main agent controls the system prompt that is injected by the provider-neutral Context Builder before each run.
+          </p>
+          <label className="settingEditor">
+            Agent name
+            <input value={mainAgentName} onChange={(event) => setMainAgentName(event.target.value)} placeholder="Mango" />
+          </label>
+          <label className="settingEditor">
+            System prompt
+            <textarea
+              className="agentPromptEditor"
+              value={mainAgentSystemPrompt}
+              onChange={(event) => setMainAgentSystemPrompt(event.target.value)}
+              rows={8}
+              placeholder="Define how the main agent should behave..."
+            />
+          </label>
+          <div className="providerActions">
+            <button onClick={() => void saveMainAgent()} disabled={agentSaveState === "loading" || !mainAgentSystemPrompt.trim()}>
+              {agentSaveState === "loading" ? "Saving..." : "Save main agent"}
+            </button>
+            <button
+              onClick={() => applyMainAgentDraft(agentsData?.agents.find((agent) => agent.id === "main") ?? null)}
+              disabled={agentSaveState === "loading"}
+            >
+              Reset draft
+            </button>
+          </div>
+          <dl className="providerDetails">
+            <dt>Agent ID</dt>
+            <dd>main</dd>
+            <dt>Skills</dt>
+            <dd>{agentsData?.agents.find((agent) => agent.id === "main")?.skillIds.length ?? 0} configured (future)</dd>
+            <dt>Tools</dt>
+            <dd>{agentsData?.agents.find((agent) => agent.id === "main")?.toolIds.length ?? 0} configured (future)</dd>
+          </dl>
         </article>
 
         <article className="settingsCard">

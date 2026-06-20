@@ -130,6 +130,7 @@ input {
   font-size: 13px;
 }
 
+.agentPicker,
 .providerPicker {
   display: grid;
   gap: 4px;
@@ -187,6 +188,57 @@ input {
   border: 1px solid #bfdbfe;
   background: #eff6ff;
   color: #1e40af;
+}
+
+.contextPreview {
+  margin: 12px 20px 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.contextPreview summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.contextPreviewGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.contextPreview h4 {
+  margin: 0 0 6px;
+}
+
+.contextPreview pre,
+.contextMessage pre,
+.agentPromptEditor {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.contextPreview pre,
+.contextMessage pre {
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 8px;
+  background: #f8fafc;
+  margin: 0;
+  padding: 8px;
+}
+
+.contextMessagesPreview {
+  grid-column: 1 / -1;
+}
+
+.contextMessage {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 8px;
+  margin-top: 8px;
 }
 
 .error {
@@ -515,6 +567,18 @@ input {
   color: #475569;
   font-size: 13px;
   margin-bottom: 10px;
+}
+
+.agentSettingsCard {
+  grid-column: span 2;
+}
+
+.agentPromptEditor {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 10px;
 }
 
 .settingsJson {

@@ -85,6 +85,11 @@ Useful environment variables:
 - `GET /api/status`
 - `GET /api/settings`
 - `PATCH /api/settings` body JSON object, stored in SQLite `app_settings` as key/value JSON
+- `GET /api/agents` returns persisted agent definitions; the default is `main`
+- `GET /api/agents/:id` returns one agent definition
+- `PATCH /api/agents/:id` updates safe agent fields such as `name`, `systemPrompt`, `modelProfileId`, `defaultRunOptions`, `skillIds`, and `toolIds` (no credential/token storage)
+- `POST /api/context/preview` body `{ "sessionId": "...", "agentId": "main", "providerProfileId": "mock", "text": "optional current input", "runOptions": { ... } }`
+- `POST /api/sessions/:id/context/preview` previews the provider-neutral context for a session without starting a run
 - `GET /api/providers` returns provider profiles, status, and the default profile id
 - `POST /api/providers/:id/test` tests a provider profile without storing secrets
 - `POST /api/providers/openai-chatgpt/auth/start` starts the experimental ChatGPT/Codex device authorization flow
@@ -93,7 +98,7 @@ Useful environment variables:
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/runs` body `{ "text": "...", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
+- `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
 
@@ -118,6 +123,37 @@ Chat runs accept optional `runOptions` (or legacy-compatible `options`) for mode
 - `mock`: options are accepted for UI/API consistency but are not sent to a model runtime.
 
 If a provider response or stream includes usage metadata, the daemon normalizes and stores available `inputTokens`, `outputTokens`, `reasoningTokens`, and `totalTokens`, then displays them in the Chat UI. The prototype does **not** store or render raw chain-of-thought/thinking text; only provider-reported usage/reasoning token counts or future provider-provided summaries should be surfaced.
+
+### Context Builder and main agent
+
+Every run now passes through a provider-neutral Context Builder before the provider adapter is called. The builder combines:
+
+- the selected session and text message history (`messages`/`message_parts`)
+- the selected `AgentDefinition` (defaults to `main`)
+- the agent system prompt
+- provider profile selection and effective run options
+- optional current, unsent input for preview requests
+
+The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `messages`, `runOptions`, `providerProfileId`, and metadata. Provider adapters then translate that context into their native request shape: OpenAI-compatible receives a chat `system` message plus context messages, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions` and text history to `input`.
+
+The default agent is persisted in SQLite `agent_definitions`:
+
+```text
+id: main
+name: Mango
+```
+
+Edit it in Settings → Main Agent or with:
+
+```bash
+curl -X PATCH http://127.0.0.1:8787/api/agents/main \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Mango","systemPrompt":"You are Mango, a helpful local assistant. Be concise and safe."}'
+```
+
+Use the Chat tab's **Context Preview** button to inspect the system prompt, text messages, and effective run options that would be sent for the selected session/agent/provider. Preview responses never include API keys, OAuth tokens, or credential values.
+
+Tools, skills, files, MCP, and subagents are intentionally not implemented yet. `AgentDefinition` and `BuiltContext` only keep optional `skillIds`/`toolIds` slots so those control-plane layers can be added later without changing the provider contract again.
 
 ### Experimental OpenAI ChatGPT/Codex OAuth profile
 
@@ -152,25 +188,27 @@ Package scripts
 Browser dashboard
   -> Express daemon API/SSE
   -> Kernel
+      -> ContextBuilder (AgentDefinition + system prompt + message history + run options)
       -> ProviderRegistry (env/file-backed profiles, credential resolution, fallback metadata)
       -> ProviderAdapter (mock/openai-compatible/openai-chatgpt)
       -> StoreAdapter (SQLite)
-      -> app_settings key/value JSON
+      -> agent_definitions and app_settings JSON
 ```
 
-The kernel deals in store/provider interfaces and an event bus. SQLite details live under `src/store`; provider HTTP/SSE parsing lives under `src/providers`.
+The kernel deals in store/provider interfaces, the provider-neutral context builder, and an event bus. SQLite details live under `src/store`; provider HTTP/SSE parsing lives under `src/providers`.
 
 ## Dashboard
 
 The React UI has two tabs:
 
 - `Chat`: existing session/run streaming flow
-- `Settings`: daemon status, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
+- `Settings`: daemon status, main agent/system prompt editor, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
 
 - The event log is append-only in `events`.
 - `messages` and `message_parts` are the current read projection used to restore sessions after reload/reopen.
+- `agent_definitions` stores the default `main` agent and future agent rows; it must not contain API keys, OAuth tokens, or credential material.
 - `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets and OAuth token values are never written there.
 - `.agent-platform/` contains local runtime pid/metadata/log/credential files and is ignored by git.
 - This is a prototype: no auth, no migration framework, and no multi-process run coordination.
@@ -180,4 +218,6 @@ The React UI has two tabs:
 - Add a safe `restart` lifecycle command if it becomes necessary.
 - Promote provider profiles from env/builtin records to user-managed persisted records.
 - Validate the experimental `openai-chatgpt` runtime against a real ChatGPT/Codex subscription login and adjust the request/stream payload if OpenAI changes the backend contract.
+- Add token counting/trimming and explicit context budget controls to the Context Builder.
+- Add real tools/skills/files/subagents on top of the existing optional context slots.
 - Add adapter install/status flows behind dashboard APIs.

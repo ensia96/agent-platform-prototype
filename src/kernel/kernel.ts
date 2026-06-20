@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
+import { buildContext, defaultAgentId } from "./context-builder";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import { RunWriter } from "./run-writer";
 import type { ProviderAdapter, ProviderMessage, ProviderRunInput } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
-import type { StoreAdapter } from "../store/types";
+import type { StoreAdapter, UpdateAgentDefinitionInput } from "../store/types";
 import type {
+  AgentDefinition,
+  BuiltContext,
+  ContextPreviewResponse,
   CreateRunResponse,
   JsonObject,
   Message,
@@ -18,9 +22,14 @@ import type {
 } from "../shared/types";
 
 export interface StartRunOptions {
+  agentId?: string;
   provider?: string;
   providerProfileId?: string;
   runOptions?: RunOptions;
+}
+
+export interface PreviewContextOptions extends StartRunOptions {
+  text?: string;
 }
 
 interface RunOptionPlan {
@@ -81,6 +90,55 @@ export class Kernel {
     return this.store.listMessages(sessionId);
   }
 
+  listAgentDefinitions(): AgentDefinition[] {
+    return this.store.listAgentDefinitions();
+  }
+
+  getAgentDefinition(id = defaultAgentId): AgentDefinition {
+    const agent = this.store.getAgentDefinition(id.trim() || defaultAgentId);
+    if (!agent) {
+      throw new KernelError("Agent definition not found", 404);
+    }
+    return agent;
+  }
+
+  updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition {
+    const agent = this.store.updateAgentDefinition(input);
+    if (!agent) {
+      throw new KernelError("Agent definition not found", 404);
+    }
+    return agent;
+  }
+
+  previewContext(sessionId: string, options: PreviewContextOptions = {}): ContextPreviewResponse {
+    const session = this.getSession(sessionId);
+    const agent = this.getAgentDefinition(options.agentId ?? defaultAgentId);
+    const resolvedProvider = this.providers.resolveRun({
+      provider: options.provider,
+      providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
+    });
+    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, mergeRunOptions(agent.defaultRunOptions, options.runOptions));
+    const providerResolution: ProviderResolution = {
+      ...resolvedProvider.providerResolution,
+      model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
+    };
+    const contextResult = buildContext({
+      session,
+      agent,
+      messages: this.store.listMessages(sessionId),
+      currentMessage: options.text?.trim() ? { content: options.text } : undefined,
+      providerProfileId: resolvedProvider.profile.id,
+      runOptions: optionPlan.runOptions
+    });
+
+    return {
+      ...contextResult,
+      providerResolution,
+      requestedRunOptions: optionPlan.requestedRunOptions,
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions
+    };
+  }
+
   getRun(runId: string): Run {
     const run = this.store.getRun(runId);
     if (!run) {
@@ -96,13 +154,18 @@ export class Kernel {
       throw new KernelError("Run text is required", 400);
     }
 
-    const resolvedProvider = this.providers.resolveRun(options);
-    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, options.runOptions ?? {});
+    const agent = this.getAgentDefinition(options.agentId ?? defaultAgentId);
+    const requestedRunOptions = mergeRunOptions(agent.defaultRunOptions, options.runOptions);
+    const resolvedProvider = this.providers.resolveRun({
+      provider: options.provider,
+      providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
+    });
+    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, requestedRunOptions);
     const providerResolution: ProviderResolution = {
       ...resolvedProvider.providerResolution,
       model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
     };
-    const runMetadata = buildRunMetadata(providerResolution, optionPlan);
+    const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {});
     const now = new Date().toISOString();
     const run = this.store.createRun({
       id: randomUUID(),
@@ -145,6 +208,20 @@ export class Kernel {
       metadata: runMetadata
     });
 
+    const sourceMessages = this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id);
+    const contextResult = buildContext({
+      session,
+      agent,
+      messages: sourceMessages,
+      providerProfileId: resolvedProvider.profile.id,
+      runOptions: optionPlan.runOptions,
+      metadata: { runId: run.id }
+    });
+    const contextMetadata = buildContextRunMetadata(contextResult.context, contextResult.warnings, contextResult.skippedMessageIds);
+    this.store.mergeRunMetadata(run.id, contextMetadata, now);
+    this.store.mergeMessageMetadata(assistantMessage.id, contextMetadata, now);
+
+    const runWithMetadata = this.store.getRun(run.id)!;
     const userMessageWithParts = this.store.getMessage(userMessage.id)!;
     const assistantMessageWithParts = this.store.getMessage(assistantMessage.id)!;
 
@@ -156,9 +233,11 @@ export class Kernel {
       requestedProvider: options.provider ?? null,
       requestedProviderProfileId: options.providerProfileId ?? null,
       providerResolution,
+      agent: agentToJson(agent),
       requestedRunOptions: optionPlan.requestedRunOptions,
       runOptions: optionPlan.runOptions,
       unsupportedRunOptions: optionPlan.unsupportedRunOptions,
+      context: contextSummaryToJson(contextResult.context, contextResult.warnings, contextResult.skippedMessageIds),
       model: optionPlan.runOptions.model ?? null
     });
     this.emit(run, "user_message_created", { message: userMessageWithParts });
@@ -169,14 +248,15 @@ export class Kernel {
     const writer = new RunWriter({
       store: this.store,
       eventBus: this.eventBus,
-      run,
+      run: runWithMetadata,
       assistantMessageId: assistantMessage.id
     });
 
     const providerInput: ProviderRunInput = {
       session,
-      sourceMessages: this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id),
-      messages: toProviderMessages(this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id)),
+      context: contextResult.context,
+      sourceMessages,
+      messages: toProviderMessages(contextResult.context),
       profile: resolvedProvider.profile,
       credential: resolvedProvider.credential,
       requestedRunOptions: optionPlan.requestedRunOptions,
@@ -185,11 +265,13 @@ export class Kernel {
     };
 
     queueMicrotask(() => {
-      void this.executeRun(run, resolvedProvider.adapter, providerInput, controller, writer);
+      void this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, controller, writer);
     });
 
     return {
-      run,
+      run: runWithMetadata,
+      agentId: agent.id,
+      agentName: agent.name,
       provider: resolvedProvider.adapter.id,
       providerProfileId: resolvedProvider.profile.id,
       providerResolution,
@@ -334,6 +416,10 @@ function buildRunOptionPlan(profile: ProviderProfile, requested: RunOptions): Ru
   return { requestedRunOptions, runOptions, unsupportedRunOptions };
 }
 
+function mergeRunOptions(agentDefaults: RunOptions | null | undefined, runOptions: RunOptions | null | undefined): RunOptions {
+  return cleanRunOptions({ ...(agentDefaults ?? {}), ...(runOptions ?? {}) });
+}
+
 function cleanRunOptions(options: RunOptions): RunOptions {
   const output: RunOptions = {};
   const model = options.model?.trim();
@@ -349,8 +435,16 @@ function cleanRunOptions(options: RunOptions): RunOptions {
   return output;
 }
 
-function buildRunMetadata(providerResolution: ProviderResolution, optionPlan: RunOptionPlan): JsonObject {
+function buildRunMetadata(
+  providerResolution: ProviderResolution,
+  optionPlan: RunOptionPlan,
+  agent: AgentDefinition,
+  userRunOptions: RunOptions
+): JsonObject {
   const metadata: JsonObject = {
+    agentId: agent.id,
+    agentName: agent.name,
+    agent: agentToJson(agent),
     providerProfileId: providerResolution.providerProfileId,
     providerProfileName: providerResolution.providerProfileName,
     providerType: providerResolution.providerType,
@@ -358,6 +452,8 @@ function buildRunMetadata(providerResolution: ProviderResolution, optionPlan: Ru
     requestedProviderProfileId: providerResolution.requestedProviderProfileId,
     providerResolution: providerResolutionToJson(providerResolution),
     runOptions: runOptionsToJson(optionPlan.runOptions),
+    agentDefaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
+    userRunOptions: runOptionsToJson(userRunOptions),
     requestedRunOptions: runOptionsToJson(optionPlan.requestedRunOptions),
     unsupportedRunOptions: optionPlan.unsupportedRunOptions
   };
@@ -415,15 +511,102 @@ function runOptionsToJson(options: RunOptions): JsonObject {
   return output;
 }
 
-function toProviderMessages(messages: Message[]): ProviderMessage[] {
-  return messages
-    .map((message) => ({
-      role: message.role,
-      content: message.parts.map((part) => part.text).join("")
-    }))
-    .filter((message): message is ProviderMessage =>
-      (message.role === "system" || message.role === "user" || message.role === "assistant") && message.content.length > 0
-    );
+function buildContextRunMetadata(context: BuiltContext, warnings: string[], skippedMessageIds: string[]): JsonObject {
+  const metadata: JsonObject = {
+    contextSnapshot: builtContextToJson(context),
+    contextBuilder: contextSummaryToJson(context, warnings, skippedMessageIds)
+  };
+  if (warnings.length > 0) {
+    metadata.contextWarnings = warnings;
+  }
+  if (skippedMessageIds.length > 0) {
+    metadata.skippedContextMessageIds = skippedMessageIds;
+  }
+  return metadata;
+}
+
+function contextSummaryToJson(context: BuiltContext, warnings: string[], skippedMessageIds: string[]): JsonObject {
+  return {
+    kind: "provider-neutral-context",
+    agentId: context.agent.id,
+    agentName: context.agent.name,
+    providerProfileId: context.providerProfileId ?? null,
+    systemPromptLength: context.systemPrompt.length,
+    messageCount: context.messages.length,
+    runOptions: runOptionsToJson(context.runOptions),
+    warningCount: warnings.length,
+    skippedMessageIds
+  };
+}
+
+function builtContextToJson(context: BuiltContext): JsonObject {
+  const output: JsonObject = {
+    agent: agentToJson(context.agent),
+    systemPrompt: context.systemPrompt,
+    messages: context.messages.map((message) => contextMessageToJson(message)),
+    runOptions: runOptionsToJson(context.runOptions),
+    metadata: context.metadata
+  };
+  if (context.providerProfileId) {
+    output.providerProfileId = context.providerProfileId;
+  }
+  if (context.skillIds) {
+    output.skillIds = context.skillIds;
+  }
+  if (context.toolIds) {
+    output.toolIds = context.toolIds;
+  }
+  return output;
+}
+
+function contextMessageToJson(message: BuiltContext["messages"][number]): JsonObject {
+  const output: JsonObject = {
+    role: message.role,
+    content: message.content
+  };
+  if (message.source) {
+    output.source = message.source;
+  }
+  if (message.messageId) {
+    output.messageId = message.messageId;
+  }
+  if (message.metadata) {
+    output.metadata = message.metadata;
+  }
+  return output;
+}
+
+function agentToJson(agent: AgentDefinition): JsonObject {
+  const output: JsonObject = {
+    id: agent.id,
+    name: agent.name,
+    description: agent.description,
+    modelProfileId: agent.modelProfileId,
+    defaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
+    skillIds: agent.skillIds,
+    toolIds: agent.toolIds,
+    metadata: agent.metadata,
+    createdAt: agent.createdAt,
+    updatedAt: agent.updatedAt
+  };
+  return output;
+}
+
+function toProviderMessages(context: BuiltContext): ProviderMessage[] {
+  const messages: ProviderMessage[] = [];
+  const systemPrompt = context.systemPrompt.trim();
+  if (systemPrompt) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+
+  for (const message of context.messages) {
+    const content = message.content.trim();
+    if (!content) {
+      continue;
+    }
+    messages.push({ role: message.role, content });
+  }
+  return messages;
 }
 
 function isAbortLike(error: unknown): boolean {

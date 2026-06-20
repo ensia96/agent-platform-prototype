@@ -24,8 +24,15 @@ export class MockProvider implements ProviderAdapter {
   }
 
   async run(input: ProviderRunInput, context: ProviderRunContext): Promise<void> {
-    const lastUserMessage = [...input.messages].reverse().find((message) => message.role === "user");
+    const lastUserMessage = [...input.context.messages].reverse().find((message) => message.role === "user");
     const prompt = lastUserMessage?.content.trim() || "(empty prompt)";
+    await context.writer.writeMetadata({
+      mockContext: {
+        agentId: input.context.agent.id,
+        agentName: input.context.agent.name,
+        messageCount: input.context.messages.length
+      }
+    });
     const response =
       `Mock response for: ${prompt}\n\n` +
       "This local provider streams small chunks so the SSE pipeline, SQLite projection, reload, and cancel behavior can be tested without an API key.";

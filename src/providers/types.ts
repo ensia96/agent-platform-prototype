@@ -1,4 +1,4 @@
-import type { JsonObject, Message, ProviderProfile, ProviderTestResponse, RunOptions, RunUsage, Session } from "../shared/types";
+import type { BuiltContext, JsonObject, Message, ProviderProfile, ProviderTestResponse, RunOptions, RunUsage, Session } from "../shared/types";
 
 export interface ProviderMessage {
   role: "system" | "user" | "assistant";
@@ -7,6 +7,7 @@ export interface ProviderMessage {
 
 export interface ProviderRunInput {
   session: Session;
+  context: BuiltContext;
   messages: ProviderMessage[];
   sourceMessages: Message[];
   profile: ProviderProfile;
