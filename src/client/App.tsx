@@ -6,6 +6,7 @@ import type {
   ContextPreviewResponse,
   CreateRunResponse,
   DaemonStatus,
+  InvokeToolResponse,
   Message,
   MessagePart,
   OpenAIChatGPTAuthPollResponse,
@@ -19,11 +20,14 @@ import type {
   RunOptions,
   RunUsage,
   RunEvent,
-  Session
+  Session,
+  ToolDefinition,
+  ToolListResponse
 } from "../shared/types";
 
 type LoadState = "idle" | "loading" | "error";
 type Tab = "chat" | "settings";
+type ShellToolState = "idle" | "running" | "completed" | "failed";
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -32,6 +36,7 @@ export function App() {
   const [input, setInput] = useState("");
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [agents, setAgents] = useState<AgentDefinition[]>([]);
+  const [tools, setTools] = useState<ToolDefinition[]>([]);
   const [agentId, setAgentId] = useState("main");
   const [providerProfileId, setProviderProfileId] = useState("");
   const [modelOverride, setModelOverride] = useState("");
@@ -44,6 +49,11 @@ export function App() {
   const [providerNotice, setProviderNotice] = useState<string | null>(null);
   const [contextPreview, setContextPreview] = useState<ContextPreviewResponse | null>(null);
   const [contextPreviewState, setContextPreviewState] = useState<LoadState>("idle");
+  const [shellCommand, setShellCommand] = useState("");
+  const [shellCwd, setShellCwd] = useState("");
+  const [shellTimeoutMs, setShellTimeoutMs] = useState("60000");
+  const [shellToolState, setShellToolState] = useState<ShellToolState>("idle");
+  const [lastShellResponse, setLastShellResponse] = useState<InvokeToolResponse | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -54,6 +64,7 @@ export function App() {
     void loadSessions();
     void loadProviders();
     void loadAgents();
+    void loadTools();
     return () => eventsRef.current?.close();
   }, []);
 
@@ -69,6 +80,7 @@ export function App() {
     if (activeTab === "chat") {
       void loadProviders();
       void loadAgents();
+      void loadTools();
     }
   }, [activeTab]);
 
@@ -112,6 +124,15 @@ export function App() {
       const response = await requestJson<AgentListResponse>("/api/agents");
       setAgents(response.agents);
       setAgentId((current) => (response.agents.some((agent) => agent.id === current) ? current : response.defaultAgentId));
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function loadTools() {
+    try {
+      const response = await requestJson<ToolListResponse>("/api/tools");
+      setTools(response.tools);
     } catch (requestError) {
       setError(toErrorMessage(requestError));
     }
@@ -212,6 +233,45 @@ export function App() {
     }
   }
 
+  async function executeShellTool() {
+    const command = shellCommand.trim();
+    if (!command || shellToolState === "running") {
+      return;
+    }
+
+    setError(null);
+    setLastShellResponse(null);
+    setShellToolState("running");
+    let sessionId = selectedSessionId;
+    try {
+      if (!sessionId) {
+        const session = await requestJson<Session>("/api/sessions", { method: "POST" });
+        setSessions((current) => [session, ...current]);
+        setSelectedSessionId(session.id);
+        sessionId = session.id;
+      }
+
+      const timeoutMs = parseShellTimeout(shellTimeoutMs);
+      const response = await requestJson<InvokeToolResponse>(`/api/sessions/${sessionId}/tools/shell.exec`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          command,
+          cwd: shellCwd.trim() || undefined,
+          timeoutMs
+        })
+      });
+      setLastShellResponse(response);
+      setShellToolState(response.result.status === "completed" ? "completed" : "failed");
+      upsertMessage(response.message);
+      void loadMessages(sessionId);
+      void loadSessions();
+    } catch (requestError) {
+      setShellToolState("failed");
+      setError(toErrorMessage(requestError));
+    }
+  }
+
   function openRunEvents(runId: string) {
     eventsRef.current?.close();
     const source = new EventSource(`/api/runs/${runId}/events`);
@@ -281,8 +341,25 @@ export function App() {
       return;
     }
 
+    if (event.type === "tool.started" || event.type === "tool.completed" || event.type === "tool.failed") {
+      const payload = event.payload as { messageId?: string; part?: MessagePart; outputPart?: MessagePart; error?: string };
+      if (payload.messageId && payload.part) {
+        upsertMessagePart(payload.messageId, payload.part);
+      }
+      if (payload.messageId && payload.outputPart) {
+        upsertMessagePart(payload.messageId, payload.outputPart);
+      }
+      if (payload.error) {
+        setError(payload.error);
+      }
+      return;
+    }
+
     if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
-      const payload = event.payload as { messageId?: string; partId?: string; text?: string };
+      const payload = event.payload as { messageId?: string; partId?: string; part?: MessagePart; text?: string };
+      if (payload.messageId && payload.part) {
+        upsertMessagePart(payload.messageId, payload.part);
+      }
       if (payload.messageId && payload.partId && payload.text) {
         appendPartDelta(payload.messageId, payload.partId, payload.text);
       }
@@ -403,6 +480,7 @@ export function App() {
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
   const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
+  const shellTool = tools.find((tool) => tool.id === "shell.exec") ?? null;
 
   return (
     <main className="appShell">
@@ -564,6 +642,19 @@ export function App() {
           )}
           {error && <div className="error">{error}</div>}
           {contextPreview && <ContextPreviewPanel preview={contextPreview} />}
+          <ShellToolPanel
+            tool={shellTool}
+            command={shellCommand}
+            cwd={shellCwd}
+            timeoutMs={shellTimeoutMs}
+            state={shellToolState}
+            lastResponse={lastShellResponse}
+            disabled={Boolean(activeRunId)}
+            onCommandChange={setShellCommand}
+            onCwdChange={setShellCwd}
+            onTimeoutChange={setShellTimeoutMs}
+            onRun={() => void executeShellTool()}
+          />
         </div>
 
         <div className="messages">
@@ -705,6 +796,8 @@ function MessagePartView({ part }: { part: MessagePart }) {
         <strong>
           Command output{partString(part, "stream") ? ` · ${partString(part, "stream")}` : ""}
           {partNumber(part, "exitCode") !== null ? ` · exit ${partNumber(part, "exitCode")}` : ""}
+          {partBoolean(part, "timedOut") ? " · timed out" : ""}
+          {partBoolean(part, "truncated") ? " · truncated" : ""}
         </strong>
         {partString(part, "cwd") && <span className="muted monospace">cwd: {partString(part, "cwd")}</span>}
         <pre>{partString(part, "text") || part.text}</pre>
@@ -773,6 +866,80 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
         </section>
       </div>
       {preview.warnings.length > 0 && <p className="muted">Warnings: {preview.warnings.join(" ")}</p>}
+    </details>
+  );
+}
+
+function ShellToolPanel({
+  tool,
+  command,
+  cwd,
+  timeoutMs,
+  state,
+  lastResponse,
+  disabled,
+  onCommandChange,
+  onCwdChange,
+  onTimeoutChange,
+  onRun
+}: {
+  tool: ToolDefinition | null;
+  command: string;
+  cwd: string;
+  timeoutMs: string;
+  state: ShellToolState;
+  lastResponse: InvokeToolResponse | null;
+  disabled: boolean;
+  onCommandChange: (value: string) => void;
+  onCwdChange: (value: string) => void;
+  onTimeoutChange: (value: string) => void;
+  onRun: () => void;
+}) {
+  const busy = state === "running";
+  const result = lastResponse?.result;
+  return (
+    <details className="shellToolPanel" open>
+      <summary>
+        Shell Tool · {tool?.id ?? "shell.exec"} · {state}
+      </summary>
+      <p className="muted">
+        Manual local shell execution only. Permission approval/policy is a placeholder for the next step, so run trusted commands carefully.
+      </p>
+      <form
+        className="shellToolForm"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onRun();
+        }}
+      >
+        <label>
+          Command
+          <input value={command} onChange={(event) => onCommandChange(event.target.value)} placeholder="echo hello" disabled={disabled || busy} />
+        </label>
+        <label>
+          cwd
+          <input value={cwd} onChange={(event) => onCwdChange(event.target.value)} placeholder="workspace root" disabled={disabled || busy} />
+        </label>
+        <label>
+          Timeout (ms)
+          <input value={timeoutMs} onChange={(event) => onTimeoutChange(event.target.value)} placeholder="60000" disabled={disabled || busy} />
+        </label>
+        <button type="submit" disabled={disabled || busy || !command.trim() || !tool}>
+          {busy ? "Running..." : "Run shell.exec"}
+        </button>
+      </form>
+      <p className="muted shellToolMeta">
+        {tool
+          ? `Registered built-in tool. cwd must stay inside the workspace root. Default timeout: ${tool.metadata.defaultTimeoutMs ?? "server default"}ms.`
+          : "Tool registry has not loaded shell.exec yet."}
+      </p>
+      {result && (
+        <div className={result.status === "completed" ? "shellToolResult success" : "shellToolResult failure"}>
+          <strong>{result.status}</strong>
+          <span>{summarizeShellResponse(lastResponse)}</span>
+          {result.error && <pre>{result.error}</pre>}
+        </div>
+      )}
     </details>
   );
 }
@@ -1246,6 +1413,18 @@ function buildRunOptionsFromForm(modelOverride: string, reasoningEffort: Reasoni
   return runOptions;
 }
 
+function parseShellTimeout(value: string): number | undefined {
+  const text = value.trim();
+  if (!text) {
+    return undefined;
+  }
+  const parsed = Number(text);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error("Shell timeout must be a positive integer number of milliseconds.");
+  }
+  return parsed;
+}
+
 function hasRunOptions(options: RunOptions): boolean {
   return Boolean(options.model || options.reasoningEffort || options.temperature !== undefined);
 }
@@ -1284,6 +1463,18 @@ function formatRunOptionSupport(support: NonNullable<ProviderProfile["runOptionS
   ].join(" · ");
 }
 
+function summarizeShellResponse(response: InvokeToolResponse | null): string {
+  if (!response) {
+    return "";
+  }
+  const output = response.result.output;
+  const exitCode = typeof output.exitCode === "number" ? `exit ${output.exitCode}` : "exit unknown";
+  const duration = typeof output.durationMs === "number" ? `${output.durationMs}ms` : "duration unknown";
+  const timedOut = output.timedOut === true ? " · timed out" : "";
+  const truncated = output.stdoutTruncated === true || output.stderrTruncated === true ? " · output truncated" : "";
+  return `${exitCode} · ${duration}${timedOut}${truncated}`;
+}
+
 function providerResolutionNotice(resolution: ProviderResolution): string | null {
   if (!resolution.fallback) {
     return null;
@@ -1315,6 +1506,10 @@ function partString(part: MessagePart, key: string): string {
 function partNumber(part: MessagePart, key: string): number | null {
   const value = part.content[key];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function partBoolean(part: MessagePart, key: string): boolean {
+  return part.content[key] === true;
 }
 
 function usageFromPart(part: MessagePart): RunUsage | null {

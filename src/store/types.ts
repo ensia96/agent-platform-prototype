@@ -64,6 +64,14 @@ export interface UpsertMessageTextPartInput {
   updatedAt: ISODateString;
 }
 
+export interface UpdateMessagePartInput {
+  id: string;
+  text: string;
+  content?: JsonObject;
+  metadata?: JsonObject;
+  updatedAt: ISODateString;
+}
+
 export interface AppendEventInput {
   id: string;
   runId: string;
@@ -103,6 +111,7 @@ export interface StoreAdapter {
   createMessage(input: CreateMessageInput): Message;
   addMessagePart(input: AddMessagePartInput): MessagePart;
   upsertMessageTextPart(input: UpsertMessageTextPartInput): void;
+  updateMessagePart(input: UpdateMessagePartInput): MessagePart | null;
   updateMessageStatus(id: string, status: MessageStatus, updatedAt: ISODateString, error?: string | null): void;
   mergeMessageMetadata(id: string, metadata: JsonObject, updatedAt: ISODateString): void;
 

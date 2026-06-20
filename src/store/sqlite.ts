@@ -9,6 +9,7 @@ import type {
   CreateSessionInput,
   StoreAdapter,
   UpdateAgentDefinitionInput,
+  UpdateMessagePartInput,
   UpsertMessageTextPartInput
 } from "./types";
 import type {
@@ -272,6 +273,36 @@ export class SQLiteStore implements StoreAdapter {
             updated_at = excluded.updated_at`
       )
       .run({ ...input, contentJson: JSON.stringify(textPartContent(input.text)) });
+  }
+
+  updateMessagePart(input: UpdateMessagePartInput): MessagePart | null {
+    const current = this.db
+      .prepare("SELECT id, message_id, seq, type, text, content_json, metadata_json, created_at, updated_at FROM message_parts WHERE id = ?")
+      .get(input.id) as MessagePartRow | undefined;
+    if (!current) {
+      return null;
+    }
+
+    const content = input.content ?? parseJsonObject(current.content_json);
+    const metadata = input.metadata ?? parseJsonObject(current.metadata_json);
+    this.db
+      .prepare(
+        `UPDATE message_parts
+         SET text = @text,
+             content_json = @contentJson,
+             metadata_json = @metadataJson,
+             updated_at = @updatedAt
+         WHERE id = @id`
+      )
+      .run({
+        id: input.id,
+        text: input.text,
+        contentJson: JSON.stringify(content),
+        metadataJson: JSON.stringify(metadata),
+        updatedAt: input.updatedAt
+      });
+
+    return this.getPartsByMessageIds([current.message_id]).get(current.message_id)?.find((part) => part.id === input.id) ?? null;
   }
 
   updateMessageStatus(id: string, status: MessageStatus, updatedAt: string, error?: string | null): void {

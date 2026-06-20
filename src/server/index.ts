@@ -15,6 +15,7 @@ import {
 } from "../providers/openai-chatgpt-credentials";
 import { createDefaultProviderRegistry } from "../providers/registry";
 import { SQLiteStore } from "../store/sqlite";
+import { createDefaultToolRegistry } from "../tools/registry";
 import type {
   AdapterRegistryItem,
   AgentListResponse,
@@ -26,7 +27,9 @@ import type {
   OpenAIChatGPTLogoutResponse,
   ReasoningEffort,
   RunOptions,
-  RunEvent
+  RunEvent,
+  ShellExecRequest,
+  ToolListResponse
 } from "../shared/types";
 
 const defaultPort = 8787;
@@ -66,7 +69,8 @@ const openAIChatGPTAuth = new OpenAIChatGPTAuthService({
   clientId: process.env.OPENAI_CHATGPT_CLIENT_ID
 });
 const providers = createDefaultProviderRegistry(process.env, { openAIChatGPTCredentials });
-const kernel = new Kernel({ store, eventBus, providers });
+const tools = createDefaultToolRegistry();
+const kernel = new Kernel({ store, eventBus, providers, tools, workspaceRoot: projectRoot });
 const app = express();
 
 app.use(express.json());
@@ -195,6 +199,11 @@ app.post("/api/providers/openai-chatgpt/logout", async (_req, res, next) => {
   }
 });
 
+app.get("/api/tools", (_req, res) => {
+  const response: ToolListResponse = { tools: kernel.listTools() };
+  res.json(response);
+});
+
 app.get("/api/sessions", (_req, res) => {
   res.json(kernel.listSessions());
 });
@@ -215,6 +224,15 @@ app.post("/api/sessions/:id/context/preview", (req, res, next) => {
 app.get("/api/sessions/:id/messages", (req, res, next) => {
   try {
     res.json(kernel.listMessages(req.params.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/sessions/:id/tools/shell.exec", async (req, res, next) => {
+  try {
+    const input = parseShellExecRequest(requestBodyObject(req.body));
+    res.json(await kernel.invokeTool(req.params.id, "shell.exec", input, { caller: "manual" }));
   } catch (error) {
     next(error);
   }
@@ -385,6 +403,30 @@ function buildContextPreview(sessionId: string, body: Record<string, unknown>) {
     runOptions,
     text: optionalString(body.text)
   });
+}
+
+function parseShellExecRequest(body: Record<string, unknown>): ShellExecRequest {
+  if (typeof body.command !== "string" || !body.command.trim()) {
+    throw new KernelError("shell.exec requires body field 'command' as a non-empty string.", 400);
+  }
+  if (body.command.length > 20_000) {
+    throw new KernelError("shell.exec field 'command' must be 20000 characters or fewer.", 400);
+  }
+
+  const input: ShellExecRequest = { command: body.command };
+  if (body.cwd !== undefined && body.cwd !== null && body.cwd !== "") {
+    if (typeof body.cwd !== "string") {
+      throw new KernelError("shell.exec field 'cwd' must be a string when provided.", 400);
+    }
+    input.cwd = body.cwd;
+  }
+  if (body.timeoutMs !== undefined && body.timeoutMs !== null && body.timeoutMs !== "") {
+    if (typeof body.timeoutMs !== "number" || !Number.isFinite(body.timeoutMs) || !Number.isInteger(body.timeoutMs)) {
+      throw new KernelError("shell.exec field 'timeoutMs' must be an integer number of milliseconds.", 400);
+    }
+    input.timeoutMs = body.timeoutMs;
+  }
+  return input;
 }
 
 function getAdapterRegistry(): AdapterRegistryItem[] {

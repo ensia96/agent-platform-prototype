@@ -1,24 +1,37 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { buildContext, defaultAgentId } from "./context-builder";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import { RunWriter } from "./run-writer";
 import type { ProviderAdapter, ProviderMessage, ProviderRunInput } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
 import type { StoreAdapter, UpdateAgentDefinitionInput } from "../store/types";
+import type { ToolRegistry } from "../tools/registry";
+import { ToolInputError } from "../tools/types";
 import type {
   AgentDefinition,
   BuiltContext,
   ContextPreviewResponse,
   CreateRunResponse,
+  InvokeToolResponse,
   JsonObject,
   Message,
+  MessagePart,
   ProviderProfile,
   ProviderResolution,
   Run,
   RunEvent,
   RunEventType,
   RunOptions,
-  Session
+  Session,
+  ToolDefinition,
+  ToolExecutionEvent,
+  ToolExecutionResult,
+  ToolInvocation,
+  ToolInvocationCaller,
+  ToolInvocationStatus,
+  ToolPermissionDecision,
+  ToolResultStatus
 } from "../shared/types";
 
 export interface StartRunOptions {
@@ -30,6 +43,10 @@ export interface StartRunOptions {
 
 export interface PreviewContextOptions extends StartRunOptions {
   text?: string;
+}
+
+export interface InvokeToolOptions {
+  caller?: ToolInvocationCaller;
 }
 
 interface RunOptionPlan {
@@ -49,18 +66,24 @@ export interface KernelOptions {
   store: StoreAdapter;
   providers: ProviderRegistry;
   eventBus: RunEventBus;
+  tools: ToolRegistry;
+  workspaceRoot?: string;
 }
 
 export class Kernel {
   private readonly store: StoreAdapter;
   private readonly providers: ProviderRegistry;
   private readonly eventBus: RunEventBus;
+  private readonly tools: ToolRegistry;
+  private readonly workspaceRoot: string;
   private readonly controllers = new Map<string, AbortController>();
 
   constructor(options: KernelOptions) {
     this.store = options.store;
     this.providers = options.providers;
     this.eventBus = options.eventBus;
+    this.tools = options.tools;
+    this.workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
   }
 
   listSessions(): Session[] {
@@ -88,6 +111,273 @@ export class Kernel {
   listMessages(sessionId: string): Message[] {
     this.getSession(sessionId);
     return this.store.listMessages(sessionId);
+  }
+
+  listTools(): ToolDefinition[] {
+    return this.tools.list();
+  }
+
+  async invokeTool(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions = {}): Promise<InvokeToolResponse> {
+    this.getSession(sessionId);
+    const registeredTool = this.tools.get(toolId.trim());
+    if (!registeredTool) {
+      throw new KernelError("Tool not found", 404);
+    }
+
+    const validationContext = { workspaceRoot: this.workspaceRoot };
+    let executionInput: JsonObject;
+    let publicInput: JsonObject;
+    try {
+      executionInput = registeredTool.executor.validateInput?.(input, validationContext) ?? input;
+      publicInput = registeredTool.executor.toPublicInput?.(executionInput, validationContext) ?? executionInput;
+    } catch (error) {
+      if (error instanceof ToolInputError) {
+        throw new KernelError(error.message, error.statusCode);
+      }
+      throw error;
+    }
+
+    const caller = options.caller ?? "manual";
+    const permissionDecision = this.decideToolPermission(caller);
+    const now = new Date().toISOString();
+    const run = this.store.createRun({
+      id: randomUUID(),
+      sessionId,
+      provider: `tool:${registeredTool.definition.id}`,
+      status: "running",
+      createdAt: now,
+      updatedAt: now,
+      metadata: buildToolRunMetadata(registeredTool.definition, publicInput, caller, permissionDecision, this.workspaceRoot)
+    });
+    this.store.touchSession(sessionId, now);
+
+    const assistantMessage = this.store.createMessage({
+      id: randomUUID(),
+      sessionId,
+      runId: run.id,
+      role: "assistant",
+      status: "streaming",
+      createdAt: now,
+      updatedAt: now,
+      metadata: buildToolMessageMetadata(registeredTool.definition, publicInput, caller, permissionDecision)
+    });
+
+    const invocation: ToolInvocation = {
+      id: randomUUID(),
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      sessionId,
+      runId: run.id,
+      messageId: assistantMessage.id,
+      caller,
+      status: permissionDecision === "allowed" ? "created" : "pending_permission",
+      permissionDecision,
+      input: publicInput,
+      metadata: {
+        toolSource: registeredTool.definition.source,
+        workspaceRoot: this.workspaceRoot
+      },
+      createdAt: now,
+      updatedAt: now
+    };
+
+    this.emit(run, "run_started", {
+      runId: run.id,
+      sessionId,
+      provider: "tool",
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      caller,
+      permissionDecision,
+      invocation
+    });
+    this.emit(run, "assistant_message_created", { message: this.store.getMessage(assistantMessage.id)! });
+
+    const writer = new RunWriter({
+      store: this.store,
+      eventBus: this.eventBus,
+      run,
+      assistantMessageId: assistantMessage.id
+    });
+
+    let toolCallPart = writer.recordToolCall({
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      provider: toolProviderForPart(registeredTool.definition.id),
+      input: publicInput,
+      inputSummary: summarizeToolInput(registeredTool.definition.id, publicInput),
+      metadata: {
+        caller,
+        permissionDecision,
+        toolSource: registeredTool.definition.source
+      }
+    });
+
+    let commandOutputText = "";
+    let commandOutputTruncated = false;
+    let commandOutputPart = writer.recordCommandOutput({
+      callId: invocation.id,
+      stream: "combined",
+      text: "",
+      cwd: stringField(executionInput, "cwd"),
+      metadata: {
+        invocationId: invocation.id,
+        toolId: registeredTool.definition.id
+      }
+    });
+
+    if (permissionDecision !== "allowed") {
+      const completedAt = new Date().toISOString();
+      const result = buildPermissionBlockedResult(invocation, registeredTool.definition.id, permissionDecision, now, completedAt);
+      toolCallPart = this.updateToolCallStatus(toolCallPart, result.status, completedAt);
+      const toolResultPart = writer.recordToolResult({
+        callId: invocation.id,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name,
+        status: result.status,
+        outputSummary: result.error ?? "Tool execution blocked by permission hook.",
+        error: result.error ?? undefined,
+        metadata: { permissionDecision }
+      });
+      writer.fail(new Error(result.error ?? "Tool execution blocked by permission hook."));
+      return {
+        invocation: { ...invocation, status: result.status, updatedAt: completedAt },
+        result,
+        run: this.store.getRun(run.id)!,
+        message: this.store.getMessage(assistantMessage.id)!,
+        toolCallPartId: toolCallPart.id,
+        commandOutputPartId: commandOutputPart.id,
+        toolResultPartId: toolResultPart.id
+      };
+    }
+
+    const startedAt = new Date().toISOString();
+    const runningInvocation: ToolInvocation = { ...invocation, status: "running", updatedAt: startedAt };
+    toolCallPart = this.updateToolCallStatus(toolCallPart, "running", startedAt);
+    this.emit(run, "tool.started", {
+      messageId: assistantMessage.id,
+      partId: toolCallPart.id,
+      part: toolCallPart,
+      outputPartId: commandOutputPart.id,
+      outputPart: commandOutputPart,
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      caller,
+      permissionDecision,
+      status: "running"
+    });
+
+    const onToolEvent = (event: ToolExecutionEvent): void => {
+      if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
+        const delta = typeof event.payload.text === "string" ? event.payload.text : "";
+        if (!delta) {
+          return;
+        }
+        const nextOutput = appendLimitedText(commandOutputText, commandOutputTruncated, delta, 128_000, "command output");
+        commandOutputText = nextOutput.text;
+        commandOutputTruncated = nextOutput.truncated;
+        const updatedAt = new Date().toISOString();
+        commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, updatedAt, {
+          truncated: commandOutputTruncated
+        });
+        this.emit(run, event.type, {
+          ...event.payload,
+          messageId: assistantMessage.id,
+          partId: commandOutputPart.id,
+          callId: invocation.id,
+          toolId: registeredTool.definition.id,
+          toolName: registeredTool.definition.name
+        });
+        return;
+      }
+
+      this.emit(run, event.type, {
+        ...event.payload,
+        messageId: assistantMessage.id,
+        callId: invocation.id,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name
+      });
+    };
+
+    let result: ToolExecutionResult;
+    try {
+      const output = await registeredTool.executor.execute(executionInput, {
+        invocation: runningInvocation,
+        workspaceRoot: this.workspaceRoot,
+        signal: new AbortController().signal,
+        emit: onToolEvent
+      });
+      const completedAt = new Date().toISOString();
+      result = buildToolExecutionResult(invocation, registeredTool.definition.id, output, startedAt, completedAt);
+    } catch (error) {
+      const completedAt = new Date().toISOString();
+      const toolError = toError(error);
+      result = {
+        invocationId: invocation.id,
+        toolId: registeredTool.definition.id,
+        status: "failed",
+        output: {},
+        error: toolError.message,
+        startedAt,
+        completedAt,
+        durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
+        metadata: {
+          failedBeforeResult: true
+        }
+      };
+    }
+
+    const completedAt = result.completedAt;
+    const finalInvocation: ToolInvocation = { ...invocation, status: result.status, updatedAt: completedAt };
+    commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, completedAt, commandOutputMetadataFromResult(result, commandOutputTruncated));
+    toolCallPart = this.updateToolCallStatus(toolCallPart, result.status, completedAt);
+    this.emit(run, result.status === "completed" ? "tool.completed" : "tool.failed", {
+      messageId: assistantMessage.id,
+      partId: toolCallPart.id,
+      part: toolCallPart,
+      outputPartId: commandOutputPart.id,
+      outputPart: commandOutputPart,
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      status: result.status,
+      error: result.error,
+      durationMs: result.durationMs
+    });
+    const toolResultPart = writer.recordToolResult({
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      status: result.status,
+      outputSummary: summarizeToolResult(result),
+      error: result.error ?? undefined,
+      metadata: {
+        durationMs: result.durationMs,
+        permissionDecision,
+        ...(result.metadata ?? {})
+      }
+    });
+
+    if (result.status === "completed") {
+      writer.complete();
+    } else if (result.status === "cancelled") {
+      writer.cancel();
+    } else {
+      writer.fail(new Error(result.error ?? "Tool execution failed."));
+    }
+
+    return {
+      invocation: finalInvocation,
+      result,
+      run: this.store.getRun(run.id)!,
+      message: this.store.getMessage(assistantMessage.id)!,
+      toolCallPartId: toolCallPart.id,
+      commandOutputPartId: commandOutputPart.id,
+      toolResultPartId: toolResultPart.id
+    };
   }
 
   listAgentDefinitions(): AgentDefinition[] {
@@ -321,6 +611,57 @@ export class Kernel {
     return this.eventBus.subscribe(runId, listener);
   }
 
+  private decideToolPermission(_caller: ToolInvocationCaller): ToolPermissionDecision {
+    // Placeholder for the next permission/policy step. Manual invocations are allowed for now;
+    // model-driven tool calls are not wired to this method yet.
+    return "allowed";
+  }
+
+  private updateToolCallStatus(part: MessagePart, status: ToolInvocationStatus | ToolResultStatus, updatedAt: string): MessagePart {
+    return (
+      this.store.updateMessagePart({
+        id: part.id,
+        text: part.text,
+        content: { ...part.content, status },
+        metadata: part.metadata,
+        updatedAt
+      }) ?? part
+    );
+  }
+
+  private updateCommandOutputPart(part: MessagePart, text: string, updatedAt: string, metadata: JsonObject = {}): MessagePart {
+    const nextMetadata = { ...part.metadata, ...metadata };
+    const nextContent: JsonObject = { ...part.content, text };
+    if (typeof metadata.cwd === "string") {
+      nextContent.cwd = metadata.cwd;
+    }
+    if (typeof metadata.exitCode === "number" && Number.isFinite(metadata.exitCode)) {
+      nextContent.exitCode = metadata.exitCode;
+    }
+    if (typeof metadata.timedOut === "boolean") {
+      nextContent.timedOut = metadata.timedOut;
+    }
+    if (typeof metadata.truncated === "boolean") {
+      nextContent.truncated = metadata.truncated;
+    }
+    if (typeof metadata.stdoutTruncated === "boolean") {
+      nextContent.stdoutTruncated = metadata.stdoutTruncated;
+    }
+    if (typeof metadata.stderrTruncated === "boolean") {
+      nextContent.stderrTruncated = metadata.stderrTruncated;
+    }
+
+    return (
+      this.store.updateMessagePart({
+        id: part.id,
+        text,
+        content: nextContent,
+        metadata: nextMetadata,
+        updatedAt
+      }) ?? part
+    );
+  }
+
   private async executeRun(
     run: Run,
     provider: ProviderAdapter,
@@ -368,6 +709,222 @@ export class Kernel {
     this.eventBus.publish(event);
     return event;
   }
+}
+
+function buildToolRunMetadata(
+  tool: ToolDefinition,
+  input: JsonObject,
+  caller: ToolInvocationCaller,
+  permissionDecision: ToolPermissionDecision,
+  workspaceRoot: string
+): JsonObject {
+  return {
+    kind: "tool_invocation",
+    toolId: tool.id,
+    toolName: tool.name,
+    toolSource: tool.source,
+    caller,
+    permissionDecision,
+    input,
+    workspaceRoot,
+    permissionHook: "placeholder"
+  };
+}
+
+function buildToolMessageMetadata(
+  tool: ToolDefinition,
+  input: JsonObject,
+  caller: ToolInvocationCaller,
+  permissionDecision: ToolPermissionDecision
+): JsonObject {
+  return {
+    kind: "tool_invocation",
+    toolId: tool.id,
+    toolName: tool.name,
+    toolSource: tool.source,
+    caller,
+    permissionDecision,
+    input
+  };
+}
+
+function toolProviderForPart(toolId: string): "shell" | "internal" {
+  return toolId === "shell.exec" ? "shell" : "internal";
+}
+
+function summarizeToolInput(toolId: string, input: JsonObject): string {
+  if (toolId === "shell.exec") {
+    const command = stringField(input, "command");
+    const cwd = stringField(input, "cwd");
+    const timeoutMs = numberField(input, "timeoutMs");
+    return [command ? `$ ${command}` : "shell.exec", cwd ? `cwd: ${cwd}` : "", timeoutMs !== null ? `timeout: ${timeoutMs}ms` : ""]
+      .filter(Boolean)
+      .join("\n");
+  }
+  return `Tool call: ${toolId}`;
+}
+
+function buildPermissionBlockedResult(
+  invocation: ToolInvocation,
+  toolId: string,
+  permissionDecision: ToolPermissionDecision,
+  startedAt: string,
+  completedAt: string
+): ToolExecutionResult {
+  return {
+    invocationId: invocation.id,
+    toolId,
+    status: "failed",
+    output: {},
+    error:
+      permissionDecision === "requires_approval"
+        ? "Tool execution requires approval, but approval UI/policy is not implemented yet."
+        : "Tool execution denied by permission hook.",
+    startedAt,
+    completedAt,
+    durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
+    metadata: { permissionDecision }
+  };
+}
+
+function buildToolExecutionResult(
+  invocation: ToolInvocation,
+  toolId: string,
+  output: JsonObject,
+  startedAt: string,
+  completedAt: string
+): ToolExecutionResult {
+  const status = inferToolResultStatus(output);
+  const durationMs = numberField(output, "durationMs") ?? Math.max(0, Date.parse(completedAt) - Date.parse(startedAt));
+  return {
+    invocationId: invocation.id,
+    toolId,
+    status,
+    output,
+    error: inferToolResultError(output, status),
+    startedAt,
+    completedAt,
+    durationMs,
+    metadata: {
+      exitCode: nullableNumberField(output, "exitCode"),
+      timedOut: booleanField(output, "timedOut"),
+      stdoutTruncated: booleanField(output, "stdoutTruncated"),
+      stderrTruncated: booleanField(output, "stderrTruncated")
+    }
+  };
+}
+
+function inferToolResultStatus(output: JsonObject): ToolResultStatus {
+  const timedOut = booleanField(output, "timedOut") === true;
+  if (timedOut) {
+    return "failed";
+  }
+  if (Object.prototype.hasOwnProperty.call(output, "exitCode")) {
+    return numberField(output, "exitCode") === 0 ? "completed" : "failed";
+  }
+  return "completed";
+}
+
+function inferToolResultError(output: JsonObject, status: ToolResultStatus): string | null {
+  if (status === "completed") {
+    return null;
+  }
+  const timeoutMs = numberField(output, "durationMs");
+  if (booleanField(output, "timedOut") === true) {
+    return `Command timed out${timeoutMs !== null ? ` after ${timeoutMs}ms` : ""}.`;
+  }
+  const exitCode = nullableNumberField(output, "exitCode");
+  if (exitCode !== null) {
+    return `Command exited with code ${exitCode}.`;
+  }
+  if (Object.prototype.hasOwnProperty.call(output, "exitCode")) {
+    return "Command ended without an exit code.";
+  }
+  return "Tool execution failed.";
+}
+
+function commandOutputMetadataFromResult(result: ToolExecutionResult, commandOutputTruncated: boolean): JsonObject {
+  const metadata: JsonObject = {
+    durationMs: result.durationMs,
+    truncated: commandOutputTruncated,
+    status: result.status
+  };
+  const exitCode = nullableNumberField(result.output, "exitCode");
+  if (exitCode !== null) {
+    metadata.exitCode = exitCode;
+  }
+  const cwd = stringField(result.output, "cwd");
+  if (cwd) {
+    metadata.cwd = cwd;
+  }
+  const timedOut = booleanField(result.output, "timedOut");
+  if (timedOut !== null) {
+    metadata.timedOut = timedOut;
+  }
+  const stdoutTruncated = booleanField(result.output, "stdoutTruncated");
+  if (stdoutTruncated !== null) {
+    metadata.stdoutTruncated = stdoutTruncated;
+    metadata.truncated = commandOutputTruncated || stdoutTruncated === true;
+  }
+  const stderrTruncated = booleanField(result.output, "stderrTruncated");
+  if (stderrTruncated !== null) {
+    metadata.stderrTruncated = stderrTruncated;
+    metadata.truncated = commandOutputTruncated || stdoutTruncated === true || stderrTruncated === true;
+  }
+  return metadata;
+}
+
+function summarizeToolResult(result: ToolExecutionResult): string {
+  const exitCode = nullableNumberField(result.output, "exitCode");
+  const parts = [
+    result.status,
+    exitCode !== null ? `exit ${exitCode}` : "",
+    `${result.durationMs}ms`,
+    booleanField(result.output, "timedOut") === true ? "timed out" : "",
+    booleanField(result.output, "stdoutTruncated") === true || booleanField(result.output, "stderrTruncated") === true ? "output truncated" : ""
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function appendLimitedText(
+  current: string,
+  truncated: boolean,
+  delta: string,
+  maxChars: number,
+  label: string
+): { text: string; truncated: boolean } {
+  if (truncated || delta.length === 0) {
+    return { text: current, truncated };
+  }
+  const remaining = maxChars - current.length;
+  if (delta.length <= remaining) {
+    return { text: current + delta, truncated: false };
+  }
+  const marker = `\n[${label} truncated after ${maxChars} characters]\n`;
+  const sliceLength = Math.max(0, remaining - marker.length);
+  return {
+    text: `${current}${delta.slice(0, sliceLength)}${marker.slice(0, remaining - sliceLength)}`,
+    truncated: true
+  };
+}
+
+function stringField(object: JsonObject, key: string): string {
+  const value = object[key];
+  return typeof value === "string" ? value : "";
+}
+
+function numberField(object: JsonObject, key: string): number | null {
+  const value = object[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nullableNumberField(object: JsonObject, key: string): number | null {
+  return object[key] === null ? null : numberField(object, key);
+}
+
+function booleanField(object: JsonObject, key: string): boolean | null {
+  const value = object[key];
+  return typeof value === "boolean" ? value : null;
 }
 
 function buildRunOptionPlan(profile: ProviderProfile, requested: RunOptions): RunOptionPlan {

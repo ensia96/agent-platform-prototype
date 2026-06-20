@@ -95,9 +95,11 @@ Useful environment variables:
 - `POST /api/providers/openai-chatgpt/auth/start` starts the experimental ChatGPT/Codex device authorization flow
 - `POST /api/providers/openai-chatgpt/auth/poll` body `{ "attemptId": "..." }` polls/completes that device authorization flow
 - `POST /api/providers/openai-chatgpt/logout` removes the local ChatGPT OAuth credential file
+- `GET /api/tools` returns registered tool definitions. The only built-in tool today is `shell.exec`
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id/messages`
+- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually executes the local shell tool and records structured tool parts/events
 - `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
@@ -136,9 +138,23 @@ Messages are no longer limited to a single text projection. `message_parts` keep
 - `command_output`
 - `file_ref`
 
-The run event log remains append-only and now reserves event names for future tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, and `permission.denied`.
+The run event log remains append-only and now uses/reserves event names for tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, and `permission.denied`.
 
-This is only the container for future capabilities. Shell execution, MCP connections, skill manifests, permission approval UI, and subagents are intentionally not implemented yet. Structured payloads and metadata must stay sanitized: API keys, OAuth tokens, credential material, and raw chain-of-thought must not be stored in message parts or events.
+Structured payloads and metadata must stay sanitized: API keys, OAuth tokens, credential material, and raw chain-of-thought must not be stored in message parts or events.
+
+### Built-in `shell.exec` tool
+
+`shell.exec` is the first real tool. It is intentionally manual-only for now: the model provider layer does not parse tool calls and cannot auto-run commands.
+
+Input:
+
+```json
+{ "command": "echo hello", "cwd": "optional/path", "timeoutMs": 60000 }
+```
+
+Output records `exitCode`, `stdout`, `stderr`, `durationMs`, `timedOut`, and truncation flags. The executor uses Node `child_process.spawn` with `shell: true`, stores stdout/stderr deltas as tool events, and writes `tool_call`, `command_output`, and `tool_result` message parts to the session. Output is size-limited before persistence.
+
+The default cwd is the daemon workspace root, and supplied cwd values must resolve under that root. This does **not** make shell commands safe: `shell.exec` runs real local commands in your environment. Avoid commands that print secrets or mutate important files unless you intend that. Permission approval/policy is only a placeholder hook in this step; approval UI and policy enforcement are planned next.
 
 ### Context Builder and main agent
 
@@ -169,7 +185,7 @@ curl -X PATCH http://127.0.0.1:8787/api/agents/main \
 
 Use the Chat tab's **Context Preview** button to inspect the system prompt, text messages, and effective run options that would be sent for the selected session/agent/provider. Preview responses never include API keys, OAuth tokens, or credential values.
 
-Tools, skills, files, MCP, permissions, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
+Beyond manual `shell.exec`, skills, files, MCP, permission approval/policy, automatic model tool calls, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
 
 ### Experimental OpenAI ChatGPT/Codex OAuth profile
 
@@ -217,7 +233,7 @@ The kernel deals in store/provider interfaces, the provider-neutral context buil
 
 The React UI has two tabs:
 
-- `Chat`: existing session/run streaming flow
+- `Chat`: existing session/run streaming flow plus a minimal manual Shell Tool panel for `shell.exec`
 - `Settings`: daemon status, main agent/system prompt editor, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
@@ -235,5 +251,5 @@ The React UI has two tabs:
 - Promote provider profiles from env/builtin records to user-managed persisted records.
 - Validate the experimental `openai-chatgpt` runtime against a real ChatGPT/Codex subscription login and adjust the request/stream payload if OpenAI changes the backend contract.
 - Add token counting/trimming and explicit context budget controls to the Context Builder.
-- Add real shell tools, MCP providers, skills, permission gates, files, and subagents on top of the structured message/event container.
+- Add shell command permission approval/policy, then MCP providers, skills, files, and subagents on top of the structured message/event container.
 - Add adapter install/status flows behind dashboard APIs.

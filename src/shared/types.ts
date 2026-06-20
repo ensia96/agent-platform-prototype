@@ -32,6 +32,11 @@ export type ProviderRuntime = "openai-compatible" | "chatgpt-codex" | "mock";
 export type ProviderAuthMode = "env-api-key" | "oauth-device" | "oauth-browser" | "none";
 export type ProviderBillingSource = "platform-api" | "consumer-subscription" | "local" | "third-party" | "unknown";
 export type RunOptionSupport = "supported" | "metadata-only" | "unsupported" | "provider-reported" | "unknown";
+export type ToolSource = "builtin" | "custom" | "mcp";
+export type ToolInvocationCaller = "manual" | "model" | "system";
+export type ToolInvocationStatus = "created" | "pending_permission" | "running" | "completed" | "failed" | "cancelled";
+export type ToolResultStatus = "completed" | "failed" | "cancelled";
+export type ToolPermissionDecision = "allowed" | "requires_approval" | "denied";
 
 export interface RunOptions {
   model?: string;
@@ -91,6 +96,45 @@ export interface RunUsage {
   outputTokens?: number;
   reasoningTokens?: number;
   totalTokens?: number;
+}
+
+export interface ToolDefinition {
+  id: string;
+  name: string;
+  description: string;
+  source: ToolSource;
+  inputSchema: JsonObject;
+  outputSchema: JsonObject;
+  metadata: JsonObject;
+}
+
+export interface ToolInvocation {
+  id: string;
+  toolId: string;
+  toolName: string;
+  sessionId: string;
+  runId: string;
+  messageId: string;
+  caller: ToolInvocationCaller;
+  status: ToolInvocationStatus;
+  permissionDecision: ToolPermissionDecision;
+  /** Sanitized public input only. Never persist credentials, tokens, or secret env values. */
+  input: JsonObject;
+  metadata: JsonObject;
+  createdAt: ISODateString;
+  updatedAt: ISODateString;
+}
+
+export interface ToolExecutionResult {
+  invocationId: string;
+  toolId: string;
+  status: ToolResultStatus;
+  output: JsonObject;
+  error: string | null;
+  startedAt: ISODateString;
+  completedAt: ISODateString;
+  durationMs: number;
+  metadata: JsonObject;
 }
 
 export interface ProviderRunOptionSupport {
@@ -270,6 +314,14 @@ export type PermissionRunEventPayload = JsonObject & {
   status?: "requested" | "approved" | "denied";
 };
 
+export interface ToolExecutionEvent<TPayload extends JsonObject = JsonObject> {
+  invocationId: string;
+  toolId: string;
+  type: ToolRunEventType;
+  createdAt: ISODateString;
+  payload: TPayload;
+}
+
 export interface RunEvent<TPayload = unknown> {
   id: string;
   runId: string;
@@ -289,9 +341,31 @@ export interface CreateRunRequest {
   runOptions?: RunOptions;
 }
 
+export type ShellExecRequest = JsonObject & {
+  command: string;
+  cwd?: string;
+  timeoutMs?: number;
+};
+
+export type ShellExecOutput = JsonObject & {
+  command: string;
+  cwd: string;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+};
+
 export interface AgentListResponse {
   agents: AgentDefinition[];
   defaultAgentId: string;
+}
+
+export interface ToolListResponse {
+  tools: ToolDefinition[];
 }
 
 export interface ContextPreviewRequest {
@@ -336,6 +410,16 @@ export interface CreateRunResponse {
   unsupportedRunOptions: string[];
   usage: RunUsage | null;
   assistantMessageId: string;
+}
+
+export interface InvokeToolResponse {
+  invocation: ToolInvocation;
+  result: ToolExecutionResult;
+  run: Run;
+  message: Message;
+  toolCallPartId: string;
+  commandOutputPartId?: string;
+  toolResultPartId?: string;
 }
 
 export interface ContextPreviewResponse extends ContextBuildResult {
