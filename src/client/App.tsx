@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { defaultShellToolSettings, defaultToolSettings, ToolSettingsValidationError, validateToolSettings } from "../shared/tool-settings";
 import type {
   AgentDefinition,
   AgentListResponse,
@@ -7,11 +8,14 @@ import type {
   CreateRunResponse,
   DaemonStatus,
   InvokeToolResponse,
+  JsonObject,
   Message,
   MessagePart,
   OpenAIChatGPTAuthPollResponse,
   OpenAIChatGPTAuthStartResponse,
   OpenAIChatGPTLogoutResponse,
+  PermissionListResponse,
+  PermissionRequest,
   ProviderListResponse,
   ProviderProfile,
   ProviderResolution,
@@ -22,12 +26,14 @@ import type {
   RunEvent,
   Session,
   ToolDefinition,
+  ToolSettings,
+  ToolSettingsResponse,
   ToolListResponse
 } from "../shared/types";
 
 type LoadState = "idle" | "loading" | "error";
 type Tab = "chat" | "settings";
-type ShellToolState = "idle" | "running" | "completed" | "failed";
+type ShellToolState = "idle" | "running" | "pending_permission" | "completed" | "failed" | "denied";
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -51,9 +57,11 @@ export function App() {
   const [contextPreviewState, setContextPreviewState] = useState<LoadState>("idle");
   const [shellCommand, setShellCommand] = useState("");
   const [shellCwd, setShellCwd] = useState("");
-  const [shellTimeoutMs, setShellTimeoutMs] = useState("60000");
+  const [shellTimeoutMs, setShellTimeoutMs] = useState("");
   const [shellToolState, setShellToolState] = useState<ShellToolState>("idle");
   const [lastShellResponse, setLastShellResponse] = useState<InvokeToolResponse | null>(null);
+  const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
+  const [permissionActionId, setPermissionActionId] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +73,7 @@ export function App() {
     void loadProviders();
     void loadAgents();
     void loadTools();
+    void loadPendingPermissions();
     return () => eventsRef.current?.close();
   }, []);
 
@@ -81,6 +90,7 @@ export function App() {
       void loadProviders();
       void loadAgents();
       void loadTools();
+      void loadPendingPermissions();
     }
   }, [activeTab]);
 
@@ -133,6 +143,15 @@ export function App() {
     try {
       const response = await requestJson<ToolListResponse>("/api/tools");
       setTools(response.tools);
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function loadPendingPermissions() {
+    try {
+      const response = await requestJson<PermissionListResponse>("/api/permissions?status=pending");
+      setPendingPermissions(response.permissions);
     } catch (requestError) {
       setError(toErrorMessage(requestError));
     }
@@ -262,13 +281,54 @@ export function App() {
         })
       });
       setLastShellResponse(response);
-      setShellToolState(response.result.status === "completed" ? "completed" : "failed");
+      setShellToolState(shellToolStateFromResponse(response));
       upsertMessage(response.message);
       void loadMessages(sessionId);
       void loadSessions();
+      void loadPendingPermissions();
     } catch (requestError) {
       setShellToolState("failed");
       setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function approvePermission(requestId: string) {
+    setPermissionActionId(requestId);
+    setError(null);
+    try {
+      const response = await requestJson<InvokeToolResponse>(`/api/permissions/${requestId}/approve`, { method: "POST" });
+      setLastShellResponse(response);
+      setShellToolState(shellToolStateFromResponse(response));
+      upsertMessage(response.message);
+      if (response.message.sessionId === selectedSessionId) {
+        void loadMessages(response.message.sessionId);
+      }
+      void loadSessions();
+      await loadPendingPermissions();
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    } finally {
+      setPermissionActionId(null);
+    }
+  }
+
+  async function denyPermission(requestId: string) {
+    setPermissionActionId(requestId);
+    setError(null);
+    try {
+      const response = await requestJson<InvokeToolResponse>(`/api/permissions/${requestId}/deny`, { method: "POST" });
+      setLastShellResponse(response);
+      setShellToolState(shellToolStateFromResponse(response));
+      upsertMessage(response.message);
+      if (response.message.sessionId === selectedSessionId) {
+        void loadMessages(response.message.sessionId);
+      }
+      void loadSessions();
+      await loadPendingPermissions();
+    } catch (requestError) {
+      setError(toErrorMessage(requestError));
+    } finally {
+      setPermissionActionId(null);
     }
   }
 
@@ -363,6 +423,11 @@ export function App() {
       if (payload.messageId && payload.partId && payload.text) {
         appendPartDelta(payload.messageId, payload.partId, payload.text);
       }
+      return;
+    }
+
+    if (event.type === "permission.requested" || event.type === "permission.approved" || event.type === "permission.denied") {
+      void loadPendingPermissions();
       return;
     }
 
@@ -642,6 +707,13 @@ export function App() {
           )}
           {error && <div className="error">{error}</div>}
           {contextPreview && <ContextPreviewPanel preview={contextPreview} />}
+          <PendingPermissionsPanel
+            permissions={pendingPermissions}
+            busyRequestId={permissionActionId}
+            onRefresh={() => void loadPendingPermissions()}
+            onApprove={(requestId) => void approvePermission(requestId)}
+            onDeny={(requestId) => void denyPermission(requestId)}
+          />
           <ShellToolPanel
             tool={shellTool}
             command={shellCommand}
@@ -870,6 +942,73 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
   );
 }
 
+function PendingPermissionsPanel({
+  permissions,
+  busyRequestId,
+  onRefresh,
+  onApprove,
+  onDeny
+}: {
+  permissions: PermissionRequest[];
+  busyRequestId: string | null;
+  onRefresh: () => void;
+  onApprove: (requestId: string) => void;
+  onDeny: (requestId: string) => void;
+}) {
+  return (
+    <details className="permissionsPanel" open={permissions.length > 0}>
+      <summary>Pending Permissions · {permissions.length}</summary>
+      <p className="muted">
+        Manual shell.exec approvals only. This is an experimental policy/approval layer, not a security sandbox.
+      </p>
+      <div className="permissionActionsHeader">
+        <button type="button" onClick={onRefresh}>
+          Refresh permissions
+        </button>
+      </div>
+      {permissions.length === 0 ? (
+        <p className="muted">No pending tool permissions.</p>
+      ) : (
+        <div className="permissionList">
+          {permissions.map((permission) => {
+            const busy = busyRequestId === permission.id;
+            return (
+              <article className={`permissionCard risk-${permission.riskLevel}`} key={permission.id}>
+                <div className="permissionCardHeader">
+                  <strong>{permission.toolName}</strong>
+                  <span>{permission.riskLevel} risk</span>
+                </div>
+                <pre>{permission.inputSummary}</pre>
+                <p>{permission.reason}</p>
+                <dl className="partDetails">
+                  <dt>Status</dt>
+                  <dd>{permission.status}</dd>
+                  <dt>Created</dt>
+                  <dd>{new Date(permission.createdAt).toLocaleString()}</dd>
+                  {permission.runId && (
+                    <>
+                      <dt>Run</dt>
+                      <dd className="monospace">{permission.runId}</dd>
+                    </>
+                  )}
+                </dl>
+                <div className="permissionButtons">
+                  <button type="button" onClick={() => onApprove(permission.id)} disabled={busy}>
+                    {busy ? "Resolving..." : "Approve and run"}
+                  </button>
+                  <button type="button" className="dangerButton" onClick={() => onDeny(permission.id)} disabled={busy}>
+                    Deny
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </details>
+  );
+}
+
 function ShellToolPanel({
   tool,
   command,
@@ -897,13 +1036,14 @@ function ShellToolPanel({
 }) {
   const busy = state === "running";
   const result = lastResponse?.result;
+  const permission = lastResponse?.permissionRequest;
   return (
     <details className="shellToolPanel" open>
       <summary>
         Shell Tool · {tool?.id ?? "shell.exec"} · {state}
       </summary>
       <p className="muted">
-        Manual local shell execution only. Permission approval/policy is a placeholder for the next step, so run trusted commands carefully.
+        Manual local shell execution only. Commands pass through Tool Settings allow / ask / deny regex policy before running.
       </p>
       <form
         className="shellToolForm"
@@ -918,11 +1058,11 @@ function ShellToolPanel({
         </label>
         <label>
           cwd
-          <input value={cwd} onChange={(event) => onCwdChange(event.target.value)} placeholder="workspace root" disabled={disabled || busy} />
+          <input value={cwd} onChange={(event) => onCwdChange(event.target.value)} placeholder="home directory" disabled={disabled || busy} />
         </label>
         <label>
           Timeout (ms)
-          <input value={timeoutMs} onChange={(event) => onTimeoutChange(event.target.value)} placeholder="60000" disabled={disabled || busy} />
+          <input value={timeoutMs} onChange={(event) => onTimeoutChange(event.target.value)} placeholder="Tool Settings default" disabled={disabled || busy} />
         </label>
         <button type="submit" disabled={disabled || busy || !command.trim() || !tool}>
           {busy ? "Running..." : "Run shell.exec"}
@@ -930,9 +1070,17 @@ function ShellToolPanel({
       </form>
       <p className="muted shellToolMeta">
         {tool
-          ? `Registered built-in tool. cwd must stay inside the workspace root. Default timeout: ${tool.metadata.defaultTimeoutMs ?? "server default"}ms.`
+          ? `Registered built-in tool. cwd defaults to the user's home directory; relative cwd is resolved from home and absolute cwd is used as-is. Default timeout comes from Tool Settings.`
           : "Tool registry has not loaded shell.exec yet."}
       </p>
+      {permission && lastResponse?.state === "pending_permission" && (
+        <div className="shellToolResult pending">
+          <strong>Approval pending</strong>
+          <span>
+            {permission.riskLevel} risk · {permission.reason}
+          </span>
+        </div>
+      )}
       {result && (
         <div className={result.status === "completed" ? "shellToolResult success" : "shellToolResult failure"}>
           <strong>{result.status}</strong>
@@ -956,6 +1104,9 @@ function SettingsPanel() {
   const [chatGPTAuthBusy, setChatGPTAuthBusy] = useState<"start" | "poll" | "logout" | null>(null);
   const [copiedAuthCode, setCopiedAuthCode] = useState(false);
   const [instanceLabel, setInstanceLabel] = useState("");
+  const [toolSettings, setToolSettings] = useState<ToolSettings>(defaultToolSettings);
+  const [toolSettingsSaveState, setToolSettingsSaveState] = useState<LoadState>("idle");
+  const [toolSettingsError, setToolSettingsError] = useState<string | null>(null);
   const [mainAgentName, setMainAgentName] = useState("");
   const [mainAgentSystemPrompt, setMainAgentSystemPrompt] = useState("");
   const [loadState, setLoadState] = useState<LoadState>("idle");
@@ -971,14 +1122,17 @@ function SettingsPanel() {
     setLoadState("loading");
     setError(null);
     try {
-      const [nextStatus, nextSettings, nextProviders, nextAgents] = await Promise.all([
+      const [nextStatus, nextSettings, nextToolSettings, nextProviders, nextAgents] = await Promise.all([
         requestJson<DaemonStatus>("/api/status"),
         requestJson<AppSettingsResponse>("/api/settings"),
+        requestJson<ToolSettingsResponse>("/api/tool-settings"),
         requestJson<ProviderListResponse>("/api/providers"),
         requestJson<AgentListResponse>("/api/agents")
       ]);
       setStatus(nextStatus);
       setSettingsData(nextSettings);
+      setToolSettings(nextToolSettings.settings);
+      setToolSettingsError(null);
       setProvidersData(nextProviders);
       setAgentsData(nextAgents);
       setInstanceLabel(settingValueAsString(nextSettings.settings.instanceLabel));
@@ -1005,6 +1159,54 @@ function SettingsPanel() {
     } catch (requestError) {
       setSaveState("error");
       setError(toErrorMessage(requestError));
+    }
+  }
+
+  function updateToolSettings(patch: Partial<ToolSettings>) {
+    setToolSettings((current) => ({ ...current, ...patch }));
+    setToolSettingsError(null);
+  }
+
+  function updateShellExecutionSetting(field: keyof ToolSettings["shell"], value: string) {
+    const trimmed = value.trim();
+    const parsedValue = trimmed ? Number(trimmed) : undefined;
+    setToolSettings((current) => ({
+      ...current,
+      shell: {
+        ...current.shell,
+        [field]: parsedValue
+      }
+    }));
+    setToolSettingsError(null);
+  }
+
+  async function saveToolSettings() {
+    setToolSettingsSaveState("loading");
+    setToolSettingsError(null);
+    setError(null);
+    try {
+      validateToolSettings(toolSettings);
+      const response = await requestJson<ToolSettingsResponse>("/api/tool-settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: toolSettings })
+      });
+      setToolSettings(response.settings);
+      setSettingsData((current) =>
+        current
+          ? {
+              ...current,
+              settings: {
+                ...current.settings,
+                toolSettings: toolSettingsJson(response.settings)
+              }
+            }
+          : current
+      );
+      setToolSettingsSaveState("idle");
+    } catch (requestError) {
+      setToolSettingsSaveState("error");
+      setToolSettingsError(formatToolSettingsError(requestError));
     }
   }
 
@@ -1169,6 +1371,114 @@ function SettingsPanel() {
           ) : (
             <p className="muted">No daemon status loaded yet.</p>
           )}
+        </article>
+
+        <article className="settingsCard toolSettingsCard">
+          <div className="cardHeaderRow">
+            <h3>Tool Settings</h3>
+            <span className="muted">shell.exec policy and shell settings</span>
+          </div>
+          <p className="muted">
+            JavaScript regular expressions only. Empty lines and lines starting with # are ignored. Evaluation order is Deny → Ask → Allow → Default. Use <code>.*</code> to match every command.
+          </p>
+          <p className="muted">
+            shell.exec cwd defaults to the user's home directory. Relative cwd values resolve from home; absolute cwd values are used as-is and only checked for existence and directory type.
+          </p>
+          <label className="settingEditor">
+            Default action
+            <select
+              value={toolSettings.defaultAction}
+              onChange={(event) => updateToolSettings({ defaultAction: event.target.value as ToolSettings["defaultAction"] })}
+            >
+              <option value="allow">allow</option>
+              <option value="ask">ask</option>
+              <option value="deny">deny</option>
+            </select>
+          </label>
+          <div className="toolPatternGrid">
+            <label className="settingEditor">
+              Deny regex patterns
+              <textarea
+                className="toolPatternEditor"
+                value={toolSettings.denyPatternsText}
+                onChange={(event) => updateToolSettings({ denyPatternsText: event.target.value })}
+                rows={7}
+                placeholder={"# deny examples\n^git\\s+push\\b\n^rm\\s+-rf\\b"}
+              />
+            </label>
+            <label className="settingEditor">
+              Ask regex patterns
+              <textarea
+                className="toolPatternEditor"
+                value={toolSettings.askPatternsText}
+                onChange={(event) => updateToolSettings({ askPatternsText: event.target.value })}
+                rows={7}
+                placeholder={"# ask examples\n^npm\\s+install\\b\n^git\\s+commit\\b"}
+              />
+            </label>
+            <label className="settingEditor">
+              Allow regex patterns
+              <textarea
+                className="toolPatternEditor"
+                value={toolSettings.allowPatternsText}
+                onChange={(event) => updateToolSettings({ allowPatternsText: event.target.value })}
+                rows={7}
+                placeholder={"# allow examples\n^pwd$\n^git\\s+status\\b"}
+              />
+            </label>
+          </div>
+          <div className="shellSettingsBlock">
+            <h4>Shell execution settings</h4>
+            <p className="muted">
+              These settings control the built-in shell tool. Invocation timeout overrides must be less than or equal to max timeout; stdout/stderr are truncated at max output chars per stream.
+            </p>
+            <div className="shellSettingsGrid">
+              <label className="settingEditor">
+                Default timeout ms
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={toolShellSettingValue(toolSettings, "defaultTimeoutMs")}
+                  onChange={(event) => updateShellExecutionSetting("defaultTimeoutMs", event.target.value)}
+                />
+              </label>
+              <label className="settingEditor">
+                Max timeout ms
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={toolShellSettingValue(toolSettings, "maxTimeoutMs")}
+                  onChange={(event) => updateShellExecutionSetting("maxTimeoutMs", event.target.value)}
+                />
+              </label>
+              <label className="settingEditor">
+                Max output chars
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={toolShellSettingValue(toolSettings, "maxOutputChars")}
+                  onChange={(event) => updateShellExecutionSetting("maxOutputChars", event.target.value)}
+                />
+              </label>
+            </div>
+          </div>
+          {toolSettingsError && (
+            <div className="testResult failure">
+              <strong>Tool Settings validation failed</strong>
+              <pre>{toolSettingsError}</pre>
+            </div>
+          )}
+          <div className="providerActions">
+            <button onClick={() => void saveToolSettings()} disabled={toolSettingsSaveState === "loading"}>
+              {toolSettingsSaveState === "loading" ? "Saving..." : "Save Tool Settings"}
+            </button>
+            <button onClick={() => updateToolSettings(defaultToolSettings)} disabled={toolSettingsSaveState === "loading"}>
+              Reset to default allow
+            </button>
+          </div>
         </article>
 
         <article className="settingsCard agentSettingsCard">
@@ -1382,10 +1692,49 @@ function SettingsPanel() {
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string; message?: string } | null;
-    throw new Error(body?.message || body?.error || `${response.status} ${response.statusText}`);
+    const body = (await response.json().catch(() => null)) as {
+      error?: string;
+      message?: string;
+      issues?: Array<{ field?: string; lineNumber?: number; pattern?: string; message?: string }>;
+    } | null;
+    const issueText = body?.issues?.length
+      ? `\n${body.issues
+          .map((issue) => {
+            const location = issue.lineNumber ? `${issue.field ?? "field"} line ${issue.lineNumber}` : issue.field ?? "field";
+            return `${location}: ${issue.message ?? "Invalid value"}${issue.pattern ? ` (${issue.pattern})` : ""}`;
+          })
+          .join("\n")}`
+      : "";
+    throw new Error(`${body?.message || body?.error || `${response.status} ${response.statusText}`}${issueText}`);
   }
   return (await response.json()) as T;
+}
+
+function toolSettingsJson(settings: ToolSettings): JsonObject {
+  const normalizedSettings = validateToolSettings(settings);
+  return {
+    defaultAction: normalizedSettings.defaultAction,
+    denyPatternsText: normalizedSettings.denyPatternsText,
+    askPatternsText: normalizedSettings.askPatternsText,
+    allowPatternsText: normalizedSettings.allowPatternsText,
+    shell: {
+      defaultTimeoutMs: normalizedSettings.shell.defaultTimeoutMs ?? defaultShellToolSettings.defaultTimeoutMs,
+      maxTimeoutMs: normalizedSettings.shell.maxTimeoutMs ?? defaultShellToolSettings.maxTimeoutMs,
+      maxOutputChars: normalizedSettings.shell.maxOutputChars ?? defaultShellToolSettings.maxOutputChars
+    }
+  };
+}
+
+function toolShellSettingValue(settings: ToolSettings, field: keyof ToolSettings["shell"]): string {
+  const value = settings.shell[field];
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
+function formatToolSettingsError(error: unknown): string {
+  if (error instanceof ToolSettingsValidationError) {
+    return error.message;
+  }
+  return toErrorMessage(error);
 }
 
 function providerOptionLabel(profile: ProviderProfile): string {
@@ -1463,8 +1812,18 @@ function formatRunOptionSupport(support: NonNullable<ProviderProfile["runOptionS
   ].join(" · ");
 }
 
+function shellToolStateFromResponse(response: InvokeToolResponse): ShellToolState {
+  if (response.state === "pending_permission") {
+    return "pending_permission";
+  }
+  if (response.state === "denied") {
+    return "denied";
+  }
+  return response.result?.status === "completed" ? "completed" : "failed";
+}
+
 function summarizeShellResponse(response: InvokeToolResponse | null): string {
-  if (!response) {
+  if (!response?.result) {
     return "";
   }
   const output = response.result.output;

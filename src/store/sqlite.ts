@@ -4,10 +4,13 @@ import { dirname } from "node:path";
 import type {
   AddMessagePartInput,
   AppendEventInput,
+  CreatePermissionRequestInput,
   CreateMessageInput,
   CreateRunInput,
   CreateSessionInput,
+  ListPermissionRequestsFilter,
   StoreAdapter,
+  StoredPermissionRequest,
   UpdateAgentDefinitionInput,
   UpdateMessagePartInput,
   UpsertMessageTextPartInput
@@ -21,13 +24,17 @@ import type {
   MessagePartType,
   MessageRole,
   MessageStatus,
+  PermissionRequestStatus,
+  PermissionRiskLevel,
   Run,
   RunEvent,
   RunEventType,
   RunOptions,
   RunStatus,
   RunUsage,
-  Session
+  Session,
+  ToolInvocationCaller,
+  ToolPermissionDecision
 } from "../shared/types";
 
 type SessionRow = {
@@ -100,6 +107,30 @@ type AgentDefinitionRow = {
   metadata_json: string;
   created_at: string;
   updated_at: string;
+};
+
+type PermissionRequestRow = {
+  id: string;
+  session_id: string;
+  run_id: string;
+  message_id: string;
+  invocation_id: string;
+  tool_id: string;
+  tool_name: string;
+  caller: ToolInvocationCaller;
+  permission_decision: ToolPermissionDecision;
+  input_summary: string;
+  public_input_json: string;
+  execution_input_json: string;
+  risk_level: PermissionRiskLevel;
+  reason: string;
+  status: PermissionRequestStatus;
+  tool_call_part_id: string;
+  command_output_part_id: string | null;
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
 };
 
 export interface SQLiteStoreOptions {
@@ -448,6 +479,80 @@ export class SQLiteStore implements StoreAdapter {
     return this.getAgentDefinition(input.id);
   }
 
+  createPermissionRequest(input: CreatePermissionRequestInput): StoredPermissionRequest {
+    this.db
+      .prepare(
+        `INSERT INTO permission_requests (
+           id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
+           input_summary, public_input_json, execution_input_json, risk_level, reason, status,
+           tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
+         ) VALUES (
+           @id, @sessionId, @runId, @messageId, @invocationId, @toolId, @toolName, @caller, @permissionDecision,
+           @inputSummary, @publicInputJson, @executionInputJson, @riskLevel, @reason, @status,
+           @toolCallPartId, @commandOutputPartId, @metadataJson, @createdAt, @updatedAt, @resolvedAt
+         )`
+      )
+      .run({
+        ...input,
+        publicInputJson: JSON.stringify(input.publicInput),
+        executionInputJson: JSON.stringify(input.executionInput),
+        commandOutputPartId: input.commandOutputPartId ?? null,
+        metadataJson: JSON.stringify(input.metadata ?? {}),
+        resolvedAt: input.resolvedAt ?? null
+      });
+    return this.getPermissionRequest(input.id)!;
+  }
+
+  getPermissionRequest(id: string): StoredPermissionRequest | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
+                input_summary, public_input_json, execution_input_json, risk_level, reason, status,
+                tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
+         FROM permission_requests
+         WHERE id = ?`
+      )
+      .get(id) as PermissionRequestRow | undefined;
+    return row ? rowToPermissionRequest(row) : null;
+  }
+
+  listPermissionRequests(filter: ListPermissionRequestsFilter = {}): StoredPermissionRequest[] {
+    const clauses: string[] = [];
+    const params: string[] = [];
+    if (filter.status) {
+      clauses.push("status = ?");
+      params.push(filter.status);
+    }
+    if (filter.sessionId) {
+      clauses.push("session_id = ?");
+      params.push(filter.sessionId);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
+                input_summary, public_input_json, execution_input_json, risk_level, reason, status,
+                tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
+         FROM permission_requests
+         ${where}
+         ORDER BY created_at DESC, id DESC`
+      )
+      .all(...params) as PermissionRequestRow[];
+    return rows.map(rowToPermissionRequest);
+  }
+
+  resolvePermissionRequest(
+    id: string,
+    status: Exclude<PermissionRequestStatus, "pending">,
+    resolvedAt: string
+  ): StoredPermissionRequest | null {
+    this.db
+      .prepare("UPDATE permission_requests SET status = ?, resolved_at = ?, updated_at = ? WHERE id = ?")
+      .run(status, resolvedAt, resolvedAt, id);
+    return this.getPermissionRequest(id);
+  }
+
   listSettings(): JsonObject {
     const rows = this.db
       .prepare("SELECT key, value_json, updated_at FROM app_settings ORDER BY key ASC")
@@ -533,6 +638,33 @@ export class SQLiteStore implements StoreAdapter {
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS permission_requests (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        invocation_id TEXT NOT NULL,
+        tool_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        caller TEXT NOT NULL,
+        permission_decision TEXT NOT NULL,
+        input_summary TEXT NOT NULL,
+        public_input_json TEXT NOT NULL,
+        execution_input_json TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL,
+        tool_call_part_id TEXT NOT NULL,
+        command_output_part_id TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        resolved_at TEXT,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+        FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS app_settings (
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL,
@@ -578,6 +710,9 @@ export class SQLiteStore implements StoreAdapter {
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_message_parts_message ON message_parts(message_id, seq);
       CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_permission_requests_status ON permission_requests(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_permission_requests_session ON permission_requests(session_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_permission_requests_run ON permission_requests(run_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_app_settings_updated_at ON app_settings(updated_at);
       CREATE INDEX IF NOT EXISTS idx_provider_profiles_source ON provider_profiles(source, updated_at);
       CREATE INDEX IF NOT EXISTS idx_agent_definitions_updated_at ON agent_definitions(updated_at);
@@ -733,6 +868,34 @@ function rowToAgentDefinition(row: AgentDefinitionRow): AgentDefinition {
     metadata: parseJsonObject(row.metadata_json),
     createdAt: row.created_at,
     updatedAt: row.updated_at
+  };
+}
+
+function rowToPermissionRequest(row: PermissionRequestRow): StoredPermissionRequest {
+  const publicInput = parseJsonObject(row.public_input_json);
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    runId: row.run_id,
+    messageId: row.message_id,
+    invocationId: row.invocation_id,
+    toolId: row.tool_id,
+    toolName: row.tool_name,
+    caller: row.caller,
+    permissionDecision: row.permission_decision,
+    inputSummary: row.input_summary,
+    input: publicInput,
+    publicInput,
+    executionInput: parseJsonObject(row.execution_input_json),
+    riskLevel: row.risk_level,
+    reason: row.reason,
+    status: row.status,
+    toolCallPartId: row.tool_call_part_id,
+    commandOutputPartId: row.command_output_part_id,
+    metadata: parseJsonObject(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    resolvedAt: row.resolved_at
   };
 }
 

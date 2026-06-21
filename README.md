@@ -85,6 +85,8 @@ Useful environment variables:
 - `GET /api/status`
 - `GET /api/settings`
 - `PATCH /api/settings` body JSON object, stored in SQLite `app_settings` as key/value JSON
+- `GET /api/tool-settings` returns the user-configurable shell permission policy and built-in shell timeout/output settings
+- `PATCH /api/tool-settings` updates Tool Settings after server-side JavaScript RegExp and shell numeric setting validation
 - `GET /api/agents` returns persisted agent definitions; the default is `main`
 - `GET /api/agents/:id` returns one agent definition
 - `PATCH /api/agents/:id` updates safe agent fields such as `name`, `systemPrompt`, `modelProfileId`, `defaultRunOptions`, `skillIds`, and `toolIds` (no credential/token storage)
@@ -96,10 +98,13 @@ Useful environment variables:
 - `POST /api/providers/openai-chatgpt/auth/poll` body `{ "attemptId": "..." }` polls/completes that device authorization flow
 - `POST /api/providers/openai-chatgpt/logout` removes the local ChatGPT OAuth credential file
 - `GET /api/tools` returns registered tool definitions. The only built-in tool today is `shell.exec`
+- `GET /api/permissions?status=pending` returns tool permission requests, primarily pending manual shell approvals
+- `POST /api/permissions/:id/approve` approves a pending permission request and runs the stored invocation
+- `POST /api/permissions/:id/deny` denies a pending permission request without running the stored invocation
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually executes the local shell tool and records structured tool parts/events
+- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually invokes the local shell tool. `timeoutMs` is optional; when omitted, Tool Settings `shell.defaultTimeoutMs` is used. The response is one of: executed immediately, pending permission, or denied by policy.
 - `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
@@ -154,7 +159,48 @@ Input:
 
 Output records `exitCode`, `stdout`, `stderr`, `durationMs`, `timedOut`, and truncation flags. The executor uses Node `child_process.spawn` with `shell: true`, stores stdout/stderr deltas as tool events, and writes `tool_call`, `command_output`, and `tool_result` message parts to the session. Output is size-limited before persistence.
 
-The default cwd is the daemon workspace root, and supplied cwd values must resolve under that root. This does **not** make shell commands safe: `shell.exec` runs real local commands in your environment. Avoid commands that print secrets or mutate important files unless you intend that. Permission approval/policy is only a placeholder hook in this step; approval UI and policy enforcement are planned next.
+The default cwd is the user's home directory. cwd is treated as execution context, not a Tool Settings value: omitted cwd uses home, relative cwd resolves from home, and absolute cwd resolves as-is. There is no home-subtree hard deny; cwd is only checked for existence and directory type. A future `session.workingDirectory` can replace the current home default when building tool execution context. `shell.exec` still runs real local commands in your environment, so avoid commands that print secrets or mutate important files unless you intend that.
+
+### Tool Settings regex permission policy and built-in shell settings
+
+Manual `shell.exec` calls pass through the user-configurable **Tool Settings** policy before execution. Tool Settings are stored in SQLite `app_settings` under `toolSettings` and can be edited in Settings → Tool Settings or through `GET/PATCH /api/tool-settings`.
+
+```ts
+{
+  defaultAction: "allow" | "ask" | "deny";
+  denyPatternsText: string;
+  askPatternsText: string;
+  allowPatternsText: string;
+  shell: {
+    defaultTimeoutMs: number;
+    maxTimeoutMs: number;
+    maxOutputChars: number;
+  };
+}
+```
+
+- `defaultAction` applies when no pattern matches. `allow` runs immediately, `ask` creates a pending permission request, and `deny` blocks without execution.
+- Pattern text fields are stored as multiline text exactly as entered.
+- Before saving and before command evaluation, the server splits lines, trims each line, ignores empty lines and lines starting with `#`, and validates each remaining line with `new RegExp(line)`.
+- Evaluation order is **Deny → Ask → Allow → Default**.
+- Use `.*` to match every command.
+- Only JavaScript regular expressions are supported for now. Glob patterns such as `*` are not supported yet.
+- `shell.defaultTimeoutMs` is used when an invocation omits `timeoutMs`.
+- `shell.maxTimeoutMs` is a local stability ceiling; invocation timeout overrides above it fail validation.
+- `shell.maxOutputChars` limits captured stdout/stderr per stream before persistence.
+- These shell settings are for the built-in `shell.exec` tool only. Custom tool packages keep their own defaults and behavior; the kernel does not expose common `executionDefaults` or `configurable` fields for registered tools.
+
+Example:
+
+```text
+# ask before package and git mutations
+^npm\s+install\b
+^git\s+push\b
+```
+
+Permission activity is stored in SQLite `permission_requests` and recorded in the run event log as `permission.requested`, `permission.approved`, and `permission.denied`. The table keeps the raw pending invocation server-side so approval can run the original command, while API/UI surfaces use the sanitized public input/summary.
+
+This permission layer is **not a security sandbox**. It is a user-configurable guardrail for the prototype. Approved commands still execute with the daemon process's local user privileges; keep using the tool carefully.
 
 ### Context Builder and main agent
 
@@ -185,7 +231,7 @@ curl -X PATCH http://127.0.0.1:8787/api/agents/main \
 
 Use the Chat tab's **Context Preview** button to inspect the system prompt, text messages, and effective run options that would be sent for the selected session/agent/provider. Preview responses never include API keys, OAuth tokens, or credential values.
 
-Beyond manual `shell.exec`, skills, files, MCP, permission approval/policy, automatic model tool calls, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
+Beyond manual `shell.exec` and its approval policy, skills, files, MCP, automatic model tool calls, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
 
 ### Experimental OpenAI ChatGPT/Codex OAuth profile
 
@@ -233,12 +279,13 @@ The kernel deals in store/provider interfaces, the provider-neutral context buil
 
 The React UI has two tabs:
 
-- `Chat`: existing session/run streaming flow plus a minimal manual Shell Tool panel for `shell.exec`
-- `Settings`: daemon status, main agent/system prompt editor, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
+- `Chat`: existing session/run streaming flow plus a minimal manual Shell Tool panel for `shell.exec` and pending shell permission approvals
+- `Settings`: daemon status, Tool Settings regex permission policy and built-in shell timeout/output settings, main agent/system prompt editor, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
 
 - The event log is append-only in `events`.
+- Tool permission decisions are stored in `permission_requests`; Tool Settings are a user-configurable guardrail and should not be treated as a sandbox.
 - `messages` and structured `message_parts` are the current read projection used to restore sessions after reload/reopen.
 - `agent_definitions` stores the default `main` agent and future agent rows; it must not contain API keys, OAuth tokens, or credential material.
 - `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets and OAuth token values are never written there.
@@ -251,5 +298,5 @@ The React UI has two tabs:
 - Promote provider profiles from env/builtin records to user-managed persisted records.
 - Validate the experimental `openai-chatgpt` runtime against a real ChatGPT/Codex subscription login and adjust the request/stream payload if OpenAI changes the backend contract.
 - Add token counting/trimming and explicit context budget controls to the Context Builder.
-- Add shell command permission approval/policy, then MCP providers, skills, files, and subagents on top of the structured message/event container.
+- Add MCP providers, skills, files, automatic tool calls, and subagents on top of the structured message/event container.
 - Add adapter install/status flows behind dashboard APIs.

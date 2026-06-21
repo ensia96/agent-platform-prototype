@@ -1,14 +1,18 @@
 import { spawn } from "node:child_process";
-import { isAbsolute, relative, resolve } from "node:path";
-import type { JsonObject, ShellExecOutput } from "../shared/types";
+import { statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { defaultShellToolSettings, normalizeShellToolSettings } from "../shared/tool-settings";
+import type { JsonObject, ShellExecOutput, ShellToolSettings } from "../shared/types";
 import type { RegisteredTool, ToolExecutionContext, ToolInputValidationContext } from "./types";
 import { ToolInputError } from "./types";
 
 export const shellExecToolId = "shell.exec";
-export const shellExecDefaultTimeoutMs = 60_000;
-export const shellExecMaxTimeoutMs = 300_000;
-export const shellExecMaxOutputChars = 64_000;
 const maxEventDeltaChars = 8_000;
+
+export interface ShellExecToolOptions {
+  env?: NodeJS.ProcessEnv;
+  getShellSettings?: () => ShellToolSettings;
+}
 
 interface NormalizedShellExecInput {
   command: string;
@@ -20,7 +24,10 @@ type OutputStream = "stdout" | "stderr";
 
 type TextRedactor = (text: string) => string;
 
-export function createShellExecTool(env: NodeJS.ProcessEnv = process.env): RegisteredTool {
+export function createShellExecTool(optionsOrEnv?: ShellExecToolOptions | NodeJS.ProcessEnv): RegisteredTool {
+  const options = optionsOrEnv === undefined ? {} : isShellExecToolOptions(optionsOrEnv) ? optionsOrEnv : { env: optionsOrEnv };
+  const env = options.env ?? process.env;
+  const getShellSettings = () => normalizeShellToolSettings(options.getShellSettings?.() ?? defaultShellToolSettings);
   const redact = createSensitiveTextRedactor(env);
   return {
     definition: {
@@ -31,31 +38,39 @@ export function createShellExecTool(env: NodeJS.ProcessEnv = process.env): Regis
       inputSchema: shellExecInputSchema(),
       outputSchema: shellExecOutputSchema(),
       metadata: {
-        defaultTimeoutMs: shellExecDefaultTimeoutMs,
-        maxTimeoutMs: shellExecMaxTimeoutMs,
-        maxOutputChars: shellExecMaxOutputChars,
-        cwdPolicy: "workspace-root-subtree",
+        cwdPolicy: "execution-context-home-default",
         shell: true,
-        permissionHook: "manual-invocation-allowed-placeholder",
-        warning: "Runs real local shell commands. Automatic model tool calls and approval policy are not enabled yet."
+        permissionHook: "allow-ask-deny-policy",
+        warning:
+          "Runs real local shell commands. cwd defaults to the runtime execution context (currently the user's home directory). Manual invocations pass through the user-edited Tool Settings permission policy first."
       }
     },
     executor: {
       validateInput(input, context) {
-        return shellExecInputToJson(validateShellExecInput(input, context));
+        return shellExecInputToJson(validateShellExecInput(input, context, getShellSettings()));
       },
       toPublicInput(input, context) {
-        const normalized = validateShellExecInput(input, context);
+        const normalized = validateShellExecInput(input, context, getShellSettings());
         return shellExecInputToJson({ ...normalized, command: redact(normalized.command) });
       },
       execute(input, context) {
-        return executeShellExec(validateShellExecInput(input, context), context, redact);
+        const shellSettings = getShellSettings();
+        const normalized = validateShellExecInput(input, context, shellSettings);
+        return executeShellExec(normalized, context, redact, shellSettings.maxOutputChars);
       }
     }
   };
 }
 
-function validateShellExecInput(input: JsonObject, context: ToolInputValidationContext): NormalizedShellExecInput {
+function isShellExecToolOptions(value: ShellExecToolOptions | NodeJS.ProcessEnv): value is ShellExecToolOptions {
+  return "env" in value || "getShellSettings" in value;
+}
+
+function validateShellExecInput(
+  input: JsonObject,
+  context: ToolInputValidationContext,
+  shellSettings: Required<ShellToolSettings>
+): NormalizedShellExecInput {
   const command = typeof input.command === "string" ? input.command.trim() : "";
   if (!command) {
     throw new ToolInputError("shell.exec requires a non-empty 'command' string.");
@@ -69,17 +84,17 @@ function validateShellExecInput(input: JsonObject, context: ToolInputValidationC
     throw new ToolInputError("shell.exec field 'cwd' must be a string when provided.");
   }
 
-  const timeoutMs = parseTimeoutMs(input.timeoutMs);
+  const timeoutMs = parseTimeoutMs(input.timeoutMs, shellSettings);
   return {
     command,
-    cwd: resolveWorkspaceCwd(context.workspaceRoot, typeof cwdValue === "string" ? cwdValue : undefined),
+    cwd: resolveExecutionCwd(context.cwd, typeof cwdValue === "string" ? cwdValue : undefined),
     timeoutMs
   };
 }
 
-function parseTimeoutMs(value: unknown): number {
+function parseTimeoutMs(value: unknown, shellSettings: Required<ShellToolSettings>): number {
   if (value === undefined || value === null || value === "") {
-    return shellExecDefaultTimeoutMs;
+    return shellSettings.defaultTimeoutMs;
   }
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     throw new ToolInputError("shell.exec field 'timeoutMs' must be an integer number of milliseconds.");
@@ -87,35 +102,41 @@ function parseTimeoutMs(value: unknown): number {
   if (value <= 0) {
     throw new ToolInputError("shell.exec field 'timeoutMs' must be greater than 0.");
   }
-  if (value > shellExecMaxTimeoutMs) {
-    throw new ToolInputError(`shell.exec field 'timeoutMs' must be ${shellExecMaxTimeoutMs}ms or less.`);
+  if (value > shellSettings.maxTimeoutMs) {
+    throw new ToolInputError(`shell.exec field 'timeoutMs' must be ${shellSettings.maxTimeoutMs}ms or less by Tool Settings shell.maxTimeoutMs.`);
   }
   return value;
 }
 
-function resolveWorkspaceCwd(workspaceRoot: string, cwd: string | undefined): string {
-  const root = resolve(workspaceRoot);
+function resolveExecutionCwd(defaultCwd: string, cwd: string | undefined): string {
+  const root = resolve(defaultCwd);
   const cwdText = cwd?.trim();
   const resolvedCwd = cwdText ? (isAbsolute(cwdText) ? resolve(cwdText) : resolve(root, cwdText)) : root;
-  if (!isInsideOrEqual(root, resolvedCwd)) {
-    throw new ToolInputError("shell.exec cwd must stay inside the workspace root.");
-  }
+  assertExistingDirectory(resolvedCwd);
   return resolvedCwd;
 }
 
-function isInsideOrEqual(parent: string, child: string): boolean {
-  const pathFromParent = relative(parent, child);
-  return pathFromParent === "" || (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent));
+function assertExistingDirectory(cwd: string): void {
+  let stat;
+  try {
+    stat = statSync(cwd);
+  } catch {
+    throw new ToolInputError(`shell.exec cwd does not exist: ${cwd}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new ToolInputError(`shell.exec cwd is not a directory: ${cwd}`);
+  }
 }
 
 async function executeShellExec(
   input: NormalizedShellExecInput,
   context: ToolExecutionContext,
-  redact: TextRedactor
+  redact: TextRedactor,
+  maxOutputChars: number
 ): Promise<JsonObject> {
   const startedAtMs = Date.now();
-  const stdout = createOutputLimiter("stdout", shellExecMaxOutputChars, redact);
-  const stderr = createOutputLimiter("stderr", shellExecMaxOutputChars, redact);
+  const stdout = createOutputLimiter("stdout", maxOutputChars, redact);
+  const stderr = createOutputLimiter("stderr", maxOutputChars, redact);
   let timedOut = false;
   let closed = false;
   let exitCode: number | null = null;
@@ -281,8 +302,17 @@ function shellExecInputSchema(): JsonObject {
     required: ["command"],
     properties: {
       command: { type: "string", minLength: 1, description: "Shell command string executed through the local shell." },
-      cwd: { type: "string", description: "Optional working directory. Must resolve inside the workspace root." },
-      timeoutMs: { type: "integer", minimum: 1, maximum: shellExecMaxTimeoutMs, default: shellExecDefaultTimeoutMs }
+      cwd: {
+        type: "string",
+        description:
+          "Optional working directory. Defaults to the runtime execution cwd (currently the user's home directory). Relative values resolve from that default; absolute values are used as-is."
+      },
+      timeoutMs: {
+        type: "integer",
+        minimum: 1,
+        description:
+          "Optional timeout in milliseconds. Omit to use Tool Settings shell.defaultTimeoutMs; values must not exceed Tool Settings shell.maxTimeoutMs."
+      }
     }
   };
 }

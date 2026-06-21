@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultAgentId } from "../kernel/context-builder";
@@ -15,6 +16,13 @@ import {
 } from "../providers/openai-chatgpt-credentials";
 import { createDefaultProviderRegistry } from "../providers/registry";
 import { SQLiteStore } from "../store/sqlite";
+import {
+  defaultShellToolSettings,
+  normalizeToolSettings,
+  toolSettingsSettingKey,
+  ToolSettingsValidationError,
+  validateToolSettings
+} from "../shared/tool-settings";
 import { createDefaultToolRegistry } from "../tools/registry";
 import type {
   AdapterRegistryItem,
@@ -25,16 +33,21 @@ import type {
   JsonValue,
   OpenAIChatGPTAuthPollResponse,
   OpenAIChatGPTLogoutResponse,
+  PermissionListResponse,
+  PermissionRequestStatus,
   ReasoningEffort,
   RunOptions,
   RunEvent,
   ShellExecRequest,
+  ToolSettings,
+  ToolSettingsResponse,
   ToolListResponse
 } from "../shared/types";
 
 const defaultPort = 8787;
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(moduleDir, "..", "..");
+const localRuntimeRoot = resolve(homedir());
 const packageJsonPath = resolve(projectRoot, "package.json");
 const dashboardDistDir = resolve(projectRoot, "dist", "client");
 const dashboardIndexPath = resolve(dashboardDistDir, "index.html");
@@ -69,8 +82,8 @@ const openAIChatGPTAuth = new OpenAIChatGPTAuthService({
   clientId: process.env.OPENAI_CHATGPT_CLIENT_ID
 });
 const providers = createDefaultProviderRegistry(process.env, { openAIChatGPTCredentials });
-const tools = createDefaultToolRegistry();
-const kernel = new Kernel({ store, eventBus, providers, tools, workspaceRoot: projectRoot });
+const tools = createDefaultToolRegistry({ getShellSettings: () => getToolSettings().shell });
+const kernel = new Kernel({ store, eventBus, providers, tools, toolExecutionCwd: localRuntimeRoot });
 const app = express();
 
 app.use(express.json());
@@ -94,11 +107,44 @@ app.patch("/api/settings", (req, res) => {
     return;
   }
 
-  const updatedAt = new Date().toISOString();
-  for (const [key, value] of Object.entries(patch)) {
-    store.setSetting(key, value, updatedAt);
+  try {
+    const updatedAt = new Date().toISOString();
+    for (const [key, value] of Object.entries(normalizeSettingsPatch(patch))) {
+      store.setSetting(key, value, updatedAt);
+    }
+  } catch (error) {
+    if (sendToolSettingsValidationError(error, res)) {
+      return;
+    }
+    throw error;
   }
   res.json(getSettingsResponse());
+});
+
+app.get("/api/tool-settings", (_req, res, next) => {
+  try {
+    const response: ToolSettingsResponse = { settings: getToolSettings() };
+    res.json(response);
+  } catch (error) {
+    if (sendToolSettingsValidationError(error, res)) {
+      return;
+    }
+    next(error);
+  }
+});
+
+app.patch("/api/tool-settings", (req, res, next) => {
+  try {
+    const settings = parseToolSettingsPatch(req.body, getToolSettings());
+    store.setSetting(toolSettingsSettingKey, toolSettingsToJson(settings), new Date().toISOString());
+    const response: ToolSettingsResponse = { settings };
+    res.json(response);
+  } catch (error) {
+    if (sendToolSettingsValidationError(error, res)) {
+      return;
+    }
+    next(error);
+  }
 });
 
 app.get("/api/agents", (_req, res) => {
@@ -202,6 +248,32 @@ app.post("/api/providers/openai-chatgpt/logout", async (_req, res, next) => {
 app.get("/api/tools", (_req, res) => {
   const response: ToolListResponse = { tools: kernel.listTools() };
   res.json(response);
+});
+
+app.get("/api/permissions", (req, res, next) => {
+  try {
+    const status = parsePermissionStatus(req.query.status);
+    const response: PermissionListResponse = { permissions: kernel.listPermissionRequests(status) };
+    res.json(response);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/permissions/:id/approve", async (req, res, next) => {
+  try {
+    res.json(await kernel.approvePermissionRequest(req.params.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/permissions/:id/deny", (req, res, next) => {
+  try {
+    res.json(kernel.denyPermissionRequest(req.params.id));
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/sessions", (_req, res) => {
@@ -394,6 +466,65 @@ function getSettingsResponse(): AppSettingsResponse {
   };
 }
 
+function getToolSettings(): ToolSettings {
+  return normalizeToolSettings(store.listSettings()[toolSettingsSettingKey]);
+}
+
+function parseToolSettingsPatch(body: unknown, current: ToolSettings): ToolSettings {
+  const candidate = isPlainObject(body) && isPlainObject(body.settings) ? body.settings : body;
+  if (!isPlainObject(candidate)) {
+    throw new KernelError("PATCH /api/tool-settings expects a JSON object or { settings: object }.", 400);
+  }
+
+  const allowedKeys = new Set(["defaultAction", "denyPatternsText", "askPatternsText", "allowPatternsText", "shell"]);
+  for (const key of Object.keys(candidate)) {
+    if (!allowedKeys.has(key)) {
+      throw new KernelError(`Unsupported Tool Settings field '${key}'.`, 400);
+    }
+  }
+
+  return normalizeToolSettings(candidate, current);
+}
+
+function normalizeSettingsPatch(patch: JsonObject): JsonObject {
+  const normalizedPatch: JsonObject = {};
+  for (const [key, value] of Object.entries(patch)) {
+    normalizedPatch[key] = key === toolSettingsSettingKey ? toolSettingsToJson(normalizeToolSettings(value)) : value;
+  }
+  return normalizedPatch;
+}
+
+function toolSettingsToJson(settings: ToolSettings): JsonObject {
+  const validatedSettings = validateToolSettings(settings);
+  return {
+    defaultAction: validatedSettings.defaultAction,
+    denyPatternsText: validatedSettings.denyPatternsText,
+    askPatternsText: validatedSettings.askPatternsText,
+    allowPatternsText: validatedSettings.allowPatternsText,
+    shell: {
+      defaultTimeoutMs: validatedSettings.shell.defaultTimeoutMs ?? defaultShellToolSettings.defaultTimeoutMs,
+      maxTimeoutMs: validatedSettings.shell.maxTimeoutMs ?? defaultShellToolSettings.maxTimeoutMs,
+      maxOutputChars: validatedSettings.shell.maxOutputChars ?? defaultShellToolSettings.maxOutputChars
+    }
+  };
+}
+
+function sendToolSettingsValidationError(error: unknown, res: Response): boolean {
+  if (!(error instanceof ToolSettingsValidationError)) {
+    return false;
+  }
+  res.status(400).json({
+    error: error.message,
+    issues: error.issues.map((issue) => ({
+      field: issue.field,
+      lineNumber: issue.lineNumber,
+      pattern: issue.pattern,
+      message: issue.message
+    }))
+  });
+  return true;
+}
+
 function buildContextPreview(sessionId: string, body: Record<string, unknown>) {
   const runOptions = parseRunOptionsFromBody(body);
   return kernel.previewContext(sessionId, {
@@ -427,6 +558,19 @@ function parseShellExecRequest(body: Record<string, unknown>): ShellExecRequest 
     input.timeoutMs = body.timeoutMs;
   }
   return input;
+}
+
+function parsePermissionStatus(value: unknown): PermissionRequestStatus | undefined {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    throw new KernelError("Permission status query must be a single value.", 400);
+  }
+  if (value === "pending" || value === "approved" || value === "denied" || value === "expired") {
+    return value;
+  }
+  throw new KernelError("Permission status must be one of pending, approved, denied, expired.", 400);
 }
 
 function getAdapterRegistry(): AdapterRegistryItem[] {

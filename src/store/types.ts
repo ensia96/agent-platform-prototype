@@ -8,12 +8,17 @@ import type {
   MessagePartType,
   MessageRole,
   MessageStatus,
+  PermissionRequest,
+  PermissionRequestStatus,
+  PermissionRiskLevel,
   Run,
   RunEvent,
   RunEventType,
   RunOptions,
   RunStatus,
-  Session
+  Session,
+  ToolInvocationCaller,
+  ToolPermissionDecision
 } from "../shared/types";
 
 export interface CreateSessionInput {
@@ -94,6 +99,50 @@ export interface UpdateAgentDefinitionInput {
   updatedAt: ISODateString;
 }
 
+export interface CreatePermissionRequestInput {
+  id: string;
+  sessionId: string;
+  runId: string;
+  messageId: string;
+  invocationId: string;
+  toolId: string;
+  toolName: string;
+  caller: ToolInvocationCaller;
+  permissionDecision: ToolPermissionDecision;
+  inputSummary: string;
+  publicInput: JsonObject;
+  executionInput: JsonObject;
+  riskLevel: PermissionRiskLevel;
+  reason: string;
+  status: PermissionRequestStatus;
+  toolCallPartId: string;
+  commandOutputPartId?: string | null;
+  metadata?: JsonObject;
+  createdAt: ISODateString;
+  updatedAt: ISODateString;
+  resolvedAt?: ISODateString | null;
+}
+
+export interface StoredPermissionRequest extends PermissionRequest {
+  runId: string;
+  messageId: string;
+  invocationId: string;
+  toolId: string;
+  caller: ToolInvocationCaller;
+  permissionDecision: ToolPermissionDecision;
+  publicInput: JsonObject;
+  executionInput: JsonObject;
+  toolCallPartId: string;
+  commandOutputPartId: string | null;
+  metadata: JsonObject;
+  updatedAt: ISODateString;
+}
+
+export interface ListPermissionRequestsFilter {
+  status?: PermissionRequestStatus;
+  sessionId?: string;
+}
+
 export interface StoreAdapter {
   listSessions(): Session[];
   getSession(id: string): Session | null;
@@ -121,6 +170,11 @@ export interface StoreAdapter {
   listAgentDefinitions(): AgentDefinition[];
   getAgentDefinition(id: string): AgentDefinition | null;
   updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition | null;
+
+  createPermissionRequest(input: CreatePermissionRequestInput): StoredPermissionRequest;
+  getPermissionRequest(id: string): StoredPermissionRequest | null;
+  listPermissionRequests(filter?: ListPermissionRequestsFilter): StoredPermissionRequest[];
+  resolvePermissionRequest(id: string, status: Exclude<PermissionRequestStatus, "pending">, resolvedAt: ISODateString): StoredPermissionRequest | null;
 
   listSettings(): JsonObject;
   setSetting(key: string, value: JsonValue, updatedAt: ISODateString): void;

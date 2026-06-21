@@ -37,6 +37,27 @@ export type ToolInvocationCaller = "manual" | "model" | "system";
 export type ToolInvocationStatus = "created" | "pending_permission" | "running" | "completed" | "failed" | "cancelled";
 export type ToolResultStatus = "completed" | "failed" | "cancelled";
 export type ToolPermissionDecision = "allowed" | "requires_approval" | "denied";
+export type PermissionRequestStatus = "pending" | "approved" | "denied" | "expired";
+export type PermissionRiskLevel = "low" | "medium" | "high" | "critical";
+export type PermissionPolicyAction = "allow" | "ask" | "deny";
+export type ToolSettingsPatternField = "denyPatternsText" | "askPatternsText" | "allowPatternsText";
+
+export interface ShellToolSettings {
+  defaultTimeoutMs?: number;
+  maxTimeoutMs?: number;
+  maxOutputChars?: number;
+}
+
+export type ToolSettingsShellField = "shell" | "shell.defaultTimeoutMs" | "shell.maxTimeoutMs" | "shell.maxOutputChars";
+export type ToolSettingsValidationField = "defaultAction" | ToolSettingsPatternField | ToolSettingsShellField;
+
+export interface ToolSettings {
+  defaultAction: PermissionPolicyAction;
+  denyPatternsText: string;
+  askPatternsText: string;
+  allowPatternsText: string;
+  shell: ShellToolSettings;
+}
 
 export interface RunOptions {
   model?: string;
@@ -106,6 +127,43 @@ export interface ToolDefinition {
   inputSchema: JsonObject;
   outputSchema: JsonObject;
   metadata: JsonObject;
+}
+
+export interface PermissionPolicyRule {
+  id: string;
+  action: PermissionPolicyAction;
+  riskLevel: PermissionRiskLevel;
+  description: string;
+  patterns?: string[];
+}
+
+export interface PermissionPolicy {
+  id: string;
+  version: number;
+  experimental: boolean;
+  defaultAction: PermissionPolicyAction;
+  executionCwd: string;
+  shell: {
+    defaultAction: PermissionPolicyAction;
+    rules: PermissionPolicyRule[];
+  };
+}
+
+export interface PermissionRequest {
+  id: string;
+  sessionId: string;
+  runId?: string;
+  invocationId?: string;
+  toolName: string;
+  toolId?: string;
+  inputSummary: string;
+  /** Sanitized public input only. Raw command text is kept server-side for approved execution. */
+  input?: JsonObject;
+  riskLevel: PermissionRiskLevel;
+  reason: string;
+  status: PermissionRequestStatus;
+  createdAt: ISODateString;
+  resolvedAt?: ISODateString | null;
 }
 
 export interface ToolInvocation {
@@ -184,7 +242,7 @@ export type ToolCallMessagePartContent = JsonObject & {
   toolId: string;
   toolName?: string;
   provider?: "native" | "shell" | "mcp" | "skill" | "subagent" | "internal";
-  status?: "created" | "pending" | "running" | "completed" | "failed" | "cancelled";
+  status?: "created" | "pending" | "pending_permission" | "running" | "completed" | "failed" | "cancelled";
   /** Sanitized public tool input only. Never persist credentials, tokens, or secret env values. */
   input?: JsonObject;
   inputSummary?: string;
@@ -412,14 +470,22 @@ export interface CreateRunResponse {
   assistantMessageId: string;
 }
 
+export type InvokeToolResponseState = "executed" | "pending_permission" | "denied";
+
 export interface InvokeToolResponse {
+  state: InvokeToolResponseState;
   invocation: ToolInvocation;
-  result: ToolExecutionResult;
+  result?: ToolExecutionResult;
+  permissionRequest?: PermissionRequest;
   run: Run;
   message: Message;
   toolCallPartId: string;
   commandOutputPartId?: string;
   toolResultPartId?: string;
+}
+
+export interface PermissionListResponse {
+  permissions: PermissionRequest[];
 }
 
 export interface ContextPreviewResponse extends ContextBuildResult {
@@ -528,4 +594,8 @@ export interface AppSettingsResponse {
   settings: JsonObject;
   providerProfiles: ProviderProfileSummary[];
   adapters: AdapterRegistryItem[];
+}
+
+export interface ToolSettingsResponse {
+  settings: ToolSettings;
 }

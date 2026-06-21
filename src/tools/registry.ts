@@ -1,6 +1,10 @@
 import { createShellExecTool } from "./shell-exec";
 import type { RegisteredTool } from "./types";
-import type { ToolDefinition } from "../shared/types";
+import type { ShellToolSettings, ToolDefinition } from "../shared/types";
+
+export interface DefaultToolRegistryOptions {
+  getShellSettings?: () => ShellToolSettings;
+}
 
 export class ToolRegistry {
   private readonly tools = new Map<string, RegisteredTool>();
@@ -25,8 +29,8 @@ export class ToolRegistry {
   }
 }
 
-export function createDefaultToolRegistry(): ToolRegistry {
+export function createDefaultToolRegistry(options: DefaultToolRegistryOptions = {}): ToolRegistry {
   const registry = new ToolRegistry();
-  registry.register(createShellExecTool());
+  registry.register(createShellExecTool({ getShellSettings: options.getShellSettings }));
   return registry;
 }

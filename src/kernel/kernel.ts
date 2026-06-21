@@ -1,13 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { buildContext, defaultAgentId } from "./context-builder";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import { RunWriter } from "./run-writer";
 import type { ProviderAdapter, ProviderMessage, ProviderRunInput } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
-import type { StoreAdapter, UpdateAgentDefinitionInput } from "../store/types";
+import type { StoreAdapter, StoredPermissionRequest, UpdateAgentDefinitionInput } from "../store/types";
+import { normalizeShellToolSettings, normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
+import { evaluateToolPermission, type ToolPermissionEvaluation } from "../tools/permission-policy";
 import type { ToolRegistry } from "../tools/registry";
-import { ToolInputError } from "../tools/types";
+import { ToolInputError, type RegisteredTool } from "../tools/types";
 import type {
   AgentDefinition,
   BuiltContext,
@@ -17,6 +20,8 @@ import type {
   JsonObject,
   Message,
   MessagePart,
+  PermissionRequest,
+  PermissionRequestStatus,
   ProviderProfile,
   ProviderResolution,
   Run,
@@ -31,6 +36,7 @@ import type {
   ToolInvocationCaller,
   ToolInvocationStatus,
   ToolPermissionDecision,
+  ToolSettings,
   ToolResultStatus
 } from "../shared/types";
 
@@ -55,6 +61,23 @@ interface RunOptionPlan {
   unsupportedRunOptions: string[];
 }
 
+interface PreparedToolInvocation {
+  registeredTool: RegisteredTool;
+  executionInput: JsonObject;
+  publicInput: JsonObject;
+  caller: ToolInvocationCaller;
+  permission: ToolPermissionEvaluation;
+  run: Run;
+  assistantMessage: Message;
+  invocation: ToolInvocation;
+  writer: RunWriter;
+  toolCallPart: MessagePart;
+  commandOutputPart: MessagePart;
+  createdAt: string;
+}
+
+const defaultCommandOutputMaxChars = 128_000;
+
 export class KernelError extends Error {
   constructor(message: string, readonly statusCode = 500) {
     super(message);
@@ -67,6 +90,9 @@ export interface KernelOptions {
   providers: ProviderRegistry;
   eventBus: RunEventBus;
   tools: ToolRegistry;
+  /** Default tool execution cwd. Current runtime default is the user's home directory. */
+  toolExecutionCwd?: string;
+  /** Deprecated compatibility alias for toolExecutionCwd. */
   workspaceRoot?: string;
 }
 
@@ -75,7 +101,7 @@ export class Kernel {
   private readonly providers: ProviderRegistry;
   private readonly eventBus: RunEventBus;
   private readonly tools: ToolRegistry;
-  private readonly workspaceRoot: string;
+  private readonly toolExecutionCwd: string;
   private readonly controllers = new Map<string, AbortController>();
 
   constructor(options: KernelOptions) {
@@ -83,7 +109,7 @@ export class Kernel {
     this.providers = options.providers;
     this.eventBus = options.eventBus;
     this.tools = options.tools;
-    this.workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
+    this.toolExecutionCwd = resolve(options.toolExecutionCwd ?? options.workspaceRoot ?? homedir());
   }
 
   listSessions(): Session[] {
@@ -118,266 +144,14 @@ export class Kernel {
   }
 
   async invokeTool(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions = {}): Promise<InvokeToolResponse> {
-    this.getSession(sessionId);
-    const registeredTool = this.tools.get(toolId.trim());
-    if (!registeredTool) {
-      throw new KernelError("Tool not found", 404);
+    const prepared = this.prepareToolInvocation(sessionId, toolId, input, options);
+    if (prepared.permission.decision === "allowed") {
+      return this.executePreparedToolInvocation(prepared, { state: "executed" });
     }
-
-    const validationContext = { workspaceRoot: this.workspaceRoot };
-    let executionInput: JsonObject;
-    let publicInput: JsonObject;
-    try {
-      executionInput = registeredTool.executor.validateInput?.(input, validationContext) ?? input;
-      publicInput = registeredTool.executor.toPublicInput?.(executionInput, validationContext) ?? executionInput;
-    } catch (error) {
-      if (error instanceof ToolInputError) {
-        throw new KernelError(error.message, error.statusCode);
-      }
-      throw error;
+    if (prepared.permission.decision === "requires_approval") {
+      return this.createPendingPermissionResponse(prepared);
     }
-
-    const caller = options.caller ?? "manual";
-    const permissionDecision = this.decideToolPermission(caller);
-    const now = new Date().toISOString();
-    const run = this.store.createRun({
-      id: randomUUID(),
-      sessionId,
-      provider: `tool:${registeredTool.definition.id}`,
-      status: "running",
-      createdAt: now,
-      updatedAt: now,
-      metadata: buildToolRunMetadata(registeredTool.definition, publicInput, caller, permissionDecision, this.workspaceRoot)
-    });
-    this.store.touchSession(sessionId, now);
-
-    const assistantMessage = this.store.createMessage({
-      id: randomUUID(),
-      sessionId,
-      runId: run.id,
-      role: "assistant",
-      status: "streaming",
-      createdAt: now,
-      updatedAt: now,
-      metadata: buildToolMessageMetadata(registeredTool.definition, publicInput, caller, permissionDecision)
-    });
-
-    const invocation: ToolInvocation = {
-      id: randomUUID(),
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      sessionId,
-      runId: run.id,
-      messageId: assistantMessage.id,
-      caller,
-      status: permissionDecision === "allowed" ? "created" : "pending_permission",
-      permissionDecision,
-      input: publicInput,
-      metadata: {
-        toolSource: registeredTool.definition.source,
-        workspaceRoot: this.workspaceRoot
-      },
-      createdAt: now,
-      updatedAt: now
-    };
-
-    this.emit(run, "run_started", {
-      runId: run.id,
-      sessionId,
-      provider: "tool",
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      caller,
-      permissionDecision,
-      invocation
-    });
-    this.emit(run, "assistant_message_created", { message: this.store.getMessage(assistantMessage.id)! });
-
-    const writer = new RunWriter({
-      store: this.store,
-      eventBus: this.eventBus,
-      run,
-      assistantMessageId: assistantMessage.id
-    });
-
-    let toolCallPart = writer.recordToolCall({
-      callId: invocation.id,
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      provider: toolProviderForPart(registeredTool.definition.id),
-      input: publicInput,
-      inputSummary: summarizeToolInput(registeredTool.definition.id, publicInput),
-      metadata: {
-        caller,
-        permissionDecision,
-        toolSource: registeredTool.definition.source
-      }
-    });
-
-    let commandOutputText = "";
-    let commandOutputTruncated = false;
-    let commandOutputPart = writer.recordCommandOutput({
-      callId: invocation.id,
-      stream: "combined",
-      text: "",
-      cwd: stringField(executionInput, "cwd"),
-      metadata: {
-        invocationId: invocation.id,
-        toolId: registeredTool.definition.id
-      }
-    });
-
-    if (permissionDecision !== "allowed") {
-      const completedAt = new Date().toISOString();
-      const result = buildPermissionBlockedResult(invocation, registeredTool.definition.id, permissionDecision, now, completedAt);
-      toolCallPart = this.updateToolCallStatus(toolCallPart, result.status, completedAt);
-      const toolResultPart = writer.recordToolResult({
-        callId: invocation.id,
-        toolId: registeredTool.definition.id,
-        toolName: registeredTool.definition.name,
-        status: result.status,
-        outputSummary: result.error ?? "Tool execution blocked by permission hook.",
-        error: result.error ?? undefined,
-        metadata: { permissionDecision }
-      });
-      writer.fail(new Error(result.error ?? "Tool execution blocked by permission hook."));
-      return {
-        invocation: { ...invocation, status: result.status, updatedAt: completedAt },
-        result,
-        run: this.store.getRun(run.id)!,
-        message: this.store.getMessage(assistantMessage.id)!,
-        toolCallPartId: toolCallPart.id,
-        commandOutputPartId: commandOutputPart.id,
-        toolResultPartId: toolResultPart.id
-      };
-    }
-
-    const startedAt = new Date().toISOString();
-    const runningInvocation: ToolInvocation = { ...invocation, status: "running", updatedAt: startedAt };
-    toolCallPart = this.updateToolCallStatus(toolCallPart, "running", startedAt);
-    this.emit(run, "tool.started", {
-      messageId: assistantMessage.id,
-      partId: toolCallPart.id,
-      part: toolCallPart,
-      outputPartId: commandOutputPart.id,
-      outputPart: commandOutputPart,
-      callId: invocation.id,
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      caller,
-      permissionDecision,
-      status: "running"
-    });
-
-    const onToolEvent = (event: ToolExecutionEvent): void => {
-      if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
-        const delta = typeof event.payload.text === "string" ? event.payload.text : "";
-        if (!delta) {
-          return;
-        }
-        const nextOutput = appendLimitedText(commandOutputText, commandOutputTruncated, delta, 128_000, "command output");
-        commandOutputText = nextOutput.text;
-        commandOutputTruncated = nextOutput.truncated;
-        const updatedAt = new Date().toISOString();
-        commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, updatedAt, {
-          truncated: commandOutputTruncated
-        });
-        this.emit(run, event.type, {
-          ...event.payload,
-          messageId: assistantMessage.id,
-          partId: commandOutputPart.id,
-          callId: invocation.id,
-          toolId: registeredTool.definition.id,
-          toolName: registeredTool.definition.name
-        });
-        return;
-      }
-
-      this.emit(run, event.type, {
-        ...event.payload,
-        messageId: assistantMessage.id,
-        callId: invocation.id,
-        toolId: registeredTool.definition.id,
-        toolName: registeredTool.definition.name
-      });
-    };
-
-    let result: ToolExecutionResult;
-    try {
-      const output = await registeredTool.executor.execute(executionInput, {
-        invocation: runningInvocation,
-        workspaceRoot: this.workspaceRoot,
-        signal: new AbortController().signal,
-        emit: onToolEvent
-      });
-      const completedAt = new Date().toISOString();
-      result = buildToolExecutionResult(invocation, registeredTool.definition.id, output, startedAt, completedAt);
-    } catch (error) {
-      const completedAt = new Date().toISOString();
-      const toolError = toError(error);
-      result = {
-        invocationId: invocation.id,
-        toolId: registeredTool.definition.id,
-        status: "failed",
-        output: {},
-        error: toolError.message,
-        startedAt,
-        completedAt,
-        durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
-        metadata: {
-          failedBeforeResult: true
-        }
-      };
-    }
-
-    const completedAt = result.completedAt;
-    const finalInvocation: ToolInvocation = { ...invocation, status: result.status, updatedAt: completedAt };
-    commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, completedAt, commandOutputMetadataFromResult(result, commandOutputTruncated));
-    toolCallPart = this.updateToolCallStatus(toolCallPart, result.status, completedAt);
-    this.emit(run, result.status === "completed" ? "tool.completed" : "tool.failed", {
-      messageId: assistantMessage.id,
-      partId: toolCallPart.id,
-      part: toolCallPart,
-      outputPartId: commandOutputPart.id,
-      outputPart: commandOutputPart,
-      callId: invocation.id,
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      status: result.status,
-      error: result.error,
-      durationMs: result.durationMs
-    });
-    const toolResultPart = writer.recordToolResult({
-      callId: invocation.id,
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      status: result.status,
-      outputSummary: summarizeToolResult(result),
-      error: result.error ?? undefined,
-      metadata: {
-        durationMs: result.durationMs,
-        permissionDecision,
-        ...(result.metadata ?? {})
-      }
-    });
-
-    if (result.status === "completed") {
-      writer.complete();
-    } else if (result.status === "cancelled") {
-      writer.cancel();
-    } else {
-      writer.fail(new Error(result.error ?? "Tool execution failed."));
-    }
-
-    return {
-      invocation: finalInvocation,
-      result,
-      run: this.store.getRun(run.id)!,
-      message: this.store.getMessage(assistantMessage.id)!,
-      toolCallPartId: toolCallPart.id,
-      commandOutputPartId: commandOutputPart.id,
-      toolResultPartId: toolResultPart.id
-    };
+    return this.denyPreparedToolInvocation(prepared, null);
   }
 
   listAgentDefinitions(): AgentDefinition[] {
@@ -611,10 +385,550 @@ export class Kernel {
     return this.eventBus.subscribe(runId, listener);
   }
 
-  private decideToolPermission(_caller: ToolInvocationCaller): ToolPermissionDecision {
-    // Placeholder for the next permission/policy step. Manual invocations are allowed for now;
-    // model-driven tool calls are not wired to this method yet.
-    return "allowed";
+  listPermissionRequests(status?: PermissionRequestStatus): PermissionRequest[] {
+    return this.store.listPermissionRequests(status ? { status } : {}).map(toPublicPermissionRequest);
+  }
+
+  async approvePermissionRequest(id: string): Promise<InvokeToolResponse> {
+    const request = this.getResolvablePermissionRequest(id);
+    const run = this.getRun(request.runId);
+    if (run.status !== "running") {
+      throw new KernelError("Permission request can only be approved while its tool run is still running.", 409);
+    }
+
+    const resolvedAt = new Date().toISOString();
+    const approvedRequest = this.store.resolvePermissionRequest(request.id, "approved", resolvedAt)!;
+    this.emit(run, "permission.approved", {
+      requestId: approvedRequest.id,
+      status: "approved",
+      reason: approvedRequest.reason,
+      riskLevel: approvedRequest.riskLevel,
+      request: toPublicPermissionRequest(approvedRequest)
+    });
+
+    return this.executePreparedToolInvocation(this.prepareToolInvocationFromPermission(approvedRequest), {
+      state: "executed",
+      permissionRequest: toPublicPermissionRequest(approvedRequest)
+    });
+  }
+
+  denyPermissionRequest(id: string): InvokeToolResponse {
+    const request = this.getResolvablePermissionRequest(id);
+    const run = this.getRun(request.runId);
+    if (run.status !== "running") {
+      throw new KernelError("Permission request can only be denied while its tool run is still running.", 409);
+    }
+
+    const resolvedAt = new Date().toISOString();
+    const deniedRequest = this.store.resolvePermissionRequest(request.id, "denied", resolvedAt)!;
+    this.emit(run, "permission.denied", {
+      requestId: deniedRequest.id,
+      status: "denied",
+      reason: deniedRequest.reason,
+      riskLevel: deniedRequest.riskLevel,
+      request: toPublicPermissionRequest(deniedRequest)
+    });
+
+    return this.denyPreparedToolInvocation(this.prepareToolInvocationFromPermission(deniedRequest), deniedRequest);
+  }
+
+  private prepareToolInvocation(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions): PreparedToolInvocation {
+    const session = this.getSession(sessionId);
+    const registeredTool = this.tools.get(toolId.trim());
+    if (!registeredTool) {
+      throw new KernelError("Tool not found", 404);
+    }
+
+    const toolSettings = this.getToolSettings();
+    const executionCwd = this.getToolExecutionCwd(session);
+    const validationContext = { cwd: executionCwd, workspaceRoot: executionCwd };
+    let executionInput: JsonObject;
+    let publicInput: JsonObject;
+    try {
+      executionInput = registeredTool.executor.validateInput?.(input, validationContext) ?? input;
+      publicInput = registeredTool.executor.toPublicInput?.(executionInput, validationContext) ?? executionInput;
+    } catch (error) {
+      if (error instanceof ToolInputError) {
+        throw new KernelError(error.message, error.statusCode);
+      }
+      throw error;
+    }
+
+    const caller = options.caller ?? "manual";
+    const permission = evaluateToolPermission({
+      tool: registeredTool.definition,
+      caller,
+      publicInput,
+      executionInput,
+      executionCwd,
+      settings: toolSettings
+    });
+    const now = new Date().toISOString();
+    const run = this.store.createRun({
+      id: randomUUID(),
+      sessionId,
+      provider: `tool:${registeredTool.definition.id}`,
+      status: "running",
+      createdAt: now,
+      updatedAt: now,
+      metadata: buildToolRunMetadata(registeredTool.definition, publicInput, caller, permission, executionCwd)
+    });
+    this.store.touchSession(sessionId, now);
+
+    const assistantMessage = this.store.createMessage({
+      id: randomUUID(),
+      sessionId,
+      runId: run.id,
+      role: "assistant",
+      status: "streaming",
+      createdAt: now,
+      updatedAt: now,
+      metadata: buildToolMessageMetadata(registeredTool.definition, publicInput, caller, permission)
+    });
+
+    const invocation: ToolInvocation = {
+      id: randomUUID(),
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      sessionId,
+      runId: run.id,
+      messageId: assistantMessage.id,
+      caller,
+      status: permission.decision === "allowed" ? "created" : "pending_permission",
+      permissionDecision: permission.decision,
+      input: publicInput,
+      metadata: {
+        toolSource: registeredTool.definition.source,
+        executionCwd,
+        permissionRuleId: permission.ruleId,
+        riskLevel: permission.riskLevel
+      },
+      createdAt: now,
+      updatedAt: now
+    };
+
+    this.emit(run, "run_started", {
+      runId: run.id,
+      sessionId,
+      provider: "tool",
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      caller,
+      permissionDecision: permission.decision,
+      permissionAction: permission.action,
+      permissionRuleId: permission.ruleId,
+      riskLevel: permission.riskLevel,
+      invocation
+    });
+    this.emit(run, "assistant_message_created", { message: this.store.getMessage(assistantMessage.id)! });
+
+    const writer = new RunWriter({
+      store: this.store,
+      eventBus: this.eventBus,
+      run,
+      assistantMessageId: assistantMessage.id
+    });
+
+    const toolCallPart = writer.recordToolCall({
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      provider: toolProviderForPart(registeredTool.definition.id),
+      input: publicInput,
+      inputSummary: summarizeToolInput(registeredTool.definition.id, publicInput),
+      metadata: {
+        caller,
+        permissionDecision: permission.decision,
+        permissionAction: permission.action,
+        permissionRuleId: permission.ruleId,
+        riskLevel: permission.riskLevel,
+        toolSource: registeredTool.definition.source
+      }
+    });
+
+    const commandOutputPart = writer.recordCommandOutput({
+      callId: invocation.id,
+      stream: "combined",
+      text: "",
+      cwd: stringField(executionInput, "cwd"),
+      metadata: {
+        invocationId: invocation.id,
+        toolId: registeredTool.definition.id
+      }
+    });
+
+    return {
+      registeredTool,
+      executionInput,
+      publicInput,
+      caller,
+      permission,
+      run,
+      assistantMessage,
+      invocation,
+      writer,
+      toolCallPart,
+      commandOutputPart,
+      createdAt: now
+    };
+  }
+
+  private prepareToolInvocationFromPermission(request: StoredPermissionRequest): PreparedToolInvocation {
+    const registeredTool = this.tools.get(request.toolId);
+    if (!registeredTool) {
+      throw new KernelError("Tool not found for permission request", 404);
+    }
+    const run = this.getRun(request.runId);
+    const assistantMessage = this.store.getMessage(request.messageId);
+    if (!assistantMessage) {
+      throw new KernelError("Assistant message for permission request not found", 404);
+    }
+    const toolCallPart = assistantMessage.parts.find((part) => part.id === request.toolCallPartId);
+    if (!toolCallPart) {
+      throw new KernelError("Tool call part for permission request not found", 404);
+    }
+    const commandOutputPart = request.commandOutputPartId
+      ? assistantMessage.parts.find((part) => part.id === request.commandOutputPartId)
+      : null;
+    if (!commandOutputPart) {
+      throw new KernelError("Command output part for permission request not found", 404);
+    }
+
+    const permission = permissionEvaluationFromRequest(request, this.getToolExecutionCwd(this.getSession(request.sessionId)));
+    const invocation: ToolInvocation = {
+      id: request.invocationId,
+      toolId: request.toolId,
+      toolName: request.toolName,
+      sessionId: request.sessionId,
+      runId: request.runId,
+      messageId: request.messageId,
+      caller: request.caller,
+      status: request.status === "approved" ? "created" : "pending_permission",
+      permissionDecision: request.permissionDecision,
+      input: request.publicInput,
+      metadata: request.metadata,
+      createdAt: request.createdAt,
+      updatedAt: request.updatedAt
+    };
+
+    return {
+      registeredTool,
+      executionInput: request.executionInput,
+      publicInput: request.publicInput,
+      caller: request.caller,
+      permission,
+      run,
+      assistantMessage,
+      invocation,
+      writer: new RunWriter({ store: this.store, eventBus: this.eventBus, run, assistantMessageId: assistantMessage.id }),
+      toolCallPart,
+      commandOutputPart,
+      createdAt: request.createdAt
+    };
+  }
+
+  private createPendingPermissionResponse(prepared: PreparedToolInvocation): InvokeToolResponse {
+    const now = new Date().toISOString();
+    const executionCwd = this.getToolExecutionCwd(this.getSession(prepared.invocation.sessionId));
+    const toolCallPart = this.updateToolCallStatus(prepared.toolCallPart, "pending_permission", now);
+    const permissionRequest = this.store.createPermissionRequest({
+      id: randomUUID(),
+      sessionId: prepared.invocation.sessionId,
+      runId: prepared.run.id,
+      messageId: prepared.assistantMessage.id,
+      invocationId: prepared.invocation.id,
+      toolId: prepared.registeredTool.definition.id,
+      toolName: prepared.registeredTool.definition.name,
+      caller: prepared.caller,
+      permissionDecision: prepared.permission.decision,
+      inputSummary: summarizeToolInput(prepared.registeredTool.definition.id, prepared.publicInput),
+      publicInput: prepared.publicInput,
+      executionInput: prepared.executionInput,
+      riskLevel: prepared.permission.riskLevel,
+      reason: prepared.permission.reason,
+      status: "pending",
+      toolCallPartId: toolCallPart.id,
+      commandOutputPartId: prepared.commandOutputPart.id,
+      metadata: {
+        toolSource: prepared.registeredTool.definition.source,
+        executionCwd,
+        permissionAction: prepared.permission.action,
+        permissionRuleId: prepared.permission.ruleId,
+        policy: permissionPolicySummary(prepared.permission)
+      },
+      createdAt: now,
+      updatedAt: now
+    });
+
+    this.emit(prepared.run, "permission.requested", {
+      requestId: permissionRequest.id,
+      status: "requested",
+      reason: permissionRequest.reason,
+      riskLevel: permissionRequest.riskLevel,
+      request: toPublicPermissionRequest(permissionRequest)
+    });
+
+    return {
+      state: "pending_permission",
+      invocation: { ...prepared.invocation, status: "pending_permission", updatedAt: now },
+      permissionRequest: toPublicPermissionRequest(permissionRequest),
+      run: this.store.getRun(prepared.run.id)!,
+      message: this.store.getMessage(prepared.assistantMessage.id)!,
+      toolCallPartId: toolCallPart.id,
+      commandOutputPartId: prepared.commandOutputPart.id
+    };
+  }
+
+  private async executePreparedToolInvocation(
+    prepared: PreparedToolInvocation,
+    responseOptions: { state: "executed"; permissionRequest?: PermissionRequest }
+  ): Promise<InvokeToolResponse> {
+    const { registeredTool, executionInput, caller, permission, run, assistantMessage, invocation, writer } = prepared;
+    const executionCwd = this.getToolExecutionCwd(this.getSession(invocation.sessionId));
+    const commandOutputMaxChars = commandOutputMaxCharsForTool(registeredTool.definition.id, this.getToolSettings());
+    let toolCallPart = prepared.toolCallPart;
+    let commandOutputPart = prepared.commandOutputPart;
+    let commandOutputText = partString(commandOutputPart, "text") || commandOutputPart.text || "";
+    let commandOutputTruncated = false;
+
+    const startedAt = new Date().toISOString();
+    const runningInvocation: ToolInvocation = { ...invocation, status: "running", updatedAt: startedAt };
+    toolCallPart = this.updateToolCallStatus(toolCallPart, "running", startedAt);
+    this.emit(run, "tool.started", {
+      messageId: assistantMessage.id,
+      partId: toolCallPart.id,
+      part: toolCallPart,
+      outputPartId: commandOutputPart.id,
+      outputPart: commandOutputPart,
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      caller,
+      permissionDecision: permission.decision,
+      permissionAction: permission.action,
+      permissionRuleId: permission.ruleId,
+      riskLevel: permission.riskLevel,
+      status: "running"
+    });
+
+    const onToolEvent = (event: ToolExecutionEvent): void => {
+      if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
+        const delta = typeof event.payload.text === "string" ? event.payload.text : "";
+        if (!delta) {
+          return;
+        }
+        const nextOutput = appendLimitedText(commandOutputText, commandOutputTruncated, delta, commandOutputMaxChars, "command output");
+        commandOutputText = nextOutput.text;
+        commandOutputTruncated = nextOutput.truncated;
+        const updatedAt = new Date().toISOString();
+        commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, updatedAt, {
+          truncated: commandOutputTruncated
+        });
+        this.emit(run, event.type, {
+          ...event.payload,
+          messageId: assistantMessage.id,
+          partId: commandOutputPart.id,
+          part: commandOutputPart,
+          callId: invocation.id,
+          toolId: registeredTool.definition.id,
+          toolName: registeredTool.definition.name
+        });
+        return;
+      }
+
+      this.emit(run, event.type, {
+        ...event.payload,
+        messageId: assistantMessage.id,
+        callId: invocation.id,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name
+      });
+    };
+
+    let result: ToolExecutionResult;
+    try {
+      const output = await registeredTool.executor.execute(executionInput, {
+        invocation: runningInvocation,
+        cwd: executionCwd,
+        workspaceRoot: executionCwd,
+        signal: new AbortController().signal,
+        emit: onToolEvent
+      });
+      const completedAt = new Date().toISOString();
+      result = buildToolExecutionResult(invocation, registeredTool.definition.id, output, startedAt, completedAt);
+    } catch (error) {
+      const completedAt = new Date().toISOString();
+      const toolError = toError(error);
+      result = {
+        invocationId: invocation.id,
+        toolId: registeredTool.definition.id,
+        status: "failed",
+        output: {},
+        error: toolError.message,
+        startedAt,
+        completedAt,
+        durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
+        metadata: {
+          failedBeforeResult: true
+        }
+      };
+    }
+
+    const completedAt = result.completedAt;
+    const finalInvocation: ToolInvocation = { ...invocation, status: result.status, updatedAt: completedAt };
+    commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, completedAt, commandOutputMetadataFromResult(result, commandOutputTruncated));
+    toolCallPart = this.updateToolCallStatus(toolCallPart, result.status, completedAt);
+    this.emit(run, result.status === "completed" ? "tool.completed" : "tool.failed", {
+      messageId: assistantMessage.id,
+      partId: toolCallPart.id,
+      part: toolCallPart,
+      outputPartId: commandOutputPart.id,
+      outputPart: commandOutputPart,
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      status: result.status,
+      error: result.error,
+      durationMs: result.durationMs
+    });
+    const toolResultPart = writer.recordToolResult({
+      callId: invocation.id,
+      toolId: registeredTool.definition.id,
+      toolName: registeredTool.definition.name,
+      status: result.status,
+      outputSummary: summarizeToolResult(result),
+      error: result.error ?? undefined,
+      metadata: {
+        durationMs: result.durationMs,
+        permissionDecision: permission.decision,
+        permissionAction: permission.action,
+        permissionRuleId: permission.ruleId,
+        riskLevel: permission.riskLevel,
+        ...(result.metadata ?? {})
+      }
+    });
+
+    if (result.status === "completed") {
+      writer.complete();
+    } else if (result.status === "cancelled") {
+      writer.cancel();
+    } else {
+      writer.fail(new Error(result.error ?? "Tool execution failed."));
+    }
+
+    return {
+      state: responseOptions.state,
+      invocation: finalInvocation,
+      result,
+      permissionRequest: responseOptions.permissionRequest,
+      run: this.store.getRun(run.id)!,
+      message: this.store.getMessage(assistantMessage.id)!,
+      toolCallPartId: toolCallPart.id,
+      commandOutputPartId: commandOutputPart.id,
+      toolResultPartId: toolResultPart.id
+    };
+  }
+
+  private denyPreparedToolInvocation(prepared: PreparedToolInvocation, request: StoredPermissionRequest | null): InvokeToolResponse {
+    const now = new Date().toISOString();
+    const executionCwd = this.getToolExecutionCwd(this.getSession(prepared.invocation.sessionId));
+    const permissionRequest = request ?? this.store.createPermissionRequest({
+      id: randomUUID(),
+      sessionId: prepared.invocation.sessionId,
+      runId: prepared.run.id,
+      messageId: prepared.assistantMessage.id,
+      invocationId: prepared.invocation.id,
+      toolId: prepared.registeredTool.definition.id,
+      toolName: prepared.registeredTool.definition.name,
+      caller: prepared.caller,
+      permissionDecision: prepared.permission.decision,
+      inputSummary: summarizeToolInput(prepared.registeredTool.definition.id, prepared.publicInput),
+      publicInput: prepared.publicInput,
+      executionInput: prepared.executionInput,
+      riskLevel: prepared.permission.riskLevel,
+      reason: prepared.permission.reason,
+      status: "denied",
+      toolCallPartId: prepared.toolCallPart.id,
+      commandOutputPartId: prepared.commandOutputPart.id,
+      metadata: {
+        toolSource: prepared.registeredTool.definition.source,
+        executionCwd,
+        permissionAction: prepared.permission.action,
+        permissionRuleId: prepared.permission.ruleId,
+        policy: permissionPolicySummary(prepared.permission)
+      },
+      createdAt: now,
+      updatedAt: now,
+      resolvedAt: now
+    });
+
+    if (!request) {
+      this.emit(prepared.run, "permission.denied", {
+        requestId: permissionRequest.id,
+        status: "denied",
+        reason: permissionRequest.reason,
+        riskLevel: permissionRequest.riskLevel,
+        request: toPublicPermissionRequest(permissionRequest)
+      });
+    }
+
+    const completedAt = new Date().toISOString();
+    const result = buildPermissionBlockedResult(
+      prepared.invocation,
+      prepared.registeredTool.definition.id,
+      request ? "denied" : prepared.permission.decision,
+      prepared.permission.reason,
+      prepared.createdAt,
+      completedAt
+    );
+    const toolCallPart = this.updateToolCallStatus(prepared.toolCallPart, result.status, completedAt);
+    const toolResultPart = prepared.writer.recordToolResult({
+      callId: prepared.invocation.id,
+      toolId: prepared.registeredTool.definition.id,
+      toolName: prepared.registeredTool.definition.name,
+      status: result.status,
+      outputSummary: result.error ?? "Tool execution denied by permission policy.",
+      error: result.error ?? undefined,
+      metadata: {
+        permissionDecision: prepared.permission.decision,
+        permissionAction: prepared.permission.action,
+        permissionRuleId: prepared.permission.ruleId,
+        riskLevel: prepared.permission.riskLevel,
+        permissionRequestId: permissionRequest.id
+      }
+    });
+    prepared.writer.fail(new Error(result.error ?? "Tool execution denied by permission policy."));
+
+    return {
+      state: "denied",
+      invocation: { ...prepared.invocation, status: result.status, updatedAt: completedAt },
+      result,
+      permissionRequest: toPublicPermissionRequest(permissionRequest),
+      run: this.store.getRun(prepared.run.id)!,
+      message: this.store.getMessage(prepared.assistantMessage.id)!,
+      toolCallPartId: toolCallPart.id,
+      commandOutputPartId: prepared.commandOutputPart.id,
+      toolResultPartId: toolResultPart.id
+    };
+  }
+
+  private getResolvablePermissionRequest(id: string): StoredPermissionRequest {
+    const request = this.store.getPermissionRequest(id);
+    if (!request) {
+      throw new KernelError("Permission request not found", 404);
+    }
+    if (request.status !== "pending") {
+      throw new KernelError(`Permission request is already ${request.status}.`, 409);
+    }
+    return request;
+  }
+
+  private getToolSettings(): ToolSettings {
+    return normalizeToolSettings(this.store.listSettings()[toolSettingsSettingKey]);
+  }
+
+  private getToolExecutionCwd(_session: Session): string {
+    return this.toolExecutionCwd;
   }
 
   private updateToolCallStatus(part: MessagePart, status: ToolInvocationStatus | ToolResultStatus, updatedAt: string): MessagePart {
@@ -715,8 +1029,8 @@ function buildToolRunMetadata(
   tool: ToolDefinition,
   input: JsonObject,
   caller: ToolInvocationCaller,
-  permissionDecision: ToolPermissionDecision,
-  workspaceRoot: string
+  permission: ToolPermissionEvaluation,
+  executionCwd: string
 ): JsonObject {
   return {
     kind: "tool_invocation",
@@ -724,10 +1038,14 @@ function buildToolRunMetadata(
     toolName: tool.name,
     toolSource: tool.source,
     caller,
-    permissionDecision,
+    permissionDecision: permission.decision,
+    permissionAction: permission.action,
+    permissionRuleId: permission.ruleId,
+    permissionRiskLevel: permission.riskLevel,
+    permissionReason: permission.reason,
     input,
-    workspaceRoot,
-    permissionHook: "placeholder"
+    executionCwd,
+    permissionPolicy: permissionPolicySummary(permission)
   };
 }
 
@@ -735,7 +1053,7 @@ function buildToolMessageMetadata(
   tool: ToolDefinition,
   input: JsonObject,
   caller: ToolInvocationCaller,
-  permissionDecision: ToolPermissionDecision
+  permission: ToolPermissionEvaluation
 ): JsonObject {
   return {
     kind: "tool_invocation",
@@ -743,13 +1061,87 @@ function buildToolMessageMetadata(
     toolName: tool.name,
     toolSource: tool.source,
     caller,
-    permissionDecision,
+    permissionDecision: permission.decision,
+    permissionAction: permission.action,
+    permissionRuleId: permission.ruleId,
+    permissionRiskLevel: permission.riskLevel,
     input
   };
 }
 
+function commandOutputMaxCharsForTool(toolId: string, settings: ToolSettings): number {
+  if (toolId !== "shell.exec") {
+    return defaultCommandOutputMaxChars;
+  }
+  return normalizeShellToolSettings(settings.shell).maxOutputChars * 2;
+}
+
 function toolProviderForPart(toolId: string): "shell" | "internal" {
   return toolId === "shell.exec" ? "shell" : "internal";
+}
+
+function toPublicPermissionRequest(request: StoredPermissionRequest): PermissionRequest {
+  return {
+    id: request.id,
+    sessionId: request.sessionId,
+    runId: request.runId,
+    invocationId: request.invocationId,
+    toolName: request.toolName,
+    toolId: request.toolId,
+    inputSummary: request.inputSummary,
+    input: request.publicInput,
+    riskLevel: request.riskLevel,
+    reason: request.reason,
+    status: request.status,
+    createdAt: request.createdAt,
+    resolvedAt: request.resolvedAt
+  };
+}
+
+function permissionEvaluationFromRequest(request: StoredPermissionRequest, executionCwd: string): ToolPermissionEvaluation {
+  const action = request.permissionDecision === "allowed" ? "allow" : request.permissionDecision === "denied" ? "deny" : "ask";
+  const ruleId = stringField(request.metadata, "permissionRuleId") || "permission.request";
+  return {
+    action,
+    decision: request.permissionDecision,
+    riskLevel: request.riskLevel,
+    reason: request.reason,
+    ruleId,
+    policy: {
+      id: "user.tool-settings",
+      version: 1,
+      experimental: true,
+      defaultAction: action,
+      executionCwd,
+      shell: {
+        defaultAction: action,
+        rules: []
+      }
+    }
+  };
+}
+
+function permissionPolicySummary(permission: ToolPermissionEvaluation): JsonObject {
+  return {
+    id: permission.policy.id,
+    version: permission.policy.version,
+    experimental: permission.policy.experimental,
+    executionCwd: permission.policy.executionCwd,
+    defaultAction: permission.policy.shell.defaultAction,
+    ruleId: permission.ruleId,
+    action: permission.action,
+    riskLevel: permission.riskLevel,
+    ...(permission.matchedPattern
+      ? {
+          matchedPattern: {
+            field: permission.matchedPattern.field,
+            lineNumber: permission.matchedPattern.lineNumber,
+            pattern: permission.matchedPattern.pattern,
+            action: permission.matchedPattern.action
+          }
+        }
+      : {})
+  };
 }
 
 function summarizeToolInput(toolId: string, input: JsonObject): string {
@@ -768,6 +1160,7 @@ function buildPermissionBlockedResult(
   invocation: ToolInvocation,
   toolId: string,
   permissionDecision: ToolPermissionDecision,
+  reason: string,
   startedAt: string,
   completedAt: string
 ): ToolExecutionResult {
@@ -778,12 +1171,12 @@ function buildPermissionBlockedResult(
     output: {},
     error:
       permissionDecision === "requires_approval"
-        ? "Tool execution requires approval, but approval UI/policy is not implemented yet."
-        : "Tool execution denied by permission hook.",
+        ? `Tool execution requires approval: ${reason}`
+        : `Tool execution denied by permission policy: ${reason}`,
     startedAt,
     completedAt,
     durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
-    metadata: { permissionDecision }
+    metadata: { permissionDecision, reason }
   };
 }
 
@@ -910,6 +1303,11 @@ function appendLimitedText(
 
 function stringField(object: JsonObject, key: string): string {
   const value = object[key];
+  return typeof value === "string" ? value : "";
+}
+
+function partString(part: MessagePart, key: string): string {
+  const value = part.content[key];
   return typeof value === "string" ? value : "";
 }
 
