@@ -92,7 +92,7 @@ Useful environment variables:
 - `PATCH /api/agents/:id` updates safe agent fields such as `name`, `systemPrompt`, `modelProfileId`, `defaultRunOptions`, `skillIds`, and `toolIds` (no credential/token storage)
 - `POST /api/context/preview` body `{ "sessionId": "...", "agentId": "main", "providerProfileId": "mock", "text": "optional current input", "runOptions": { ... } }`
 - `POST /api/sessions/:id/context/preview` previews the provider-neutral context for a session without starting a run
-- `GET /api/providers` returns provider profiles, status, and the default profile id
+- `GET /api/providers` returns provider profiles, credential/status details, and the default profile id
 - `POST /api/providers/:id/test` tests a provider profile without storing secrets
 - `POST /api/providers/openai-chatgpt/auth/start` starts the experimental ChatGPT/Codex device authorization flow
 - `POST /api/providers/openai-chatgpt/auth/poll` body `{ "attemptId": "..." }` polls/completes that device authorization flow
@@ -108,6 +108,7 @@ Useful environment variables:
 - `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
+- `POST /api/runs/:id/resume` resumes a run that is waiting for already-resolved tool permission
 
 The OpenAI-compatible profile is env-backed. Only the credential reference (`env:OPENAI_API_KEY`) is surfaced through the API/UI; the API key value is read by the server process at runtime and is not stored in SQLite.
 
@@ -143,13 +144,13 @@ Messages are no longer limited to a single text projection. `message_parts` keep
 - `command_output`
 - `file_ref`
 
-The run event log remains append-only and now uses/reserves event names for tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, and `permission.denied`.
+The run event log remains append-only and now uses/reserves event names for tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, `permission.denied`, and `run_waiting_permission`.
 
 Structured payloads and metadata must stay sanitized: API keys, OAuth tokens, credential material, and raw chain-of-thought must not be stored in message parts or events.
 
 ### Built-in `shell.exec` tool
 
-`shell.exec` is the first real tool. It is intentionally manual-only for now: the model provider layer does not parse tool calls and cannot auto-run commands.
+`shell.exec` is the first real tool. It can be invoked manually from the debug Shell Tool panel/API and is also exposed to model providers as a single canonical function tool (`shell_exec`) when the selected main agent has shell access enabled.
 
 Input:
 
@@ -159,11 +160,13 @@ Input:
 
 Output records `exitCode`, `stdout`, `stderr`, `durationMs`, `timedOut`, and truncation flags. The executor uses Node `child_process.spawn` with `shell: true`, stores stdout/stderr deltas as tool events, and writes `tool_call`, `command_output`, and `tool_result` message parts to the session. Output is size-limited before persistence.
 
+The current agent tool loop is intentionally minimal and only supports this one provider-facing tool, but the kernel treats tool use as a normal capability of an agent run. If a model emits a `shell_exec` tool call, the kernel maps it back to canonical `shell.exec`, evaluates Tool Settings permission, executes or denies the invocation, injects the resulting tool output back into context, and calls the model again. There is no core tool-iteration cap; long-running loops are controlled through user cancel/interruption and the permission flow rather than by a fixed kernel limit.
+
 The default cwd is the user's home directory. cwd is treated as execution context, not a Tool Settings value: omitted cwd uses home, relative cwd resolves from home, and absolute cwd resolves as-is. There is no home-subtree hard deny; cwd is only checked for existence and directory type. A future `session.workingDirectory` can replace the current home default when building tool execution context. `shell.exec` still runs real local commands in your environment, so avoid commands that print secrets or mutate important files unless you intend that.
 
 ### Tool Settings regex permission policy and built-in shell settings
 
-Manual `shell.exec` calls pass through the user-configurable **Tool Settings** policy before execution. Tool Settings are stored in SQLite `app_settings` under `toolSettings` and can be edited in Settings → Tool Settings or through `GET/PATCH /api/tool-settings`.
+Manual and model-requested `shell.exec` calls pass through the user-configurable **Tool Settings** policy before execution. Tool Settings are stored in SQLite `app_settings` under `toolSettings` and can be edited in Settings → Tool Settings or through `GET/PATCH /api/tool-settings`.
 
 ```ts
 {
@@ -179,7 +182,7 @@ Manual `shell.exec` calls pass through the user-configurable **Tool Settings** p
 }
 ```
 
-- `defaultAction` applies when no pattern matches. `allow` runs immediately, `ask` creates a pending permission request, and `deny` blocks without execution.
+- `defaultAction` applies when no pattern matches. `allow` runs immediately, `ask` creates a pending permission request, and `deny` blocks without execution. For model-requested tool calls, allow/deny results are fed back to the model; ask moves the run to `waiting_permission` until approval/denial resolves it.
 - Pattern text fields are stored as multiline text exactly as entered.
 - Before saving and before command evaluation, the server splits lines, trims each line, ignores empty lines and lines starting with `#`, and validates each remaining line with `new RegExp(line)`.
 - Evaluation order is **Deny → Ask → Allow → Default**.
@@ -200,6 +203,8 @@ Example:
 
 Permission activity is stored in SQLite `permission_requests` and recorded in the run event log as `permission.requested`, `permission.approved`, and `permission.denied`. The table keeps the raw pending invocation server-side so approval can run the original command, while API/UI surfaces use the sanitized public input/summary.
 
+When a model-requested permission is approved or denied, the approval API records the tool result and automatically resumes the run. `POST /api/runs/:id/resume` exists as a manual fallback for a waiting run after all pending permissions have already been resolved.
+
 This permission layer is **not a security sandbox**. It is a user-configurable guardrail for the prototype. Approved commands still execute with the daemon process's local user privileges; keep using the tool carefully.
 
 ### Context Builder and main agent
@@ -209,10 +214,11 @@ Every run now passes through a provider-neutral Context Builder before the provi
 - the selected session and text message history (`messages`/`message_parts`)
 - the selected `AgentDefinition` (defaults to `main`)
 - the agent system prompt
+- canonical available tools (`shell.exec` as provider function `shell_exec` for the main agent by default)
 - provider profile selection and effective run options
 - optional current, unsent input for preview requests
 
-The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `messages`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning metadata are skipped by default. Provider adapters then translate that context into their native request shape: OpenAI-compatible receives a chat `system` message plus context messages, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions` and text history to `input`.
+The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `messages`, `availableTools`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning metadata are skipped by default. During a live tool loop, the kernel adds synthetic tool-result context for the in-progress assistant message so the provider can produce the final answer. Provider adapters are responsible for translating this context and `availableTools` into their native request shape, and for converting provider-native tool/function-call responses back into canonical tool-call events. OpenAI-compatible receives a chat `system` message plus context messages and native function tools, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions`, text history to `input`, and tools to its experimental function schema.
 
 The default agent is persisted in SQLite `agent_definitions`:
 
@@ -229,9 +235,17 @@ curl -X PATCH http://127.0.0.1:8787/api/agents/main \
   -d '{"name":"Mango","systemPrompt":"You are Mango, a helpful local assistant. Be concise and safe."}'
 ```
 
-Use the Chat tab's **Context Preview** button to inspect the system prompt, text messages, and effective run options that would be sent for the selected session/agent/provider. Preview responses never include API keys, OAuth tokens, or credential values.
+Use the Chat tab's **Context Preview** button to inspect the system prompt, text messages, available model tools, and effective run options that would be sent for the selected session/agent/provider. Preview responses never include API keys, OAuth tokens, or credential values.
 
-Beyond manual `shell.exec` and its approval policy, skills, files, MCP, automatic model tool calls, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
+Beyond `shell.exec` and its approval policy, skills, files, MCP, additional tools, and subagents are intentionally not implemented yet. `AgentDefinition`, structured message parts, reserved run events, and `BuiltContext` keep the slots needed for those control-plane layers to be added later without changing the provider contract again.
+
+### Provider adapter tool translation
+
+- `openai-compatible`: sends Chat Completions `tools: [{ type: "function", function: ... }]` with `tool_choice: "auto"`, parses streaming `tool_calls` deltas, executes `shell_exec`, and loops back with tool-result context for the final assistant answer.
+- `openai-chatgpt`: sends an experimental ChatGPT/Codex Responses-style function schema whenever the selected agent exposes tools; stream parsing includes best-effort function-call extraction, but this backend contract may change.
+- `mock`: text-only; it does not synthesize tool calls and otherwise keeps existing chat behavior.
+
+The kernel does not centrally decide whether a provider "supports tools". It always passes `BuiltContext.availableTools` to the selected adapter, executes any canonical tool calls the adapter returns, and treats provider/backend incompatibility as an adapter/provider error path.
 
 ### Experimental OpenAI ChatGPT/Codex OAuth profile
 
@@ -279,8 +293,8 @@ The kernel deals in store/provider interfaces, the provider-neutral context buil
 
 The React UI has two tabs:
 
-- `Chat`: existing session/run streaming flow plus a minimal manual Shell Tool panel for `shell.exec` and pending shell permission approvals
-- `Settings`: daemon status, Tool Settings regex permission policy and built-in shell timeout/output settings, main agent/system prompt editor, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
+- `Chat`: existing session/run streaming flow, agent tool-call/result rendering, pending shell permission approvals, and a debug/manual Shell Tool panel for `shell.exec`
+- `Settings`: daemon status, Tool Settings regex permission policy and built-in shell timeout/output settings, main agent/system prompt/tool visibility, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
 
@@ -298,5 +312,5 @@ The React UI has two tabs:
 - Promote provider profiles from env/builtin records to user-managed persisted records.
 - Validate the experimental `openai-chatgpt` runtime against a real ChatGPT/Codex subscription login and adjust the request/stream payload if OpenAI changes the backend contract.
 - Add token counting/trimming and explicit context budget controls to the Context Builder.
-- Add MCP providers, skills, files, automatic tool calls, and subagents on top of the structured message/event container.
+- Add MCP providers, skills, files, more tools, and subagents on top of the structured message/event container.
 - Add adapter install/status flows behind dashboard APIs.

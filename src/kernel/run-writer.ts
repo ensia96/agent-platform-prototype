@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RunEventBus } from "./event-bus";
 import type { StoreAdapter } from "../store/types";
-import type { JsonObject, MessagePart, MessagePartType, Run, RunEvent, RunEventType, RunUsage } from "../shared/types";
+import type { JsonObject, Message, MessagePart, MessagePartType, Run, RunEvent, RunEventType, RunUsage } from "../shared/types";
 import type { ProviderMessagePartInput, ProviderRunWriter, ProviderToolCallRecord, ProviderToolResultRecord } from "../providers/types";
 
 export interface RunWriterOptions {
@@ -29,6 +29,10 @@ export class RunWriter implements ProviderRunWriter {
     this.text = options.store.getMessage(options.assistantMessageId)?.parts.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
     this.metadata = { ...options.run.metadata };
     this.usage = options.run.usage;
+  }
+
+  get messageId(): string {
+    return this.assistantMessageId;
   }
 
   writeDelta(delta: string): void {
@@ -220,6 +224,22 @@ export class RunWriter implements ProviderRunWriter {
 
   complete(): void {
     this.finish("completed", "run_completed", terminalPayload(this.assistantMessageId, this.metadata, this.usage));
+  }
+
+  completeMessage(): Message | null {
+    if (this.terminal) {
+      return this.store.getMessage(this.assistantMessageId);
+    }
+
+    this.terminal = true;
+    const now = new Date().toISOString();
+    this.store.updateMessageStatus(this.assistantMessageId, "completed", now, null);
+    this.store.touchSession(this.run.sessionId, now);
+    const message = this.store.getMessage(this.assistantMessageId);
+    if (message) {
+      this.emit("assistant_message_updated", { message });
+    }
+    return message;
   }
 
   cancel(): void {

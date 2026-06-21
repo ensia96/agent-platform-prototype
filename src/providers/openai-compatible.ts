@@ -1,6 +1,6 @@
-import type { ProviderAdapter, ProviderRunContext, ProviderRunInput } from "./types";
+import type { ProviderAdapter, ProviderRunContext, ProviderRunInput, ProviderRunResult, ProviderToolCall } from "./types";
 import { extractRunUsage } from "./usage";
-import type { BuiltContext, ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
+import type { BuiltContext, JsonObject, ModelToolDefinition, ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
 
 const defaultBaseUrl = "https://api.openai.com/v1";
 const defaultModel = "gpt-4o-mini";
@@ -125,7 +125,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     }
   }
 
-  async run(input: ProviderRunInput, context: ProviderRunContext): Promise<void> {
+  async run(input: ProviderRunInput, context: ProviderRunContext): Promise<ProviderRunResult> {
     const apiKey = input.credential.apiKey?.trim() ?? "";
     const baseUrl = getBaseUrl(input.profile);
     const model = getRunModel(input);
@@ -139,6 +139,19 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
       stream: true,
       messages: buildOpenAICompatibleMessages(input.context)
     };
+    if (input.context.availableTools.length > 0) {
+      requestBody.tools = buildOpenAICompatibleTools(input.context.availableTools);
+      requestBody.tool_choice = "auto";
+      await context.writer.writeMetadata({
+        toolTranslation: {
+          provider: this.id,
+          native: true,
+          requestFormat: "openai-chat-completions-tools",
+          availableToolIds: input.context.availableTools.map((tool) => tool.id),
+          providerToolNames: input.context.availableTools.map((tool) => tool.providerName)
+        }
+      });
+    }
     if (typeof input.context.runOptions.temperature === "number" && Number.isFinite(input.context.runOptions.temperature)) {
       requestBody.temperature = input.context.runOptions.temperature;
     }
@@ -162,14 +175,24 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
       throw new Error("OpenAI-compatible provider returned an empty response body");
     }
 
-    await parseOpenAIStream(response.body, context);
+    const toolCalls = await parseOpenAIStream(response.body, context);
+    return { toolCalls };
   }
 }
 
-async function parseOpenAIStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<void> {
+interface OpenAIToolCallState {
+  index: number;
+  id?: string;
+  type?: string;
+  name?: string;
+  argumentsText: string;
+}
+
+async function parseOpenAIStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<ProviderToolCall[]> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const toolCallStates = new Map<number, OpenAIToolCallState>();
 
   try {
     while (true) {
@@ -190,9 +213,9 @@ async function parseOpenAIStream(stream: ReadableStream<Uint8Array>, context: Pr
       while (boundary !== -1) {
         const rawEvent = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
-        const doneParsing = await handleSseEvent(rawEvent, context);
+        const doneParsing = await handleSseEvent(rawEvent, context, toolCallStates);
         if (doneParsing) {
-          return;
+          return finalizeToolCalls(toolCallStates);
         }
         boundary = buffer.indexOf("\n\n");
       }
@@ -200,14 +223,16 @@ async function parseOpenAIStream(stream: ReadableStream<Uint8Array>, context: Pr
 
     buffer += decoder.decode();
     if (buffer.trim()) {
-      await handleSseEvent(buffer, context);
+      await handleSseEvent(buffer, context, toolCallStates);
     }
   } finally {
     reader.releaseLock();
   }
+
+  return finalizeToolCalls(toolCallStates);
 }
 
-async function handleSseEvent(rawEvent: string, context: ProviderRunContext): Promise<boolean> {
+async function handleSseEvent(rawEvent: string, context: ProviderRunContext, toolCallStates: Map<number, OpenAIToolCallState>): Promise<boolean> {
   const data = rawEvent
     .split("\n")
     .filter((line) => line.startsWith("data:"))
@@ -225,7 +250,8 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext): Pr
 
   type OpenAIStreamEvent = {
     choices?: Array<{
-      delta?: { content?: string };
+      delta?: { content?: string | null; tool_calls?: OpenAIToolCallDelta[] };
+      message?: { content?: string | null; tool_calls?: OpenAIToolCall[] };
       text?: string;
     }>;
     usage?: unknown;
@@ -249,9 +275,120 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext): Pr
     if (delta) {
       await context.writer.writeDelta(delta);
     }
+    const messageContent = choice.message?.content ?? "";
+    if (messageContent) {
+      await context.writer.writeDelta(messageContent);
+    }
+    for (const toolCallDelta of choice.delta?.tool_calls ?? []) {
+      mergeOpenAIToolCallDelta(toolCallStates, toolCallDelta);
+    }
+    for (const toolCall of choice.message?.tool_calls ?? []) {
+      mergeOpenAIToolCall(toolCallStates, toolCall);
+    }
   }
 
   return false;
+}
+
+interface OpenAIToolCallDelta {
+  index?: number;
+  id?: string;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
+interface OpenAIToolCall {
+  id?: string;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
+function buildOpenAICompatibleTools(tools: ModelToolDefinition[]): Array<{
+  type: "function";
+  function: { name: string; description: string; parameters: JsonObject };
+}> {
+  return tools.map((tool) => ({
+    type: "function" as const,
+    function: {
+      name: tool.providerName,
+      description: tool.description,
+      parameters: tool.inputSchema
+    }
+  }));
+}
+
+function mergeOpenAIToolCallDelta(states: Map<number, OpenAIToolCallState>, delta: OpenAIToolCallDelta): void {
+  const index = typeof delta.index === "number" && Number.isInteger(delta.index) ? delta.index : states.size;
+  const current = states.get(index) ?? { index, argumentsText: "" };
+  if (delta.id?.trim()) {
+    current.id = delta.id.trim();
+  }
+  if (delta.type?.trim()) {
+    current.type = delta.type.trim();
+  }
+  if (delta.function?.name?.trim()) {
+    current.name = delta.function.name.trim();
+  }
+  if (typeof delta.function?.arguments === "string") {
+    current.argumentsText += delta.function.arguments;
+  }
+  states.set(index, current);
+}
+
+function mergeOpenAIToolCall(states: Map<number, OpenAIToolCallState>, toolCall: OpenAIToolCall): void {
+  const index = states.size;
+  const current: OpenAIToolCallState = {
+    index,
+    id: toolCall.id?.trim() || undefined,
+    type: toolCall.type?.trim() || undefined,
+    name: toolCall.function?.name?.trim() || undefined,
+    argumentsText: typeof toolCall.function?.arguments === "string" ? toolCall.function.arguments : ""
+  };
+  states.set(index, current);
+}
+
+function finalizeToolCalls(states: Map<number, OpenAIToolCallState>): ProviderToolCall[] {
+  return [...states.values()]
+    .sort((a, b) => a.index - b.index)
+    .filter((state) => Boolean(state.name?.trim()))
+    .map((state) => {
+      const parsed = parseToolArguments(state.argumentsText);
+      return {
+        id: state.id?.trim() || `tool_call_${state.index}`,
+        name: state.name!.trim(),
+        arguments: parsed.value,
+        argumentsText: state.argumentsText,
+        metadata: {
+          provider: "openai-compatible",
+          providerToolType: state.type ?? "function",
+          index: state.index,
+          ...(parsed.error ? { argumentsParseError: parsed.error } : {})
+        }
+      };
+    });
+}
+
+function parseToolArguments(value: string): { value: JsonObject; error?: string } {
+  const text = value.trim();
+  if (!text) {
+    return { value: {} };
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return isJsonObject(parsed) ? { value: parsed } : { value: {}, error: "Tool arguments JSON was not an object." };
+  } catch (error) {
+    return { value: {}, error: `Tool arguments JSON parse failed: ${toErrorMessage(error)}` };
+  }
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function stripTrailingSlash(value: string): string {

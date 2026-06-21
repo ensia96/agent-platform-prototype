@@ -23,14 +23,15 @@ export class MockProvider implements ProviderAdapter {
     };
   }
 
-  async run(input: ProviderRunInput, context: ProviderRunContext): Promise<void> {
+  async run(input: ProviderRunInput, context: ProviderRunContext) {
     const lastUserMessage = [...input.context.messages].reverse().find((message) => message.role === "user");
     const prompt = lastUserMessage?.content.trim() || "(empty prompt)";
     await context.writer.writeMetadata({
       mockContext: {
         agentId: input.context.agent.id,
         agentName: input.context.agent.name,
-        messageCount: input.context.messages.length
+        messageCount: input.context.messages.length,
+        availableToolCount: input.context.availableTools.length
       }
     });
     const response =
@@ -42,6 +43,8 @@ export class MockProvider implements ProviderAdapter {
       await delay(70, context.signal);
       await context.writer.writeDelta(chunk);
     }
+
+    return { toolCalls: [] };
   }
 }
 

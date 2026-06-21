@@ -33,7 +33,8 @@ export function createShellExecTool(optionsOrEnv?: ShellExecToolOptions | NodeJS
     definition: {
       id: shellExecToolId,
       name: "Shell Exec",
-      description: "Execute a local shell command manually and record stdout/stderr as structured tool output.",
+      description:
+        "Execute a local shell command and record stdout/stderr as structured tool output. This runs on the local machine and requires allow / ask / deny permission evaluation according to Tool Settings.",
       source: "builtin",
       inputSchema: shellExecInputSchema(),
       outputSchema: shellExecOutputSchema(),
@@ -42,7 +43,7 @@ export function createShellExecTool(optionsOrEnv?: ShellExecToolOptions | NodeJS
         shell: true,
         permissionHook: "allow-ask-deny-policy",
         warning:
-          "Runs real local shell commands. cwd defaults to the runtime execution context (currently the user's home directory). Manual invocations pass through the user-edited Tool Settings permission policy first."
+          "Runs real local shell commands. cwd defaults to the runtime execution context (currently the user's home directory). Manual and model-requested invocations pass through the user-edited Tool Settings permission policy first."
       }
     },
     executor: {

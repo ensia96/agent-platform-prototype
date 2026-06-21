@@ -8,8 +8,15 @@ import {
   type OpenAIChatGPTCredential,
   type OpenAIChatGPTCredentialStore
 } from "./openai-chatgpt-credentials";
-import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput } from "./types";
-import type { BuiltContext, ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
+import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput, ProviderRunResult, ProviderToolCall } from "./types";
+import type {
+  BuiltContext,
+  JsonObject,
+  ModelToolDefinition,
+  ProviderProfile,
+  ProviderStatus,
+  ProviderTestResponse
+} from "../shared/types";
 
 const refreshSkewMs = 60_000;
 const defaultCodexInstructions =
@@ -21,6 +28,13 @@ interface ChatGPTCodexRequestPayload {
   instructions: string;
   store: false;
   stream: true;
+  tools?: Array<{
+    type: "function";
+    name: string;
+    description: string;
+    parameters: JsonObject;
+  }>;
+  tool_choice?: "auto";
   input: Array<{
     role: "user" | "assistant";
     content: string;
@@ -128,7 +142,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     }
   }
 
-  async run(input: ProviderRunInput, context: ProviderRunContext): Promise<void> {
+  async run(input: ProviderRunInput, context: ProviderRunContext): Promise<ProviderRunResult> {
     if (!input.credential.oauth) {
       if (input.profile.status.state === "error") {
         throw new Error(input.profile.status.message);
@@ -151,11 +165,24 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     }
 
     const payload = buildCodexRequestPayload(input);
+    if ((payload.tools?.length ?? 0) > 0) {
+      await context.writer.writeMetadata({
+        toolTranslation: {
+          provider: this.id,
+          native: true,
+          experimental: true,
+          requestFormat: "chatgpt-codex-responses-function",
+          availableToolIds: input.context.availableTools.map((tool) => tool.id),
+          providerToolNames: input.context.availableTools.map((tool) => tool.providerName)
+        }
+      });
+    }
     logDebug("request", {
       endpoint,
       model: payload.model,
       store: payload.store,
       stream: payload.stream,
+      toolSchemaCount: payload.tools?.length ?? 0,
       inputMessages: payload.input.length,
       hasInstructions: payload.instructions.trim().length > 0,
       requestedReasoningEffort: input.requestedRunOptions.reasoningEffort ?? null,
@@ -180,7 +207,8 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       throw new Error("OpenAI ChatGPT Codex provider returned an empty response body");
     }
 
-    await parseChatGPTStream(response.body, context);
+    const toolCalls = await parseChatGPTStream(response.body, context);
+    return { toolCalls };
   }
 
   private async ensureUsableCredential(credential: OpenAIChatGPTCredential): Promise<OpenAIChatGPTCredential> {
@@ -217,13 +245,18 @@ function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestP
 
   // The ChatGPT/Codex backend's public contract for reasoning effort is not stable.
   // Keep requested reasoning effort in run metadata for now rather than risking the known-good payload shape.
-  return {
+  const payload: ChatGPTCodexRequestPayload = {
     model: getRunModel(input),
     instructions,
     store: false,
     stream: true,
     input: inputMessages
   };
+  if (input.context.availableTools.length > 0) {
+    payload.tools = buildCodexTools(input.context.availableTools);
+    payload.tool_choice = "auto";
+  }
+  return payload;
 }
 
 function buildCodexInputMessages(context: BuiltContext): Array<{ role: "user" | "assistant"; content: string }> {
@@ -236,10 +269,11 @@ function buildCodexInputMessages(context: BuiltContext): Array<{ role: "user" | 
     .filter((message) => message.content.length > 0);
 }
 
-async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<void> {
+async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<ProviderToolCall[]> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const toolCallStates = new Map<string, ChatGPTToolCallState>();
 
   try {
     while (true) {
@@ -258,9 +292,9 @@ async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: P
       while (boundary !== -1) {
         const rawEvent = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
-        const finished = await handleStreamEvent(rawEvent, context);
+        const finished = await handleStreamEvent(rawEvent, context, toolCallStates);
         if (finished) {
-          return;
+          return finalizeChatGPTToolCalls(toolCallStates);
         }
         boundary = buffer.indexOf("\n\n");
       }
@@ -268,14 +302,16 @@ async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: P
 
     buffer += decoder.decode();
     if (buffer.trim()) {
-      await handleStreamEvent(buffer, context);
+      await handleStreamEvent(buffer, context, toolCallStates);
     }
   } finally {
     reader.releaseLock();
   }
+
+  return finalizeChatGPTToolCalls(toolCallStates);
 }
 
-async function handleStreamEvent(rawEvent: string, context: ProviderRunContext): Promise<boolean> {
+async function handleStreamEvent(rawEvent: string, context: ProviderRunContext, toolCallStates: Map<string, ChatGPTToolCallState>): Promise<boolean> {
   const data = rawEvent
     .split("\n")
     .filter((line) => line.startsWith("data:"))
@@ -309,11 +345,115 @@ async function handleStreamEvent(rawEvent: string, context: ProviderRunContext):
     await context.writer.writeUsage(usage);
   }
 
+  collectChatGPTToolCallEvent(parsed, toolCallStates);
+
   for (const delta of extractTextDeltas(parsed)) {
     await context.writer.writeDelta(delta);
   }
 
   return false;
+}
+
+interface ChatGPTToolCallState {
+  key: string;
+  id?: string;
+  callId?: string;
+  name?: string;
+  argumentsText: string;
+}
+
+function buildCodexTools(tools: ModelToolDefinition[]): ChatGPTCodexRequestPayload["tools"] {
+  return tools.map((tool) => ({
+    type: "function" as const,
+    name: tool.providerName,
+    description: tool.description,
+    parameters: tool.inputSchema
+  }));
+}
+
+function collectChatGPTToolCallEvent(value: unknown, states: Map<string, ChatGPTToolCallState>): void {
+  if (!isRecord(value)) {
+    return;
+  }
+
+  const eventType = typeof value.type === "string" ? value.type : "";
+  const item = isRecord(value.item) ? value.item : isRecord(value.output_item) ? value.output_item : null;
+  const itemId = stringValue(value.item_id) ?? stringValue(value.output_item_id) ?? stringValue(item?.id);
+  const outputIndex = typeof value.output_index === "number" ? `output:${value.output_index}` : undefined;
+  const key = itemId ?? outputIndex ?? stringValue(value.call_id) ?? stringValue(value.id);
+
+  if (item && isFunctionCallRecord(item)) {
+    const stateKey = key ?? stringValue(item.id) ?? stringValue(item.call_id) ?? `tool:${states.size}`;
+    const state = states.get(stateKey) ?? { key: stateKey, argumentsText: "" };
+    state.id = stringValue(item.id) ?? state.id;
+    state.callId = stringValue(item.call_id) ?? state.callId;
+    state.name = stringValue(item.name) ?? state.name;
+    const argumentsText = stringValue(item.arguments);
+    if (argumentsText) {
+      state.argumentsText = argumentsText;
+    }
+    states.set(stateKey, state);
+  }
+
+  if (!key || !/function_call|tool_call/i.test(eventType)) {
+    return;
+  }
+
+  const state = states.get(key) ?? { key, argumentsText: "" };
+  const delta = stringValue(value.delta) ?? stringValue(value.arguments_delta);
+  if (delta) {
+    state.argumentsText += delta;
+  }
+  const name = stringValue(value.name);
+  if (name) {
+    state.name = name;
+  }
+  const callId = stringValue(value.call_id);
+  if (callId) {
+    state.callId = callId;
+  }
+  states.set(key, state);
+}
+
+function finalizeChatGPTToolCalls(states: Map<string, ChatGPTToolCallState>): ProviderToolCall[] {
+  return [...states.values()]
+    .filter((state) => Boolean(state.name?.trim()))
+    .map((state, index) => {
+      const parsed = parseToolArguments(state.argumentsText);
+      return {
+        id: state.callId?.trim() || state.id?.trim() || `chatgpt_tool_call_${index}`,
+        name: state.name!.trim(),
+        arguments: parsed.value,
+        argumentsText: state.argumentsText,
+        metadata: {
+          provider: "openai-chatgpt",
+          experimental: true,
+          key: state.key,
+          ...(parsed.error ? { argumentsParseError: parsed.error } : {})
+        }
+      };
+    });
+}
+
+function parseToolArguments(value: string): { value: JsonObject; error?: string } {
+  const text = value.trim();
+  if (!text) {
+    return { value: {} };
+  }
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return isJsonObject(parsed) ? { value: parsed } : { value: {}, error: "Tool arguments JSON was not an object." };
+  } catch (error) {
+    return { value: {}, error: `Tool arguments JSON parse failed: ${toErrorMessage(error)}` };
+  }
+}
+
+function isFunctionCallRecord(value: Record<string, unknown>): boolean {
+  return value.type === "function_call" || value.type === "tool_call" || (typeof value.name === "string" && "arguments" in value);
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function extractTextDeltas(value: unknown): string[] {
@@ -323,7 +463,7 @@ function extractTextDeltas(value: unknown): string[] {
 
   const deltas: string[] = [];
   const eventType = typeof value.type === "string" ? value.type : "";
-  if (isReasoningLikeEvent(eventType)) {
+  if (isReasoningLikeEvent(eventType) || /function_call|tool_call/i.test(eventType)) {
     return deltas;
   }
   const topLevelTextIsDelta = !eventType || eventType.endsWith(".delta") || eventType === "delta";

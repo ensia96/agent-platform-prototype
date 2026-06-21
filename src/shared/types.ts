@@ -13,7 +13,7 @@ export type MessagePartType =
   | "command_output"
   | "file_ref";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
-export type RunStatus = "running" | "completed" | "cancelled" | "failed";
+export type RunStatus = "running" | "waiting_permission" | "completed" | "cancelled" | "failed";
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ProviderProfileType = "openai-compatible" | "openai-chatgpt" | "mock";
 export type ProviderProfileSource = "env" | "builtin" | "user";
@@ -99,6 +99,7 @@ export interface BuiltContext {
   agent: AgentDefinition;
   systemPrompt: string;
   messages: ContextMessage[];
+  availableTools: ModelToolDefinition[];
   runOptions: RunOptions;
   providerProfileId?: string;
   skillIds?: string[];
@@ -126,6 +127,15 @@ export interface ToolDefinition {
   source: ToolSource;
   inputSchema: JsonObject;
   outputSchema: JsonObject;
+  metadata: JsonObject;
+}
+
+export interface ModelToolDefinition {
+  id: string;
+  providerName: string;
+  name: string;
+  description: string;
+  inputSchema: JsonObject;
   metadata: JsonObject;
 }
 
@@ -310,7 +320,9 @@ export const CORE_RUN_EVENT_TYPES = [
   "run_started",
   "user_message_created",
   "assistant_message_created",
+  "assistant_message_updated",
   "delta",
+  "run_waiting_permission",
   "run_completed",
   "run_cancelled",
   "run_failed"

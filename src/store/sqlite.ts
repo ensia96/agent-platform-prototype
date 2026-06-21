@@ -36,6 +36,7 @@ import type {
   ToolInvocationCaller,
   ToolPermissionDecision
 } from "../shared/types";
+import { defaultMainAgentToolIds } from "../shared/model-tools";
 
 type SessionRow = {
   id: string;
@@ -736,24 +737,40 @@ export class SQLiteStore implements StoreAdapter {
 
   private seedDefaultAgents(): void {
     const now = new Date().toISOString();
+    const defaultMainAgentToolIdsJson = JSON.stringify(defaultMainAgentToolIds);
     this.db
       .prepare(
         `INSERT INTO agent_definitions (
            id, name, description, system_prompt, model_profile_id, default_run_options_json,
            skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          )
-         VALUES (@id, @name, @description, @systemPrompt, NULL, '{}', '[]', '[]', @metadataJson, @createdAt, @updatedAt)
-         ON CONFLICT(id) DO NOTHING`
+          VALUES (@id, @name, @description, @systemPrompt, NULL, '{}', '[]', @toolIdsJson, @metadataJson, @createdAt, @updatedAt)
+          ON CONFLICT(id) DO NOTHING`
       )
       .run({
         id: "main",
         name: "Mango",
         description: "Default main assistant agent.",
         systemPrompt: "You are Mango, a helpful local assistant. Be concise, safe, and ask clarifying questions when requirements are unclear.",
+        toolIdsJson: defaultMainAgentToolIdsJson,
         metadataJson: JSON.stringify({ builtin: true, version: 1 }),
         createdAt: now,
         updatedAt: now
       });
+    this.ensureDefaultMainAgentTools(defaultMainAgentToolIdsJson, now);
+  }
+
+  private ensureDefaultMainAgentTools(defaultToolIdsJson: string, updatedAt: string): void {
+    const row = this.db.prepare("SELECT tool_ids_json FROM agent_definitions WHERE id = ?").get("main") as
+      | Pick<AgentDefinitionRow, "tool_ids_json">
+      | undefined;
+    if (!row || parseStringArray(row.tool_ids_json).length > 0) {
+      return;
+    }
+
+    this.db
+      .prepare("UPDATE agent_definitions SET tool_ids_json = ?, updated_at = ? WHERE id = ?")
+      .run(defaultToolIdsJson, updatedAt, "main");
   }
 
   private getPartsByMessageIds(messageIds: string[]): Map<string, MessagePart[]> {

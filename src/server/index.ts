@@ -373,6 +373,14 @@ app.post("/api/runs/:id/cancel", (req, res, next) => {
   }
 });
 
+app.post("/api/runs/:id/resume", (req, res, next) => {
+  try {
+    res.json(kernel.resumeRun(req.params.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use("/api", (_req, res) => {
   res.status(404).json({ error: "API route not found." });
 });

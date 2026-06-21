@@ -6,6 +6,7 @@ import type {
   ContextMessagePart,
   JsonObject,
   Message,
+  ModelToolDefinition,
   MessagePart,
   MessagePartType,
   RunOptions,
@@ -26,6 +27,7 @@ export interface ContextBuildInput {
   };
   providerProfileId?: string;
   runOptions?: RunOptions;
+  availableTools?: ModelToolDefinition[];
   metadata?: JsonObject;
   builtAt?: string;
 }
@@ -54,9 +56,10 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
     });
   }
 
-  // TODO: add token counting, history trimming, explicit file expansion, tools list injection, skills, and subagent context slots.
+  // TODO: add token counting, history trimming, explicit file expansion, skills, and subagent context slots.
   const builtAt = input.builtAt ?? new Date().toISOString();
   const runOptions = cleanRunOptions(input.runOptions ?? {});
+  const availableTools = [...(input.availableTools ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   const metadata: JsonObject = {
     ...(input.metadata ?? {}),
     kind: "provider-neutral-context",
@@ -64,6 +67,7 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
     agentId: input.agent.id,
     builtAt,
     messageCount: messages.length,
+    availableToolIds: availableTools.map((tool) => tool.id),
     sourceMessageCount: sortedMessages.length,
     sourceMessageIds: sortedMessages.map((message) => message.id),
     skippedMessageIds
@@ -76,10 +80,11 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
     agent: input.agent,
     systemPrompt: input.agent.systemPrompt,
     messages,
+    availableTools,
     runOptions,
     ...(input.providerProfileId ? { providerProfileId: input.providerProfileId } : {}),
     skillIds: input.agent.skillIds,
-    toolIds: input.agent.toolIds,
+    toolIds: availableTools.map((tool) => tool.id),
     metadata
   };
 

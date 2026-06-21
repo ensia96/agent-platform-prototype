@@ -18,6 +18,11 @@ export interface ProviderMessage {
 
 export interface ProviderRunInput {
   session: Session;
+  /**
+   * Provider-neutral context built by the kernel. Adapters are responsible for
+   * translating its messages, run options, and availableTools into the
+   * provider-specific request shape.
+   */
   context: BuiltContext;
   messages: ProviderMessage[];
   sourceMessages: Message[];
@@ -93,9 +98,30 @@ export interface ProviderRunContext {
   writer: ProviderRunWriter;
 }
 
+export interface ProviderToolCall {
+  id: string;
+  /** Provider-native function/tool name, e.g. shell_exec. Runtime maps this to a canonical tool id. */
+  name: string;
+  /** Parsed JSON object arguments supplied by the model. */
+  arguments: JsonObject;
+  /** Raw argument JSON text when provided by a streaming API. */
+  argumentsText?: string;
+  metadata?: JsonObject;
+}
+
+export interface ProviderRunResult {
+  toolCalls: ProviderToolCall[];
+  metadata?: JsonObject;
+}
+
 export interface ProviderAdapter {
   id: string;
   label: string;
   test(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderTestResponse>;
-  run(input: ProviderRunInput, context: ProviderRunContext): Promise<void>;
+  /**
+   * Execute one provider turn. If the provider emits native tool/function calls,
+   * convert them into canonical ProviderToolCall records; the kernel will handle
+   * permission gates, execution, result persistence, and follow-up turns.
+   */
+  run(input: ProviderRunInput, context: ProviderRunContext): Promise<ProviderRunResult>;
 }

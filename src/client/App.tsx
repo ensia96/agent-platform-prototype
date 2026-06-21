@@ -300,6 +300,7 @@ export function App() {
       setLastShellResponse(response);
       setShellToolState(shellToolStateFromResponse(response));
       upsertMessage(response.message);
+      openRunEventsIfAgentResume(response);
       if (response.message.sessionId === selectedSessionId) {
         void loadMessages(response.message.sessionId);
       }
@@ -320,6 +321,7 @@ export function App() {
       setLastShellResponse(response);
       setShellToolState(shellToolStateFromResponse(response));
       upsertMessage(response.message);
+      openRunEventsIfAgentResume(response);
       if (response.message.sessionId === selectedSessionId) {
         void loadMessages(response.message.sessionId);
       }
@@ -377,7 +379,7 @@ export function App() {
       return;
     }
 
-    if (event.type === "user_message_created" || event.type === "assistant_message_created") {
+    if (event.type === "user_message_created" || event.type === "assistant_message_created" || event.type === "assistant_message_updated") {
       const payload = event.payload as { message?: Message };
       if (payload.message) {
         upsertMessage(payload.message);
@@ -419,14 +421,22 @@ export function App() {
       const payload = event.payload as { messageId?: string; partId?: string; part?: MessagePart; text?: string };
       if (payload.messageId && payload.part) {
         upsertMessagePart(payload.messageId, payload.part);
-      }
-      if (payload.messageId && payload.partId && payload.text) {
+      } else if (payload.messageId && payload.partId && payload.text) {
         appendPartDelta(payload.messageId, payload.partId, payload.text);
       }
       return;
     }
 
     if (event.type === "permission.requested" || event.type === "permission.approved" || event.type === "permission.denied") {
+      void loadPendingPermissions();
+      return;
+    }
+
+    if (event.type === "run_waiting_permission") {
+      const payload = event.payload as { runId?: string };
+      if (payload.runId) {
+        setActiveRunId(payload.runId);
+      }
       void loadPendingPermissions();
       return;
     }
@@ -542,6 +552,16 @@ export function App() {
     );
   }
 
+  function openRunEventsIfAgentResume(response: InvokeToolResponse) {
+    if (response.run.provider.startsWith("tool:")) {
+      return;
+    }
+    if (response.run.status === "running" || response.run.status === "waiting_permission") {
+      setActiveRunId(response.run.id);
+      openRunEvents(response.run.id);
+    }
+  }
+
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
   const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
@@ -609,7 +629,9 @@ export function App() {
                 </select>
               </label>
               <p className="muted providerSummary">
-                {selectedAgent ? `System prompt: ${selectedAgent.systemPrompt.slice(0, 96)}${selectedAgent.systemPrompt.length > 96 ? "…" : ""}` : "Main agent"}
+                {selectedAgent
+                  ? `System prompt: ${selectedAgent.systemPrompt.slice(0, 96)}${selectedAgent.systemPrompt.length > 96 ? "…" : ""} · tools: ${agentToolIds(selectedAgent).join(", ") || "none"}`
+                  : "Main agent"}
               </p>
             </div>
 
@@ -780,6 +802,7 @@ export function App() {
 }
 
 function MessageBody({ message }: { message: Message }) {
+  const timeline = buildMessageTimeline(message.parts);
   return (
     <>
       {message.error && (
@@ -789,12 +812,118 @@ function MessageBody({ message }: { message: Message }) {
         </div>
       )}
       <div className="messageParts">
-        {message.parts.map((part) => (
-          <MessagePartView key={part.id} part={part} />
+        {timeline.map((item) => (
+          item.kind === "tool" ? (
+            <ToolTimelineGroup key={`tool-${item.callId}-${item.parts[0]?.id ?? "part"}`} parts={item.parts} />
+          ) : (
+            <MessagePartView key={item.part.id} part={item.part} />
+          )
         ))}
       </div>
       {message.usage && <UsageSummary usage={message.usage} />}
     </>
+  );
+}
+
+type MessageTimelineItem =
+  | { kind: "part"; part: MessagePart }
+  | { kind: "tool"; callId: string; parts: MessagePart[] };
+
+function buildMessageTimeline(parts: MessagePart[]): MessageTimelineItem[] {
+  const sortedParts = [...parts].sort(compareParts);
+  const consumedPartIds = new Set<string>();
+  const timeline: MessageTimelineItem[] = [];
+
+  for (const part of sortedParts) {
+    if (consumedPartIds.has(part.id)) {
+      continue;
+    }
+
+    if (!isToolTimelinePart(part)) {
+      consumedPartIds.add(part.id);
+      timeline.push({ kind: "part", part });
+      continue;
+    }
+
+    const callId = partString(part, "callId");
+    if (!callId) {
+      consumedPartIds.add(part.id);
+      timeline.push({ kind: "part", part });
+      continue;
+    }
+
+    const toolParts = sortedParts.filter((candidate) => isToolTimelinePart(candidate) && partString(candidate, "callId") === callId);
+    for (const toolPart of toolParts) {
+      consumedPartIds.add(toolPart.id);
+    }
+    timeline.push({ kind: "tool", callId, parts: toolParts });
+  }
+
+  return timeline;
+}
+
+function isToolTimelinePart(part: MessagePart): boolean {
+  return part.type === "tool_call" || part.type === "command_output" || part.type === "tool_result";
+}
+
+function ToolTimelineGroup({ parts }: { parts: MessagePart[] }) {
+  const sortedParts = [...parts].sort(compareParts);
+  const callPart = sortedParts.find((part) => part.type === "tool_call") ?? null;
+  const resultPart = [...sortedParts].reverse().find((part) => part.type === "tool_result") ?? null;
+  const outputParts = sortedParts.filter((part) => part.type === "command_output");
+  const primaryPart = callPart ?? resultPart ?? sortedParts[0];
+  const callId = primaryPart ? partString(primaryPart, "callId") : "";
+  const toolLabel = toolTimelineLabel(callPart, resultPart, callId);
+  const status = toolTimelineStatus(callPart, resultPart);
+  const statusClass = toolStatusClass(status);
+  const inputSummary = callPart ? partString(callPart, "inputSummary") || callPart.text : "";
+  const resultSummary = resultPart ? partString(resultPart, "outputSummary") || partString(resultPart, "output") || resultPart.text : "";
+  const resultError = resultPart ? partString(resultPart, "error") : "";
+
+  return (
+    <details className={`messagePart toolTimelineBlock ${statusClass}`} open>
+      <summary className="toolTimelineSummary">
+        <span className="toolTimelineKind">Tool</span>
+        <span className="toolTimelineName">{toolLabel}</span>
+        <span className={`toolStatus ${statusClass}`}>{status}</span>
+      </summary>
+      {callPart && (
+        <dl className="partDetails compactDetails">
+          <dt>Call ID</dt>
+          <dd>{callId || "unknown"}</dd>
+          {partString(callPart, "provider") && (
+            <>
+              <dt>Provider</dt>
+              <dd>{partString(callPart, "provider")}</dd>
+            </>
+          )}
+        </dl>
+      )}
+      {inputSummary && <pre className="toolTimelineInput">{inputSummary}</pre>}
+      {callPart && <JsonPreview value={callPart.content.input} label="Input" />}
+      {outputParts.map((outputPart) => {
+        const outputText = partString(outputPart, "text") || outputPart.text;
+        return (
+          <div className="toolTimelineOutput" key={outputPart.id}>
+            <strong>
+              Command output{partString(outputPart, "stream") ? ` · ${partString(outputPart, "stream")}` : ""}
+              {partNumber(outputPart, "exitCode") !== null ? ` · exit ${partNumber(outputPart, "exitCode")}` : ""}
+              {partBoolean(outputPart, "timedOut") ? " · timed out" : ""}
+              {partBoolean(outputPart, "truncated") ? " · truncated" : ""}
+            </strong>
+            {partString(outputPart, "cwd") && <span className="muted monospace">cwd: {partString(outputPart, "cwd")}</span>}
+            {outputText.trim() ? <pre>{outputText}</pre> : <p className="muted">No command output yet.</p>}
+          </div>
+        );
+      })}
+      {resultPart && (
+        <div className="toolTimelineResult">
+          <strong>Result · {partString(resultPart, "status") || "completed"}</strong>
+          {resultSummary && <pre>{resultSummary}</pre>}
+          {resultError && <pre className="partErrorText">{resultError}</pre>}
+        </div>
+      )}
+    </details>
   );
 }
 
@@ -917,6 +1046,21 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
           <h4>Run options</h4>
           <pre>{JSON.stringify(preview.context.runOptions, null, 2)}</pre>
         </section>
+        <section>
+          <h4>Available tools</h4>
+          {preview.context.availableTools.length === 0 ? (
+            <p className="muted">No model tools available.</p>
+          ) : (
+            <ul className="contextToolList">
+              {preview.context.availableTools.map((tool) => (
+                <li key={tool.id}>
+                  <strong>{tool.id}</strong> <span className="muted">as {tool.providerName}</span>
+                  <p>{tool.description}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
         <section className="contextMessagesPreview">
           <h4>Messages</h4>
           {preview.context.messages.length === 0 ? (
@@ -959,7 +1103,7 @@ function PendingPermissionsPanel({
     <details className="permissionsPanel" open={permissions.length > 0}>
       <summary>Pending Permissions · {permissions.length}</summary>
       <p className="muted">
-        Manual shell.exec approvals only. This is an experimental policy/approval layer, not a security sandbox.
+        shell.exec approvals for manual and model-requested tool calls. This is an experimental policy/approval layer, not a security sandbox.
       </p>
       <div className="permissionActionsHeader">
         <button type="button" onClick={onRefresh}>
@@ -1043,7 +1187,7 @@ function ShellToolPanel({
         Shell Tool · {tool?.id ?? "shell.exec"} · {state}
       </summary>
       <p className="muted">
-        Manual local shell execution only. Commands pass through Tool Settings allow / ask / deny regex policy before running.
+        Debug/manual local shell invocation. Agent model tool calls use the same shell.exec registry entry and Tool Settings allow / ask / deny regex policy.
       </p>
       <form
         className="shellToolForm"
@@ -1487,7 +1631,7 @@ function SettingsPanel() {
             {agentsData && <span className="muted">default: {agentsData.defaultAgentId}</span>}
           </div>
           <p className="muted">
-            The main agent controls the system prompt that is injected by the provider-neutral Context Builder before each run.
+            The main agent controls the system prompt and default model tool access injected by the provider-neutral Context Builder before each run.
           </p>
           <label className="settingEditor">
             Agent name
@@ -1520,7 +1664,7 @@ function SettingsPanel() {
             <dt>Skills</dt>
             <dd>{agentsData?.agents.find((agent) => agent.id === "main")?.skillIds.length ?? 0} configured (future)</dd>
             <dt>Tools</dt>
-            <dd>{agentsData?.agents.find((agent) => agent.id === "main")?.toolIds.length ?? 0} configured (future)</dd>
+            <dd>{agentToolIds(agentsData?.agents.find((agent) => agent.id === "main") ?? { id: "main", toolIds: [] }).join(", ") || "none"}</dd>
           </dl>
         </article>
 
@@ -1595,7 +1739,8 @@ function SettingsPanel() {
                   <p className="muted">{profile.status.message}</p>
                   {isOpenAIChatGPT && (
                     <p className="muted">
-                      Experimental ChatGPT/Codex OAuth runtime; billing and quota come from the consumer subscription channel.
+                      Experimental ChatGPT/Codex OAuth runtime; billing and quota come from the consumer subscription channel. When an agent
+                      exposes tools, the adapter sends experimental tool schemas by default; the backend contract may change.
                     </p>
                   )}
                   <div className="providerActions">
@@ -1742,6 +1887,10 @@ function providerOptionLabel(profile: ProviderProfile): string {
   return `${profile.name}${model} · ${profile.status.state}`;
 }
 
+function agentToolIds(agent: Pick<AgentDefinition, "id" | "toolIds">): string[] {
+  return agent.toolIds.length > 0 ? agent.toolIds : agent.id === "main" ? ["shell.exec"] : [];
+}
+
 function buildRunOptionsFromForm(modelOverride: string, reasoningEffort: ReasoningEffort | "", temperature: string): RunOptions {
   const runOptions: RunOptions = {};
   const model = modelOverride.trim();
@@ -1839,6 +1988,31 @@ function providerResolutionNotice(resolution: ProviderResolution): string | null
     return null;
   }
   return `Provider fallback: ${resolution.fallback.message}`;
+}
+
+function toolTimelineLabel(callPart: MessagePart | null, resultPart: MessagePart | null, callId: string): string {
+  const sourcePart = callPart ?? resultPart;
+  return sourcePart ? partString(sourcePart, "toolName") || partString(sourcePart, "toolId") || callId || "unknown" : callId || "unknown";
+}
+
+function toolTimelineStatus(callPart: MessagePart | null, resultPart: MessagePart | null): string {
+  return (resultPart ? partString(resultPart, "status") : "") || (callPart ? partString(callPart, "status") : "") || "created";
+}
+
+function toolStatusClass(status: string): string {
+  if (status === "completed") {
+    return "success";
+  }
+  if (status === "failed" || status === "cancelled") {
+    return "failure";
+  }
+  if (status === "pending" || status === "pending_permission") {
+    return "pending";
+  }
+  if (status === "running") {
+    return "running";
+  }
+  return "created";
 }
 
 function JsonPreview({ value, label }: { value: unknown; label: string }) {
