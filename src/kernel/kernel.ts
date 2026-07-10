@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { buildContext, defaultAgentId } from "./context-builder";
@@ -56,6 +57,11 @@ export interface InvokeToolOptions {
   caller?: ToolInvocationCaller;
 }
 
+export interface CreateSessionOptions {
+  title?: string;
+  workingDirectory?: string;
+}
+
 interface RunOptionPlan {
   requestedRunOptions: RunOptions;
   runOptions: RunOptions;
@@ -66,6 +72,7 @@ interface PreparedToolInvocation {
   registeredTool: RegisteredTool;
   executionInput: JsonObject;
   publicInput: JsonObject;
+  executionCwd: string;
   caller: ToolInvocationCaller;
   permission: ToolPermissionEvaluation;
   run: Run;
@@ -94,7 +101,7 @@ export interface KernelOptions {
   providers: ProviderRegistry;
   eventBus: RunEventBus;
   tools: ToolRegistry;
-  /** Default tool execution cwd. Current runtime default is the user's home directory. */
+  /** Default session/tool cwd for newly created sessions and legacy rows without one. */
   toolExecutionCwd?: string;
   /** Deprecated compatibility alias for toolExecutionCwd. */
   workspaceRoot?: string;
@@ -105,7 +112,7 @@ export class Kernel {
   private readonly providers: ProviderRegistry;
   private readonly eventBus: RunEventBus;
   private readonly tools: ToolRegistry;
-  private readonly toolExecutionCwd: string;
+  private readonly defaultWorkingDirectory: string;
   private readonly controllers = new Map<string, AbortController>();
 
   constructor(options: KernelOptions) {
@@ -113,18 +120,21 @@ export class Kernel {
     this.providers = options.providers;
     this.eventBus = options.eventBus;
     this.tools = options.tools;
-    this.toolExecutionCwd = resolve(options.toolExecutionCwd ?? options.workspaceRoot ?? homedir());
+    this.defaultWorkingDirectory = resolve(options.toolExecutionCwd ?? options.workspaceRoot ?? homedir());
+    assertExistingDirectory(this.defaultWorkingDirectory, "Default session workingDirectory");
   }
 
   listSessions(): Session[] {
     return this.store.listSessions();
   }
 
-  createSession(title?: string): Session {
+  createSession(options: CreateSessionOptions | string = {}): Session {
+    const input = typeof options === "string" ? { title: options } : options;
     const now = new Date().toISOString();
     return this.store.createSession({
       id: randomUUID(),
-      title: title?.trim() || "New session",
+      title: input.title?.trim() || "New session",
+      workingDirectory: this.normalizeWorkingDirectory(input.workingDirectory, { allowDefault: true }),
       createdAt: now,
       updatedAt: now
     });
@@ -136,6 +146,16 @@ export class Kernel {
       throw new KernelError("Session not found", 404);
     }
     return session;
+  }
+
+  updateSessionWorkingDirectory(id: string, workingDirectory: string): Session {
+    this.getSession(id);
+    const now = new Date().toISOString();
+    const updated = this.store.updateSessionWorkingDirectory(id, this.normalizeWorkingDirectory(workingDirectory, { allowDefault: false }), now);
+    if (!updated) {
+      throw new KernelError("Session not found", 404);
+    }
+    return updated;
   }
 
   listMessages(sessionId: string): Message[] {
@@ -618,6 +638,7 @@ export class Kernel {
       registeredTool,
       executionInput,
       publicInput,
+      executionCwd,
       caller,
       permission,
       run,
@@ -652,7 +673,8 @@ export class Kernel {
       throw new KernelError("Command output part for permission request not found", 404);
     }
 
-    const permission = permissionEvaluationFromRequest(request, this.getToolExecutionCwd(this.getSession(request.sessionId)));
+    const executionCwd = stringField(request.metadata, "executionCwd") || this.getToolExecutionCwd(this.getSession(request.sessionId));
+    const permission = permissionEvaluationFromRequest(request, executionCwd);
     const invocation: ToolInvocation = {
       id: request.invocationId,
       toolId: request.toolId,
@@ -673,6 +695,7 @@ export class Kernel {
       registeredTool,
       executionInput: request.executionInput,
       publicInput: request.publicInput,
+      executionCwd,
       caller: request.caller,
       permission,
       run,
@@ -690,7 +713,7 @@ export class Kernel {
 
   private createPendingPermissionResponse(prepared: PreparedToolInvocation): InvokeToolResponse {
     const now = new Date().toISOString();
-    const executionCwd = this.getToolExecutionCwd(this.getSession(prepared.invocation.sessionId));
+    const executionCwd = prepared.executionCwd;
     const toolCallPart = this.updateToolCallStatus(prepared.toolCallPart, "pending_permission", now);
     const permissionRequest = this.store.createPermissionRequest({
       id: randomUUID(),
@@ -757,7 +780,7 @@ export class Kernel {
     responseOptions: { state: "executed"; permissionRequest?: PermissionRequest; finishRun?: boolean }
   ): Promise<InvokeToolResponse> {
     const { registeredTool, executionInput, caller, permission, run, assistantMessage, invocation, writer } = prepared;
-    const executionCwd = this.getToolExecutionCwd(this.getSession(invocation.sessionId));
+    const executionCwd = prepared.executionCwd;
     const commandOutputMaxChars = commandOutputMaxCharsForTool(registeredTool.definition.id, this.getToolSettings());
     let toolCallPart = prepared.toolCallPart;
     let commandOutputPart = prepared.commandOutputPart;
@@ -917,7 +940,7 @@ export class Kernel {
     options: { finishRun?: boolean } = {}
   ): InvokeToolResponse {
     const now = new Date().toISOString();
-    const executionCwd = this.getToolExecutionCwd(this.getSession(prepared.invocation.sessionId));
+    const executionCwd = prepared.executionCwd;
     const permissionRequest = request ?? this.store.createPermissionRequest({
       id: randomUUID(),
       sessionId: prepared.invocation.sessionId,
@@ -1029,8 +1052,24 @@ export class Kernel {
     return normalizeToolSettings(this.store.listSettings()[toolSettingsSettingKey]);
   }
 
-  private getToolExecutionCwd(_session: Session): string {
-    return this.toolExecutionCwd;
+  private getToolExecutionCwd(session: Session): string {
+    const workingDirectory = resolve(session.workingDirectory || this.defaultWorkingDirectory);
+    assertExistingDirectory(workingDirectory, "Session workingDirectory");
+    return workingDirectory;
+  }
+
+  private normalizeWorkingDirectory(value: string | undefined, options: { allowDefault: boolean }): string {
+    const candidate = value?.trim();
+    if (!candidate) {
+      if (options.allowDefault) {
+        return this.defaultWorkingDirectory;
+      }
+      throw new KernelError("Session workingDirectory must be a non-empty path.", 400);
+    }
+
+    const workingDirectory = resolve(candidate);
+    assertExistingDirectory(workingDirectory, "Session workingDirectory");
+    return workingDirectory;
   }
 
   private updateToolCallStatus(part: MessagePart, status: ToolInvocationStatus | ToolResultStatus, updatedAt: string): MessagePart {
@@ -1370,6 +1409,7 @@ export class Kernel {
       registeredTool,
       executionInput,
       publicInput,
+      executionCwd,
       caller: "model",
       permission,
       run,
@@ -1879,6 +1919,18 @@ function booleanField(object: JsonObject, key: string): boolean | null {
   return typeof value === "boolean" ? value : null;
 }
 
+function assertExistingDirectory(path: string, label: string): void {
+  let stat;
+  try {
+    stat = statSync(path);
+  } catch {
+    throw new KernelError(`${label} does not exist: ${path}`, 400);
+  }
+  if (!stat.isDirectory()) {
+    throw new KernelError(`${label} is not a directory: ${path}`, 400);
+  }
+}
+
 function buildRunOptionPlan(profile: ProviderProfile, requested: RunOptions): RunOptionPlan {
   const requestedRunOptions = cleanRunOptions(requested);
   const runOptions: RunOptions = {};
@@ -2039,6 +2091,7 @@ function contextSummaryToJson(context: BuiltContext, warnings: string[], skipped
     kind: "provider-neutral-context",
     agentId: context.agent.id,
     agentName: context.agent.name,
+    workingDirectory: context.workingDirectory,
     providerProfileId: context.providerProfileId ?? null,
     systemPromptLength: context.systemPrompt.length,
     messageCount: context.messages.length,
@@ -2053,6 +2106,7 @@ function builtContextToJson(context: BuiltContext): JsonObject {
   const output: JsonObject = {
     agent: agentToJson(context.agent),
     systemPrompt: context.systemPrompt,
+    workingDirectory: context.workingDirectory,
     messages: context.messages.map((message) => contextMessageToJson(message)),
     availableTools: context.availableTools.map((tool) => ({
       id: tool.id,

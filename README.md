@@ -102,9 +102,11 @@ Useful environment variables:
 - `POST /api/permissions/:id/approve` approves a pending permission request and runs the stored invocation
 - `POST /api/permissions/:id/deny` denies a pending permission request without running the stored invocation
 - `GET /api/sessions`
-- `POST /api/sessions`
+- `POST /api/sessions` body optional `{ "title": "...", "workingDirectory": "/absolute/project/path" }`; omitted `workingDirectory` uses the daemon-compatible default home directory
+- `GET /api/sessions/:id`
+- `PATCH /api/sessions/:id` body `{ "workingDirectory": "/absolute/project/path" }` updates the session cwd after resolving/validating that it exists and is a directory
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually invokes the local shell tool. `timeoutMs` is optional; when omitted, Tool Settings `shell.defaultTimeoutMs` is used. The response is one of: executed immediately, pending permission, or denied by policy.
+- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually invokes the local shell tool. `cwd` is optional; when omitted, the session `workingDirectory` is used. Relative `cwd` values resolve from the session `workingDirectory`; absolute values resolve as-is. `timeoutMs` is optional; when omitted, Tool Settings `shell.defaultTimeoutMs` is used. The response is one of: executed immediately, pending permission, or denied by policy.
 - `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
@@ -162,7 +164,7 @@ Output records `exitCode`, `stdout`, `stderr`, `durationMs`, `timedOut`, and tru
 
 The current agent tool loop is intentionally minimal and only supports this one provider-facing tool, but the kernel treats tool use as a normal capability of an agent run. If a model emits a `shell_exec` tool call, the kernel maps it back to canonical `shell.exec`, evaluates Tool Settings permission, executes or denies the invocation, injects the resulting tool output back into context, and calls the model again. There is no core tool-iteration cap; long-running loops are controlled through user cancel/interruption and the permission flow rather than by a fixed kernel limit.
 
-The default cwd is the user's home directory. cwd is treated as execution context, not a Tool Settings value: omitted cwd uses home, relative cwd resolves from home, and absolute cwd resolves as-is. There is no home-subtree hard deny; cwd is only checked for existence and directory type. A future `session.workingDirectory` can replace the current home default when building tool execution context. `shell.exec` still runs real local commands in your environment, so avoid commands that print secrets or mutate important files unless you intend that.
+The default cwd is the session `workingDirectory`. New sessions and legacy DB rows without a stored value default to the user's home directory to preserve the prototype daemon's previous shell behavior. cwd is treated as execution context, not a Tool Settings value: omitted cwd uses the session `workingDirectory`, relative cwd resolves from it, and absolute cwd resolves as-is. There is no home-subtree hard deny; cwd is only checked for existence and directory type. `shell.exec` still runs real local commands in your environment, so avoid commands that print secrets or mutate important files unless you intend that.
 
 ### Tool Settings regex permission policy and built-in shell settings
 
@@ -217,8 +219,9 @@ Every run now passes through a provider-neutral Context Builder before the provi
 - canonical available tools (`shell.exec` as provider function `shell_exec` for the main agent by default)
 - provider profile selection and effective run options
 - optional current, unsent input for preview requests
+- the current session `workingDirectory`, which is appended to the system/runtime context so the model can see the default execution path
 
-The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `messages`, `availableTools`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning metadata are skipped by default. During a live tool loop, the kernel adds synthetic tool-result context for the in-progress assistant message so the provider can produce the final answer. Provider adapters are responsible for translating this context and `availableTools` into their native request shape, and for converting provider-native tool/function-call responses back into canonical tool-call events. OpenAI-compatible receives a chat `system` message plus context messages and native function tools, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions`, text history to `input`, and tools to its experimental function schema.
+The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `workingDirectory`, `messages`, `availableTools`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning metadata are skipped by default. During a live tool loop, the kernel adds synthetic tool-result context for the in-progress assistant message so the provider can produce the final answer. Provider adapters are responsible for translating this context and `availableTools` into their native request shape, and for converting provider-native tool/function-call responses back into canonical tool-call events. OpenAI-compatible receives a chat `system` message plus context messages and native function tools, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions`, text history to `input`, and tools to its experimental function schema.
 
 The default agent is persisted in SQLite `agent_definitions`:
 

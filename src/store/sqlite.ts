@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import type {
   AddMessagePartInput,
   AppendEventInput,
@@ -41,6 +41,7 @@ import { defaultMainAgentToolIds } from "../shared/model-tools";
 type SessionRow = {
   id: string;
   title: string;
+  working_directory: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -136,12 +137,15 @@ type PermissionRequestRow = {
 
 export interface SQLiteStoreOptions {
   dbPath: string;
+  defaultWorkingDirectory?: string;
 }
 
 export class SQLiteStore implements StoreAdapter {
   private readonly db: Database.Database;
+  private readonly defaultWorkingDirectory: string;
 
   constructor(options: SQLiteStoreOptions) {
+    this.defaultWorkingDirectory = resolve(options.defaultWorkingDirectory ?? process.cwd());
     mkdirSync(dirname(options.dbPath), { recursive: true });
     this.db = new Database(options.dbPath);
     this.db.pragma("journal_mode = WAL");
@@ -151,26 +155,33 @@ export class SQLiteStore implements StoreAdapter {
 
   listSessions(): Session[] {
     const rows = this.db
-      .prepare("SELECT id, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
+      .prepare("SELECT id, title, working_directory, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
       .all() as SessionRow[];
-    return rows.map(rowToSession);
+    return rows.map((row) => rowToSession(row, this.defaultWorkingDirectory));
   }
 
   getSession(id: string): Session | null {
     const row = this.db
-      .prepare("SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?")
+      .prepare("SELECT id, title, working_directory, created_at, updated_at FROM sessions WHERE id = ?")
       .get(id) as SessionRow | undefined;
-    return row ? rowToSession(row) : null;
+    return row ? rowToSession(row, this.defaultWorkingDirectory) : null;
   }
 
   createSession(input: CreateSessionInput): Session {
     this.db
       .prepare(
-        `INSERT INTO sessions (id, title, created_at, updated_at, metadata_json)
-         VALUES (@id, @title, @createdAt, @updatedAt, '{}')`
+        `INSERT INTO sessions (id, title, working_directory, created_at, updated_at, metadata_json)
+         VALUES (@id, @title, @workingDirectory, @createdAt, @updatedAt, '{}')`
       )
       .run(input);
     return this.getSession(input.id)!;
+  }
+
+  updateSessionWorkingDirectory(id: string, workingDirectory: string, updatedAt: string): Session | null {
+    this.db
+      .prepare("UPDATE sessions SET working_directory = ?, updated_at = ? WHERE id = ?")
+      .run(workingDirectory, updatedAt, id);
+    return this.getSession(id);
   }
 
   touchSession(id: string, updatedAt: string): void {
@@ -582,6 +593,7 @@ export class SQLiteStore implements StoreAdapter {
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
+        working_directory TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -718,8 +730,21 @@ export class SQLiteStore implements StoreAdapter {
       CREATE INDEX IF NOT EXISTS idx_provider_profiles_source ON provider_profiles(source, updated_at);
       CREATE INDEX IF NOT EXISTS idx_agent_definitions_updated_at ON agent_definitions(updated_at);
     `);
+    this.ensureSessionWorkingDirectoryColumn();
     this.ensureMessagePartStructuredColumns();
     this.seedDefaultAgents();
+  }
+
+  private ensureSessionWorkingDirectoryColumn(): void {
+    const columns = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((column) => column.name));
+
+    if (!columns.has("working_directory")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN working_directory TEXT");
+    }
+
+    this.db
+      .prepare("UPDATE sessions SET working_directory = ? WHERE working_directory IS NULL OR trim(working_directory) = ''")
+      .run(this.defaultWorkingDirectory);
   }
 
   private ensureMessagePartStructuredColumns(): void {
@@ -798,13 +823,19 @@ export class SQLiteStore implements StoreAdapter {
   }
 }
 
-function rowToSession(row: SessionRow): Session {
+function rowToSession(row: SessionRow, defaultWorkingDirectory: string): Session {
   return {
     id: row.id,
     title: row.title,
+    workingDirectory: normalizeStoredWorkingDirectory(row.working_directory, defaultWorkingDirectory),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function normalizeStoredWorkingDirectory(value: string | null | undefined, defaultWorkingDirectory: string): string {
+  const trimmed = value?.trim();
+  return trimmed ? resolve(trimmed) : defaultWorkingDirectory;
 }
 
 function rowToRun(row: RunRow): Run {

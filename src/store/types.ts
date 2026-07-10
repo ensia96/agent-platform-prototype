@@ -24,6 +24,7 @@ import type {
 export interface CreateSessionInput {
   id: string;
   title: string;
+  workingDirectory: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
@@ -147,6 +148,7 @@ export interface StoreAdapter {
   listSessions(): Session[];
   getSession(id: string): Session | null;
   createSession(input: CreateSessionInput): Session;
+  updateSessionWorkingDirectory(id: string, workingDirectory: string, updatedAt: ISODateString): Session | null;
   touchSession(id: string, updatedAt: ISODateString): void;
 
   createRun(input: CreateRunInput): Run;

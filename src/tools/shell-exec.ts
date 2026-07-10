@@ -39,11 +39,11 @@ export function createShellExecTool(optionsOrEnv?: ShellExecToolOptions | NodeJS
       inputSchema: shellExecInputSchema(),
       outputSchema: shellExecOutputSchema(),
       metadata: {
-        cwdPolicy: "execution-context-home-default",
+        cwdPolicy: "session-working-directory-default",
         shell: true,
         permissionHook: "allow-ask-deny-policy",
         warning:
-          "Runs real local shell commands. cwd defaults to the runtime execution context (currently the user's home directory). Manual and model-requested invocations pass through the user-edited Tool Settings permission policy first."
+          "Runs real local shell commands. cwd defaults to the session workingDirectory. Relative cwd values resolve from that directory. Manual and model-requested invocations pass through the user-edited Tool Settings permission policy first."
       }
     },
     executor: {

@@ -34,6 +34,7 @@ import type {
 type LoadState = "idle" | "loading" | "error";
 type Tab = "chat" | "settings";
 type ShellToolState = "idle" | "running" | "pending_permission" | "completed" | "failed" | "denied";
+type SaveState = "idle" | "saving" | "saved";
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -55,6 +56,9 @@ export function App() {
   const [providerNotice, setProviderNotice] = useState<string | null>(null);
   const [contextPreview, setContextPreview] = useState<ContextPreviewResponse | null>(null);
   const [contextPreviewState, setContextPreviewState] = useState<LoadState>("idle");
+  const [workingDirectoryDraft, setWorkingDirectoryDraft] = useState("");
+  const [workingDirectorySaveState, setWorkingDirectorySaveState] = useState<SaveState>("idle");
+  const [workingDirectoryError, setWorkingDirectoryError] = useState<string | null>(null);
   const [shellCommand, setShellCommand] = useState("");
   const [shellCwd, setShellCwd] = useState("");
   const [shellTimeoutMs, setShellTimeoutMs] = useState("");
@@ -67,6 +71,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("chat");
   const eventsRef = useRef<EventSource | null>(null);
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
 
   useEffect(() => {
     void loadSessions();
@@ -84,6 +89,12 @@ export function App() {
     }
     void loadMessages(selectedSessionId);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    setWorkingDirectoryDraft(selectedSession?.workingDirectory ?? "");
+    setWorkingDirectorySaveState("idle");
+    setWorkingDirectoryError(null);
+  }, [selectedSessionId, selectedSession?.workingDirectory]);
 
   useEffect(() => {
     if (activeTab === "chat") {
@@ -165,6 +176,34 @@ export function App() {
       setSelectedSessionId(session.id);
     } catch (requestError) {
       setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function saveSessionWorkingDirectory() {
+    if (!selectedSessionId) {
+      setWorkingDirectoryError("Select or create a session before changing its working directory.");
+      return;
+    }
+    const workingDirectory = workingDirectoryDraft.trim();
+    if (!workingDirectory) {
+      setWorkingDirectoryError("Working directory is required.");
+      return;
+    }
+
+    setWorkingDirectorySaveState("saving");
+    setWorkingDirectoryError(null);
+    try {
+      const session = await requestJson<Session>(`/api/sessions/${selectedSessionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workingDirectory })
+      });
+      setSessions((current) => current.map((item) => (item.id === session.id ? session : item)));
+      setWorkingDirectoryDraft(session.workingDirectory);
+      setWorkingDirectorySaveState("saved");
+    } catch (requestError) {
+      setWorkingDirectorySaveState("idle");
+      setWorkingDirectoryError(toErrorMessage(requestError));
     }
   }
 
@@ -562,7 +601,6 @@ export function App() {
     }
   }
 
-  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
   const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
   const shellTool = tools.find((tool) => tool.id === "shell.exec") ?? null;
@@ -595,6 +633,7 @@ export function App() {
                   onClick={() => setSelectedSessionId(session.id)}
                 >
                   <strong>{session.title}</strong>
+                  <span className="sessionCwd monospace">{session.workingDirectory}</span>
                   <span>{new Date(session.updatedAt).toLocaleString()}</span>
                 </button>
               ))}
@@ -717,6 +756,19 @@ export function App() {
         </header>
 
         <div className="chatBanners">
+          <SessionWorkingDirectoryPanel
+            session={selectedSession}
+            value={workingDirectoryDraft}
+            state={workingDirectorySaveState}
+            error={workingDirectoryError}
+            disabled={Boolean(activeRunId)}
+            onChange={(value) => {
+              setWorkingDirectoryDraft(value);
+              setWorkingDirectorySaveState("idle");
+              setWorkingDirectoryError(null);
+            }}
+            onSave={() => void saveSessionWorkingDirectory()}
+          />
           {providerNotice && <div className="providerNotice">{providerNotice}</div>}
           {lastProviderResolution && (
             <div className="providerRunMeta">
@@ -738,6 +790,7 @@ export function App() {
           />
           <ShellToolPanel
             tool={shellTool}
+            sessionWorkingDirectory={selectedSession?.workingDirectory ?? null}
             command={shellCommand}
             cwd={shellCwd}
             timeoutMs={shellTimeoutMs}
@@ -1031,6 +1084,60 @@ function UsageSummary({ usage }: { usage: RunUsage }) {
   return <div className="usageSummary">Usage: {summary}</div>;
 }
 
+function SessionWorkingDirectoryPanel({
+  session,
+  value,
+  state,
+  error,
+  disabled,
+  onChange,
+  onSave
+}: {
+  session: Session | null;
+  value: string;
+  state: SaveState;
+  error: string | null;
+  disabled: boolean;
+  onChange: (value: string) => void;
+  onSave: () => void;
+}) {
+  const saving = state === "saving";
+  const changed = Boolean(session) && value.trim() !== session?.workingDirectory;
+  return (
+    <section className="workingDirectoryPanel">
+      <div>
+        <strong>Session working directory</strong>
+        <p className="muted monospace">{session?.workingDirectory ?? "No session selected"}</p>
+      </div>
+      <form
+        className="workingDirectoryForm"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onSave();
+        }}
+      >
+        <label>
+          cwd
+          <input
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            placeholder="/absolute/project/path"
+            disabled={!session || disabled || saving}
+          />
+        </label>
+        <button type="submit" disabled={!session || disabled || saving || !value.trim() || !changed}>
+          {saving ? "Saving..." : "Save cwd"}
+        </button>
+      </form>
+      <p className="muted workingDirectoryHint">
+        shell.exec without cwd uses this path; relative shell cwd values resolve from it.
+      </p>
+      {error && <div className="inlineError">{error}</div>}
+      {state === "saved" && !error && <div className="inlineSuccess">Saved.</div>}
+    </section>
+  );
+}
+
 function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
   return (
     <details className="contextPreview" open>
@@ -1045,6 +1152,10 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
         <section>
           <h4>Run options</h4>
           <pre>{JSON.stringify(preview.context.runOptions, null, 2)}</pre>
+        </section>
+        <section>
+          <h4>Working directory</h4>
+          <pre>{preview.context.workingDirectory}</pre>
         </section>
         <section>
           <h4>Available tools</h4>
@@ -1155,6 +1266,7 @@ function PendingPermissionsPanel({
 
 function ShellToolPanel({
   tool,
+  sessionWorkingDirectory,
   command,
   cwd,
   timeoutMs,
@@ -1167,6 +1279,7 @@ function ShellToolPanel({
   onRun
 }: {
   tool: ToolDefinition | null;
+  sessionWorkingDirectory: string | null;
   command: string;
   cwd: string;
   timeoutMs: string;
@@ -1202,7 +1315,7 @@ function ShellToolPanel({
         </label>
         <label>
           cwd
-          <input value={cwd} onChange={(event) => onCwdChange(event.target.value)} placeholder="home directory" disabled={disabled || busy} />
+          <input value={cwd} onChange={(event) => onCwdChange(event.target.value)} placeholder="session workingDirectory" disabled={disabled || busy} />
         </label>
         <label>
           Timeout (ms)
@@ -1214,7 +1327,7 @@ function ShellToolPanel({
       </form>
       <p className="muted shellToolMeta">
         {tool
-          ? `Registered built-in tool. cwd defaults to the user's home directory; relative cwd is resolved from home and absolute cwd is used as-is. Default timeout comes from Tool Settings.`
+          ? `Registered built-in tool. Empty cwd uses the session workingDirectory${sessionWorkingDirectory ? ` (${sessionWorkingDirectory})` : ""}; relative cwd resolves from that directory and absolute cwd is used as-is. Default timeout comes from Tool Settings.`
           : "Tool registry has not loaded shell.exec yet."}
       </p>
       {permission && lastResponse?.state === "pending_permission" && (
@@ -1526,7 +1639,7 @@ function SettingsPanel() {
             JavaScript regular expressions only. Empty lines and lines starting with # are ignored. Evaluation order is Deny → Ask → Allow → Default. Use <code>.*</code> to match every command.
           </p>
           <p className="muted">
-            shell.exec cwd defaults to the user's home directory. Relative cwd values resolve from home; absolute cwd values are used as-is and only checked for existence and directory type.
+            shell.exec cwd defaults to the session workingDirectory. Relative cwd values resolve from that directory; absolute cwd values are used as-is and only checked for existence and directory type.
           </p>
           <label className="settingEditor">
             Default action

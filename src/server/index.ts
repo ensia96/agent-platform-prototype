@@ -28,6 +28,7 @@ import type {
   AdapterRegistryItem,
   AgentListResponse,
   AppSettingsResponse,
+  CreateSessionRequest,
   DaemonStatus,
   JsonObject,
   JsonValue,
@@ -41,13 +42,14 @@ import type {
   ShellExecRequest,
   ToolSettings,
   ToolSettingsResponse,
-  ToolListResponse
+  ToolListResponse,
+  UpdateSessionRequest
 } from "../shared/types";
 
 const defaultPort = 8787;
 const moduleDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(moduleDir, "..", "..");
-const localRuntimeRoot = resolve(homedir());
+const defaultSessionWorkingDirectory = resolve(homedir());
 const packageJsonPath = resolve(projectRoot, "package.json");
 const dashboardDistDir = resolve(projectRoot, "dist", "client");
 const dashboardIndexPath = resolve(dashboardDistDir, "index.html");
@@ -72,7 +74,7 @@ type AgentDefinitionPatch = {
   metadata?: JsonObject;
 };
 
-const store = new SQLiteStore({ dbPath });
+const store = new SQLiteStore({ dbPath, defaultWorkingDirectory: defaultSessionWorkingDirectory });
 const eventBus = new RunEventBus();
 const openAIChatGPTCredentials = new OpenAIChatGPTCredentialStore({ runtimeDir });
 const openAIChatGPTAuth = new OpenAIChatGPTAuthService({
@@ -83,7 +85,7 @@ const openAIChatGPTAuth = new OpenAIChatGPTAuthService({
 });
 const providers = createDefaultProviderRegistry(process.env, { openAIChatGPTCredentials });
 const tools = createDefaultToolRegistry({ getShellSettings: () => getToolSettings().shell });
-const kernel = new Kernel({ store, eventBus, providers, tools, toolExecutionCwd: localRuntimeRoot });
+const kernel = new Kernel({ store, eventBus, providers, tools, toolExecutionCwd: defaultSessionWorkingDirectory });
 const app = express();
 
 app.use(express.json());
@@ -280,9 +282,29 @@ app.get("/api/sessions", (_req, res) => {
   res.json(kernel.listSessions());
 });
 
-app.post("/api/sessions", (req, res) => {
-  const title = typeof req.body?.title === "string" ? req.body.title : undefined;
-  res.status(201).json(kernel.createSession(title));
+app.post("/api/sessions", (req, res, next) => {
+  try {
+    res.status(201).json(kernel.createSession(parseCreateSessionRequest(requestBodyObject(req.body))));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/sessions/:id", (req, res, next) => {
+  try {
+    res.json(kernel.getSession(req.params.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/sessions/:id", (req, res, next) => {
+  try {
+    const patch = parseSessionPatch(req.body);
+    res.json(kernel.updateSessionWorkingDirectory(req.params.id, patch.workingDirectory));
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/sessions/:id/context/preview", (req, res, next) => {
@@ -542,6 +564,39 @@ function buildContextPreview(sessionId: string, body: Record<string, unknown>) {
     runOptions,
     text: optionalString(body.text)
   });
+}
+
+function parseCreateSessionRequest(body: Record<string, unknown>): CreateSessionRequest {
+  const request: CreateSessionRequest = {};
+  if (body.title !== undefined && body.title !== null && body.title !== "") {
+    if (typeof body.title !== "string") {
+      throw new KernelError("Session field 'title' must be a string when provided.", 400);
+    }
+    request.title = body.title;
+  }
+  if (body.workingDirectory !== undefined && body.workingDirectory !== null && body.workingDirectory !== "") {
+    if (typeof body.workingDirectory !== "string") {
+      throw new KernelError("Session field 'workingDirectory' must be a string when provided.", 400);
+    }
+    request.workingDirectory = body.workingDirectory;
+  }
+  return request;
+}
+
+function parseSessionPatch(body: unknown): UpdateSessionRequest {
+  if (!isPlainObject(body)) {
+    throw new KernelError("PATCH /api/sessions/:id expects a JSON object.", 400);
+  }
+  const allowedKeys = new Set(["workingDirectory"]);
+  for (const key of Object.keys(body)) {
+    if (!allowedKeys.has(key)) {
+      throw new KernelError(`Unsupported session field '${key}'.`, 400);
+    }
+  }
+  if (typeof body.workingDirectory !== "string" || !body.workingDirectory.trim()) {
+    throw new KernelError("Session field 'workingDirectory' must be a non-empty string.", 400);
+  }
+  return { workingDirectory: body.workingDirectory };
 }
 
 function parseShellExecRequest(body: Record<string, unknown>): ShellExecRequest {

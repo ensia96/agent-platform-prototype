@@ -60,10 +60,12 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
   const builtAt = input.builtAt ?? new Date().toISOString();
   const runOptions = cleanRunOptions(input.runOptions ?? {});
   const availableTools = [...(input.availableTools ?? [])].sort((a, b) => a.id.localeCompare(b.id));
+  const workingDirectory = input.session.workingDirectory;
   const metadata: JsonObject = {
     ...(input.metadata ?? {}),
     kind: "provider-neutral-context",
     sessionId: input.session.id,
+    workingDirectory,
     agentId: input.agent.id,
     builtAt,
     messageCount: messages.length,
@@ -78,7 +80,8 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
 
   const context: BuiltContext = {
     agent: input.agent,
-    systemPrompt: input.agent.systemPrompt,
+    systemPrompt: buildSystemPrompt(input.agent.systemPrompt, workingDirectory),
+    workingDirectory,
     messages,
     availableTools,
     runOptions,
@@ -89,6 +92,19 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
   };
 
   return { context, warnings, skippedMessageIds };
+}
+
+function buildSystemPrompt(agentSystemPrompt: string, workingDirectory: string): string {
+  const runtimeContext = [
+    "Runtime context:",
+    `- Session working directory: ${singleLine(workingDirectory)}`,
+    "- Use this as the default cwd for shell.exec when cwd is omitted; relative shell cwd values resolve from this directory."
+  ].join("\n");
+  return [agentSystemPrompt.trim(), runtimeContext].filter(Boolean).join("\n\n");
+}
+
+function singleLine(value: string): string {
+  return value.replace(/[\r\n]+/g, " ");
 }
 
 function messageToContextMessage(message: Message, warnings: string[], skippedMessageIds: string[]): ContextMessage | null {

@@ -98,6 +98,7 @@ export interface ContextMessagePart {
 export interface BuiltContext {
   agent: AgentDefinition;
   systemPrompt: string;
+  workingDirectory: string;
   messages: ContextMessage[];
   availableTools: ModelToolDefinition[];
   runOptions: RunOptions;
@@ -215,8 +216,18 @@ export interface ProviderRunOptionSupport {
 export interface Session {
   id: string;
   title: string;
+  workingDirectory: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
+}
+
+export interface CreateSessionRequest {
+  title?: string;
+  workingDirectory?: string;
+}
+
+export interface UpdateSessionRequest {
+  workingDirectory: string;
 }
 
 export interface MessagePart {
