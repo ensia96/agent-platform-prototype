@@ -10,16 +10,12 @@ export class ToolInputError extends Error {
 export interface ToolInputValidationContext {
   /** Default execution cwd supplied by the session workingDirectory. */
   cwd: string;
-  /** Deprecated compatibility alias for the current default execution cwd. */
-  workspaceRoot: string;
 }
 
 export interface ToolExecutionContext {
   invocation: ToolInvocation;
   /** Default execution cwd supplied by the session workingDirectory. */
   cwd: string;
-  /** Deprecated compatibility alias for the current default execution cwd. */
-  workspaceRoot: string;
   signal: AbortSignal;
   emit(event: ToolExecutionEvent): void | Promise<void>;
 }

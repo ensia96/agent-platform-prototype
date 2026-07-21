@@ -306,7 +306,7 @@ function shellExecInputSchema(): JsonObject {
       cwd: {
         type: "string",
         description:
-          "Optional working directory. Defaults to the runtime execution cwd (currently the user's home directory). Relative values resolve from that default; absolute values are used as-is."
+          "Optional working directory. Defaults to the session workingDirectory. Relative values resolve from that directory; absolute values are used as-is."
       },
       timeoutMs: {
         type: "integer",

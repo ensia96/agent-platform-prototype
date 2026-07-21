@@ -103,8 +103,6 @@ export interface KernelOptions {
   tools: ToolRegistry;
   /** Default session/tool cwd for newly created sessions and legacy rows without one. */
   toolExecutionCwd?: string;
-  /** Deprecated compatibility alias for toolExecutionCwd. */
-  workspaceRoot?: string;
 }
 
 export class Kernel {
@@ -120,7 +118,7 @@ export class Kernel {
     this.providers = options.providers;
     this.eventBus = options.eventBus;
     this.tools = options.tools;
-    this.defaultWorkingDirectory = resolve(options.toolExecutionCwd ?? options.workspaceRoot ?? homedir());
+    this.defaultWorkingDirectory = resolve(options.toolExecutionCwd ?? homedir());
     assertExistingDirectory(this.defaultWorkingDirectory, "Default session workingDirectory");
   }
 
@@ -518,7 +516,7 @@ export class Kernel {
 
     const toolSettings = this.getToolSettings();
     const executionCwd = this.getToolExecutionCwd(session);
-    const validationContext = { cwd: executionCwd, workspaceRoot: executionCwd };
+    const validationContext = { cwd: executionCwd };
     let executionInput: JsonObject;
     let publicInput: JsonObject;
     try {
@@ -846,7 +844,6 @@ export class Kernel {
       const output = await registeredTool.executor.execute(executionInput, {
         invocation: runningInvocation,
         cwd: executionCwd,
-        workspaceRoot: executionCwd,
         signal: new AbortController().signal,
         emit: onToolEvent
       });
@@ -1304,7 +1301,7 @@ export class Kernel {
     }
 
     const executionCwd = this.getToolExecutionCwd(this.getSession(run.sessionId));
-    const validationContext = { cwd: executionCwd, workspaceRoot: executionCwd };
+    const validationContext = { cwd: executionCwd };
     let executionInput: JsonObject;
     let publicInput: JsonObject;
     try {
