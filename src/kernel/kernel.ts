@@ -4,12 +4,43 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { buildContext, defaultAgentId } from "./context-builder";
 import type { RunEventBus, RunEventListener } from "./event-bus";
+import {
+  agentToJson,
+  booleanField,
+  buildContextRunMetadata,
+  buildRunMetadata,
+  buildRunOptionPlan,
+  contextSummaryToJson,
+  effectiveAgentToolIds,
+  mergeRunOptions,
+  numberField,
+  partString,
+  stringField,
+  toProviderMessages
+} from "./kernel-metadata";
 import { RunWriter } from "./run-writer";
-import type { ProviderAdapter, ProviderMessage, ProviderRunInput, ProviderToolCall } from "../providers/types";
+import {
+  appendLimitedText,
+  buildPermissionBlockedResult,
+  buildToolExecutionResult,
+  buildToolMessageMetadata,
+  buildToolRunMetadata,
+  commandOutputMaxCharsForTool,
+  commandOutputMetadataFromResult,
+  normalizeToolCallId,
+  permissionEvaluationFromRequest,
+  permissionPolicySummary,
+  summarizeToolInput,
+  summarizeToolResult,
+  toolLoopSyntheticMessages,
+  toolProviderForPart,
+  toPublicPermissionRequest
+} from "./tool-execution";
+import type { ProviderAdapter, ProviderRunInput, ProviderToolCall } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
 import type { StoreAdapter, StoredPermissionRequest, UpdateAgentDefinitionInput } from "../store/types";
-import { defaultMainAgentToolIds, providerToolNameToToolId, toModelToolDefinition } from "../shared/model-tools";
-import { normalizeShellToolSettings, normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
+import { providerToolNameToToolId, toModelToolDefinition } from "../shared/model-tools";
+import { normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
 import { evaluateToolPermission, type ToolPermissionEvaluation } from "../tools/permission-policy";
 import type { ToolRegistry } from "../tools/registry";
 import { ToolInputError, type RegisteredTool } from "../tools/types";
@@ -24,7 +55,6 @@ import type {
   MessagePart,
   PermissionRequest,
   PermissionRequestStatus,
-  ProviderProfile,
   ProviderResolution,
   Run,
   RunEvent,
@@ -37,7 +67,6 @@ import type {
   ToolInvocation,
   ToolInvocationCaller,
   ToolInvocationStatus,
-  ToolPermissionDecision,
   ToolSettings,
   ToolResultStatus
 } from "../shared/types";
@@ -62,12 +91,6 @@ export interface CreateSessionOptions {
   workingDirectory?: string;
 }
 
-interface RunOptionPlan {
-  requestedRunOptions: RunOptions;
-  runOptions: RunOptions;
-  unsupportedRunOptions: string[];
-}
-
 interface PreparedToolInvocation {
   registeredTool: RegisteredTool;
   executionInput: JsonObject;
@@ -86,8 +109,6 @@ interface PreparedToolInvocation {
   toolLoopIteration?: number;
   providerToolCallName?: string;
 }
-
-const defaultCommandOutputMaxChars = 128_000;
 
 export class KernelError extends Error {
   constructor(message: string, readonly statusCode = 500) {
@@ -1612,310 +1633,6 @@ export class Kernel {
   }
 }
 
-function buildToolRunMetadata(
-  tool: ToolDefinition,
-  input: JsonObject,
-  caller: ToolInvocationCaller,
-  permission: ToolPermissionEvaluation,
-  executionCwd: string
-): JsonObject {
-  return {
-    kind: "tool_invocation",
-    toolId: tool.id,
-    toolName: tool.name,
-    toolSource: tool.source,
-    caller,
-    permissionDecision: permission.decision,
-    permissionAction: permission.action,
-    permissionRuleId: permission.ruleId,
-    permissionRiskLevel: permission.riskLevel,
-    permissionReason: permission.reason,
-    input,
-    executionCwd,
-    permissionPolicy: permissionPolicySummary(permission)
-  };
-}
-
-function buildToolMessageMetadata(
-  tool: ToolDefinition,
-  input: JsonObject,
-  caller: ToolInvocationCaller,
-  permission: ToolPermissionEvaluation
-): JsonObject {
-  return {
-    kind: "tool_invocation",
-    toolId: tool.id,
-    toolName: tool.name,
-    toolSource: tool.source,
-    caller,
-    permissionDecision: permission.decision,
-    permissionAction: permission.action,
-    permissionRuleId: permission.ruleId,
-    permissionRiskLevel: permission.riskLevel,
-    input
-  };
-}
-
-function commandOutputMaxCharsForTool(toolId: string, settings: ToolSettings): number {
-  if (toolId !== "shell.exec") {
-    return defaultCommandOutputMaxChars;
-  }
-  return normalizeShellToolSettings(settings.shell).maxOutputChars * 2;
-}
-
-function toolProviderForPart(toolId: string): "shell" | "internal" {
-  return toolId === "shell.exec" ? "shell" : "internal";
-}
-
-function toPublicPermissionRequest(request: StoredPermissionRequest): PermissionRequest {
-  return {
-    id: request.id,
-    sessionId: request.sessionId,
-    runId: request.runId,
-    invocationId: request.invocationId,
-    toolName: request.toolName,
-    toolId: request.toolId,
-    inputSummary: request.inputSummary,
-    input: request.publicInput,
-    riskLevel: request.riskLevel,
-    reason: request.reason,
-    status: request.status,
-    createdAt: request.createdAt,
-    resolvedAt: request.resolvedAt
-  };
-}
-
-function permissionEvaluationFromRequest(request: StoredPermissionRequest, executionCwd: string): ToolPermissionEvaluation {
-  const action = request.permissionDecision === "allowed" ? "allow" : request.permissionDecision === "denied" ? "deny" : "ask";
-  const ruleId = stringField(request.metadata, "permissionRuleId") || "permission.request";
-  return {
-    action,
-    decision: request.permissionDecision,
-    riskLevel: request.riskLevel,
-    reason: request.reason,
-    ruleId,
-    policy: {
-      id: "user.tool-settings",
-      version: 1,
-      experimental: true,
-      defaultAction: action,
-      executionCwd,
-      shell: {
-        defaultAction: action,
-        rules: []
-      }
-    }
-  };
-}
-
-function permissionPolicySummary(permission: ToolPermissionEvaluation): JsonObject {
-  return {
-    id: permission.policy.id,
-    version: permission.policy.version,
-    experimental: permission.policy.experimental,
-    executionCwd: permission.policy.executionCwd,
-    defaultAction: permission.policy.shell.defaultAction,
-    ruleId: permission.ruleId,
-    action: permission.action,
-    riskLevel: permission.riskLevel,
-    ...(permission.matchedPattern
-      ? {
-          matchedPattern: {
-            field: permission.matchedPattern.field,
-            lineNumber: permission.matchedPattern.lineNumber,
-            pattern: permission.matchedPattern.pattern,
-            action: permission.matchedPattern.action
-          }
-        }
-      : {})
-  };
-}
-
-function summarizeToolInput(toolId: string, input: JsonObject): string {
-  if (toolId === "shell.exec") {
-    const command = stringField(input, "command");
-    const cwd = stringField(input, "cwd");
-    const timeoutMs = numberField(input, "timeoutMs");
-    return [command ? `$ ${command}` : "shell.exec", cwd ? `cwd: ${cwd}` : "", timeoutMs !== null ? `timeout: ${timeoutMs}ms` : ""]
-      .filter(Boolean)
-      .join("\n");
-  }
-  return `Tool call: ${toolId}`;
-}
-
-function buildPermissionBlockedResult(
-  invocation: ToolInvocation,
-  toolId: string,
-  permissionDecision: ToolPermissionDecision,
-  reason: string,
-  startedAt: string,
-  completedAt: string
-): ToolExecutionResult {
-  return {
-    invocationId: invocation.id,
-    toolId,
-    status: "failed",
-    output: {},
-    error:
-      permissionDecision === "requires_approval"
-        ? `Tool execution requires approval: ${reason}`
-        : `Tool execution denied by permission policy: ${reason}`,
-    startedAt,
-    completedAt,
-    durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
-    metadata: { permissionDecision, reason }
-  };
-}
-
-function buildToolExecutionResult(
-  invocation: ToolInvocation,
-  toolId: string,
-  output: JsonObject,
-  startedAt: string,
-  completedAt: string
-): ToolExecutionResult {
-  const status = inferToolResultStatus(output);
-  const durationMs = numberField(output, "durationMs") ?? Math.max(0, Date.parse(completedAt) - Date.parse(startedAt));
-  return {
-    invocationId: invocation.id,
-    toolId,
-    status,
-    output,
-    error: inferToolResultError(output, status),
-    startedAt,
-    completedAt,
-    durationMs,
-    metadata: {
-      exitCode: nullableNumberField(output, "exitCode"),
-      timedOut: booleanField(output, "timedOut"),
-      stdoutTruncated: booleanField(output, "stdoutTruncated"),
-      stderrTruncated: booleanField(output, "stderrTruncated")
-    }
-  };
-}
-
-function inferToolResultStatus(output: JsonObject): ToolResultStatus {
-  const timedOut = booleanField(output, "timedOut") === true;
-  if (timedOut) {
-    return "failed";
-  }
-  if (Object.prototype.hasOwnProperty.call(output, "exitCode")) {
-    return numberField(output, "exitCode") === 0 ? "completed" : "failed";
-  }
-  return "completed";
-}
-
-function inferToolResultError(output: JsonObject, status: ToolResultStatus): string | null {
-  if (status === "completed") {
-    return null;
-  }
-  const timeoutMs = numberField(output, "durationMs");
-  if (booleanField(output, "timedOut") === true) {
-    return `Command timed out${timeoutMs !== null ? ` after ${timeoutMs}ms` : ""}.`;
-  }
-  const exitCode = nullableNumberField(output, "exitCode");
-  if (exitCode !== null) {
-    return `Command exited with code ${exitCode}.`;
-  }
-  if (Object.prototype.hasOwnProperty.call(output, "exitCode")) {
-    return "Command ended without an exit code.";
-  }
-  return "Tool execution failed.";
-}
-
-function commandOutputMetadataFromResult(result: ToolExecutionResult, commandOutputTruncated: boolean): JsonObject {
-  const metadata: JsonObject = {
-    durationMs: result.durationMs,
-    truncated: commandOutputTruncated,
-    status: result.status
-  };
-  const exitCode = nullableNumberField(result.output, "exitCode");
-  if (exitCode !== null) {
-    metadata.exitCode = exitCode;
-  }
-  const cwd = stringField(result.output, "cwd");
-  if (cwd) {
-    metadata.cwd = cwd;
-  }
-  const timedOut = booleanField(result.output, "timedOut");
-  if (timedOut !== null) {
-    metadata.timedOut = timedOut;
-  }
-  const stdoutTruncated = booleanField(result.output, "stdoutTruncated");
-  if (stdoutTruncated !== null) {
-    metadata.stdoutTruncated = stdoutTruncated;
-    metadata.truncated = commandOutputTruncated || stdoutTruncated === true;
-  }
-  const stderrTruncated = booleanField(result.output, "stderrTruncated");
-  if (stderrTruncated !== null) {
-    metadata.stderrTruncated = stderrTruncated;
-    metadata.truncated = commandOutputTruncated || stdoutTruncated === true || stderrTruncated === true;
-  }
-  return metadata;
-}
-
-function summarizeToolResult(result: ToolExecutionResult): string {
-  const exitCode = nullableNumberField(result.output, "exitCode");
-  const parts = [
-    result.status,
-    exitCode !== null ? `exit ${exitCode}` : "",
-    `${result.durationMs}ms`,
-    booleanField(result.output, "timedOut") === true ? "timed out" : "",
-    booleanField(result.output, "stdoutTruncated") === true || booleanField(result.output, "stderrTruncated") === true ? "output truncated" : ""
-  ].filter(Boolean);
-  return parts.join(" · ");
-}
-
-function appendLimitedText(
-  current: string,
-  truncated: boolean,
-  delta: string,
-  maxChars: number,
-  label: string
-): { text: string; truncated: boolean } {
-  if (truncated || delta.length === 0) {
-    return { text: current, truncated };
-  }
-  const remaining = maxChars - current.length;
-  if (delta.length <= remaining) {
-    return { text: current + delta, truncated: false };
-  }
-  const marker = `\n[${label} truncated after ${maxChars} characters]\n`;
-  const sliceLength = Math.max(0, remaining - marker.length);
-  return {
-    text: `${current}${delta.slice(0, sliceLength)}${marker.slice(0, remaining - sliceLength)}`,
-    truncated: true
-  };
-}
-
-function stringField(object: JsonObject, key: string): string {
-  const value = object[key];
-  return typeof value === "string" ? value : "";
-}
-
-function partString(part: MessagePart, key: string): string {
-  const value = part.content[key];
-  return typeof value === "string" ? value : "";
-}
-
-function partNumber(part: MessagePart, key: string): number | null {
-  return numberField(part.content, key);
-}
-
-function numberField(object: JsonObject, key: string): number | null {
-  const value = object[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function nullableNumberField(object: JsonObject, key: string): number | null {
-  return object[key] === null ? null : numberField(object, key);
-}
-
-function booleanField(object: JsonObject, key: string): boolean | null {
-  const value = object[key];
-  return typeof value === "boolean" ? value : null;
-}
-
 function assertExistingDirectory(path: string, label: string): void {
   let stat;
   try {
@@ -1926,338 +1643,6 @@ function assertExistingDirectory(path: string, label: string): void {
   if (!stat.isDirectory()) {
     throw new KernelError(`${label} is not a directory: ${path}`, 400);
   }
-}
-
-function buildRunOptionPlan(profile: ProviderProfile, requested: RunOptions): RunOptionPlan {
-  const requestedRunOptions = cleanRunOptions(requested);
-  const runOptions: RunOptions = {};
-  const unsupportedRunOptions: string[] = [];
-  const defaultModel = profile.defaultRunOptions?.model?.trim() || profile.model?.trim();
-
-  if (profile.type === "openai-compatible") {
-    const model = requestedRunOptions.model ?? defaultModel;
-    if (model) {
-      runOptions.model = model;
-    }
-    if (requestedRunOptions.temperature !== undefined) {
-      runOptions.temperature = requestedRunOptions.temperature;
-    }
-    if (requestedRunOptions.reasoningEffort) {
-      unsupportedRunOptions.push("reasoningEffort");
-    }
-    return { requestedRunOptions, runOptions, unsupportedRunOptions };
-  }
-
-  if (profile.type === "openai-chatgpt") {
-    const model = requestedRunOptions.model ?? defaultModel;
-    if (model) {
-      runOptions.model = model;
-    }
-    if (requestedRunOptions.temperature !== undefined) {
-      unsupportedRunOptions.push("temperature");
-    }
-    if (requestedRunOptions.reasoningEffort) {
-      unsupportedRunOptions.push("reasoningEffort");
-    }
-    return { requestedRunOptions, runOptions, unsupportedRunOptions };
-  }
-
-  if (requestedRunOptions.model) {
-    unsupportedRunOptions.push("model");
-  }
-  if (requestedRunOptions.temperature !== undefined) {
-    unsupportedRunOptions.push("temperature");
-  }
-  if (requestedRunOptions.reasoningEffort) {
-    unsupportedRunOptions.push("reasoningEffort");
-  }
-  return { requestedRunOptions, runOptions, unsupportedRunOptions };
-}
-
-function mergeRunOptions(agentDefaults: RunOptions | null | undefined, runOptions: RunOptions | null | undefined): RunOptions {
-  return cleanRunOptions({ ...(agentDefaults ?? {}), ...(runOptions ?? {}) });
-}
-
-function cleanRunOptions(options: RunOptions): RunOptions {
-  const output: RunOptions = {};
-  const model = options.model?.trim();
-  if (model) {
-    output.model = model;
-  }
-  if (options.reasoningEffort) {
-    output.reasoningEffort = options.reasoningEffort;
-  }
-  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
-    output.temperature = options.temperature;
-  }
-  return output;
-}
-
-function buildRunMetadata(
-  providerResolution: ProviderResolution,
-  optionPlan: RunOptionPlan,
-  agent: AgentDefinition,
-  userRunOptions: RunOptions
-): JsonObject {
-  const metadata: JsonObject = {
-    agentId: agent.id,
-    agentName: agent.name,
-    agent: agentToJson(agent),
-    providerProfileId: providerResolution.providerProfileId,
-    providerProfileName: providerResolution.providerProfileName,
-    providerType: providerResolution.providerType,
-    requestedProvider: providerResolution.requestedProvider,
-    requestedProviderProfileId: providerResolution.requestedProviderProfileId,
-    providerResolution: providerResolutionToJson(providerResolution),
-    runOptions: runOptionsToJson(optionPlan.runOptions),
-    agentDefaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
-    userRunOptions: runOptionsToJson(userRunOptions),
-    requestedRunOptions: runOptionsToJson(optionPlan.requestedRunOptions),
-    unsupportedRunOptions: optionPlan.unsupportedRunOptions
-  };
-
-  if (providerResolution.model) {
-    metadata.model = providerResolution.model;
-  }
-  if (optionPlan.unsupportedRunOptions.length > 0) {
-    metadata.optionSupportNote = "Unsupported run options are recorded as metadata only and are not sent to the provider.";
-  }
-  return metadata;
-}
-
-function providerResolutionToJson(resolution: ProviderResolution): JsonObject {
-  const output: JsonObject = {
-    requestedProvider: resolution.requestedProvider,
-    requestedProviderProfileId: resolution.requestedProviderProfileId,
-    providerProfileId: resolution.providerProfileId,
-    providerProfileName: resolution.providerProfileName,
-    providerType: resolution.providerType,
-    fallback: resolution.fallback ? fallbackToJson(resolution.fallback) : null
-  };
-  if (resolution.model) {
-    output.model = resolution.model;
-  }
-  if (resolution.baseUrl) {
-    output.baseUrl = resolution.baseUrl;
-  }
-  if (resolution.credentialRef) {
-    output.credentialRef = resolution.credentialRef;
-  }
-  return output;
-}
-
-function fallbackToJson(fallback: NonNullable<ProviderResolution["fallback"]>): JsonObject {
-  return {
-    fromProviderProfileId: fallback.fromProviderProfileId,
-    toProviderProfileId: fallback.toProviderProfileId,
-    reason: fallback.reason,
-    message: fallback.message
-  };
-}
-
-function runOptionsToJson(options: RunOptions): JsonObject {
-  const output: JsonObject = {};
-  if (options.model) {
-    output.model = options.model;
-  }
-  if (options.reasoningEffort) {
-    output.reasoningEffort = options.reasoningEffort;
-  }
-  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
-    output.temperature = options.temperature;
-  }
-  return output;
-}
-
-function buildContextRunMetadata(context: BuiltContext, warnings: string[], skippedMessageIds: string[]): JsonObject {
-  const metadata: JsonObject = {
-    contextSnapshot: builtContextToJson(context),
-    contextBuilder: contextSummaryToJson(context, warnings, skippedMessageIds)
-  };
-  if (warnings.length > 0) {
-    metadata.contextWarnings = warnings;
-  }
-  if (skippedMessageIds.length > 0) {
-    metadata.skippedContextMessageIds = skippedMessageIds;
-  }
-  return metadata;
-}
-
-function contextSummaryToJson(context: BuiltContext, warnings: string[], skippedMessageIds: string[]): JsonObject {
-  return {
-    kind: "provider-neutral-context",
-    agentId: context.agent.id,
-    agentName: context.agent.name,
-    workingDirectory: context.workingDirectory,
-    providerProfileId: context.providerProfileId ?? null,
-    systemPromptLength: context.systemPrompt.length,
-    messageCount: context.messages.length,
-    availableToolIds: context.availableTools.map((tool) => tool.id),
-    runOptions: runOptionsToJson(context.runOptions),
-    warningCount: warnings.length,
-    skippedMessageIds
-  };
-}
-
-function builtContextToJson(context: BuiltContext): JsonObject {
-  const output: JsonObject = {
-    agent: agentToJson(context.agent),
-    systemPrompt: context.systemPrompt,
-    workingDirectory: context.workingDirectory,
-    messages: context.messages.map((message) => contextMessageToJson(message)),
-    availableTools: context.availableTools.map((tool) => ({
-      id: tool.id,
-      providerName: tool.providerName,
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-      metadata: tool.metadata
-    })),
-    runOptions: runOptionsToJson(context.runOptions),
-    metadata: context.metadata
-  };
-  if (context.providerProfileId) {
-    output.providerProfileId = context.providerProfileId;
-  }
-  if (context.skillIds) {
-    output.skillIds = context.skillIds;
-  }
-  if (context.toolIds) {
-    output.toolIds = context.toolIds;
-  }
-  return output;
-}
-
-function contextMessageToJson(message: BuiltContext["messages"][number]): JsonObject {
-  const output: JsonObject = {
-    role: message.role,
-    content: message.content
-  };
-  if (message.source) {
-    output.source = message.source;
-  }
-  if (message.messageId) {
-    output.messageId = message.messageId;
-  }
-  if (message.parts) {
-    output.parts = message.parts.map((part) => {
-      const partOutput: JsonObject = {
-        type: part.type,
-        text: part.text
-      };
-      if (part.sourcePartId) {
-        partOutput.sourcePartId = part.sourcePartId;
-      }
-      if (part.metadata) {
-        partOutput.metadata = part.metadata;
-      }
-      return partOutput;
-    });
-  }
-  if (message.metadata) {
-    output.metadata = message.metadata;
-  }
-  return output;
-}
-
-function agentToJson(agent: AgentDefinition): JsonObject {
-  const output: JsonObject = {
-    id: agent.id,
-    name: agent.name,
-    description: agent.description,
-    modelProfileId: agent.modelProfileId,
-    defaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
-    skillIds: agent.skillIds,
-    toolIds: agent.toolIds,
-    metadata: agent.metadata,
-    createdAt: agent.createdAt,
-    updatedAt: agent.updatedAt
-  };
-  return output;
-}
-
-function effectiveAgentToolIds(agent: AgentDefinition): string[] {
-  const explicit = uniqueStrings(agent.toolIds);
-  if (explicit.length > 0) {
-    return explicit;
-  }
-  return agent.id === defaultAgentId ? defaultMainAgentToolIds : [];
-}
-
-function uniqueStrings(values: string[]): string[] {
-  const output: string[] = [];
-  for (const value of values) {
-    const trimmed = value.trim();
-    if (trimmed && !output.includes(trimmed)) {
-      output.push(trimmed);
-    }
-  }
-  return output;
-}
-
-function normalizeToolCallId(value: string | undefined): string {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    return randomUUID();
-  }
-  return trimmed.length > 160 ? trimmed.slice(0, 160) : trimmed;
-}
-
-function toolLoopSyntheticMessages(message: Message): BuiltContext["messages"] {
-  const output: BuiltContext["messages"] = [];
-  const toolCallParts = message.parts.filter((part) => part.type === "tool_call");
-  for (const toolCallPart of toolCallParts) {
-    const callId = partString(toolCallPart, "callId");
-    if (!callId) {
-      continue;
-    }
-    const relatedParts = message.parts.filter((part) => part.id !== toolCallPart.id && partString(part, "callId") === callId);
-    const content = toolLoopContextText(toolCallPart, relatedParts);
-    if (!content.trim()) {
-      continue;
-    }
-    output.push({
-      role: "user",
-      content,
-      source: "synthetic",
-      messageId: message.id,
-      metadata: {
-        syntheticKind: "tool_result",
-        callId,
-        runId: message.runId ?? null
-      }
-    });
-  }
-  return output;
-}
-
-function toolLoopContextText(toolCallPart: MessagePart, relatedParts: MessagePart[]): string {
-  const lines = [
-    `[tool call · ${partString(toolCallPart, "toolName") || partString(toolCallPart, "toolId") || "unknown"} · ${partString(toolCallPart, "callId")}]`,
-    partString(toolCallPart, "inputSummary") || toolCallPart.text
-  ].filter(Boolean);
-  for (const part of relatedParts.sort(comparePartsForContext)) {
-    if (part.type === "command_output") {
-      const outputText = partString(part, "text") || part.text;
-      if (outputText.trim()) {
-        lines.push(`[command output${partString(part, "stream") ? ` · ${partString(part, "stream")}` : ""}${partNumber(part, "exitCode") !== null ? ` · exit ${partNumber(part, "exitCode")}` : ""}]`);
-        lines.push(outputText);
-      }
-    }
-    if (part.type === "tool_result") {
-      const status = partString(part, "status") || "completed";
-      const body = partString(part, "outputSummary") || partString(part, "output") || partString(part, "error") || part.text;
-      lines.push(`[tool result · ${status}]`);
-      if (body.trim()) {
-        lines.push(body);
-      }
-    }
-  }
-  return lines.join("\n");
-}
-
-function comparePartsForContext(a: MessagePart, b: MessagePart): number {
-  return a.seq - b.seq || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
 }
 
 function compareMessagesForTimeline(a: Message, b: Message): number {
@@ -2273,23 +1658,6 @@ function timestampAfter(...timestamps: Array<string | null | undefined>): string
     return Number.isFinite(parsed) ? Math.max(latest, parsed) : latest;
   }, Date.now());
   return new Date(latestTimestamp + 1).toISOString();
-}
-
-function toProviderMessages(context: BuiltContext): ProviderMessage[] {
-  const messages: ProviderMessage[] = [];
-  const systemPrompt = context.systemPrompt.trim();
-  if (systemPrompt) {
-    messages.push({ role: "system", content: systemPrompt });
-  }
-
-  for (const message of context.messages) {
-    const content = message.content.trim();
-    if (!content) {
-      continue;
-    }
-    messages.push({ role: message.role, content });
-  }
-  return messages;
 }
 
 function isAbortLike(error: unknown): boolean {
