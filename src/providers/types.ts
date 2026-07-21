@@ -52,7 +52,8 @@ export interface ProviderRunWriter {
   writeDelta(text: string): void | Promise<void>;
   writeUsage(usage: RunUsage): void | Promise<void>;
   writeMetadata(metadata: JsonObject): void | Promise<void>;
-  writeReasoningSummary?(summary: ProviderReasoningSummaryRecord): MessagePart | Promise<MessagePart>;
+  writeReasoningSummary?(summary: ProviderReasoningSummaryRecord): MessagePart | null | Promise<MessagePart | null>;
+  writeReasoningDetail?(detail: ProviderReasoningDetailRecord): MessagePart | null | Promise<MessagePart | null>;
   appendMessagePart?(part: ProviderMessagePartInput): MessagePart | Promise<MessagePart>;
   recordToolCall?(toolCall: ProviderToolCallRecord): MessagePart | Promise<MessagePart>;
   recordToolResult?(toolResult: ProviderToolResultRecord): MessagePart | Promise<MessagePart>;
@@ -61,11 +62,28 @@ export interface ProviderRunWriter {
 export interface ProviderReasoningSummaryRecord {
   summary?: string;
   usage?: RunUsage;
-  metadata?: JsonObject;
+  provenance: ProviderReasoningProvenance;
+}
+
+export interface ProviderReasoningDetailRecord {
+  detail?: string;
+  usage?: RunUsage;
+  provenance: ProviderReasoningProvenance;
+}
+
+export interface ProviderReasoningProvenance {
+  provider: string;
+  nativeEventType?: string;
+  itemId?: string;
+  outputIndex?: number;
+  summaryIndexes?: number[];
+  contentIndexes?: number[];
+  authoritative?: boolean;
 }
 
 export interface ProviderMessagePartInput {
-  type: MessagePartType;
+  /** Reasoning parts must use their explicit writer methods so provenance is sanitized. */
+  type: Exclude<MessagePartType, "reasoning_summary" | "reasoning_detail">;
   text?: string;
   content?: JsonObject;
   metadata?: JsonObject;

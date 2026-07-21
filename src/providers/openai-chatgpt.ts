@@ -8,14 +8,24 @@ import {
   type OpenAIChatGPTCredential,
   type OpenAIChatGPTCredentialStore
 } from "./openai-chatgpt-credentials";
-import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput, ProviderRunResult, ProviderToolCall } from "./types";
+import type {
+  ProviderAdapter,
+  ProviderCredential,
+  ProviderReasoningDetailRecord,
+  ProviderReasoningSummaryRecord,
+  ProviderRunContext,
+  ProviderRunInput,
+  ProviderRunResult,
+  ProviderToolCall
+} from "./types";
 import type {
   BuiltContext,
   JsonObject,
   ModelToolDefinition,
   ProviderProfile,
   ProviderStatus,
-  ProviderTestResponse
+  ProviderTestResponse,
+  RunUsage
 } from "../shared/types";
 
 const refreshSkewMs = 60_000;
@@ -28,6 +38,9 @@ interface ChatGPTCodexRequestPayload {
   instructions: string;
   store: false;
   stream: true;
+  reasoning: {
+    summary: "auto";
+  };
   tools?: Array<{
     type: "function";
     name: string;
@@ -187,6 +200,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       hasInstructions: payload.instructions.trim().length > 0,
       requestedReasoningEffort: input.requestedRunOptions.reasoningEffort ?? null,
       reasoningEffortSent: false,
+      reasoningSummaryRequested: payload.reasoning.summary,
       accountIdPresent: Boolean(credential.accountId)
     });
 
@@ -207,7 +221,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       throw new Error("OpenAI ChatGPT Codex provider returned an empty response body");
     }
 
-    const toolCalls = await parseChatGPTStream(response.body, context);
+    const toolCalls = await parseOpenAIChatGPTStream(response.body, context);
     return { toolCalls };
   }
 
@@ -235,7 +249,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
   }
 }
 
-function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestPayload {
+export function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestPayload {
   const systemInstructions = input.context.messages
     .filter((message) => message.role === "system")
     .map((message) => message.content.trim())
@@ -250,6 +264,7 @@ function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestP
     instructions,
     store: false,
     stream: true,
+    reasoning: { summary: "auto" },
     input: inputMessages
   };
   if (input.context.availableTools.length > 0) {
@@ -269,11 +284,16 @@ function buildCodexInputMessages(context: BuiltContext): Array<{ role: "user" | 
     .filter((message) => message.content.length > 0);
 }
 
-async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<ProviderToolCall[]> {
+export async function parseOpenAIChatGPTStream(
+  stream: ReadableStream<Uint8Array>,
+  context: ProviderRunContext
+): Promise<ProviderToolCall[]> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   const toolCallStates = new Map<string, ChatGPTToolCallState>();
+  const reasoningSummaryState: ChatGPTReasoningTextState = { items: new Map(), nextOrder: 0 };
+  const reasoningDetailState: ChatGPTReasoningTextState = { items: new Map(), nextOrder: 0 };
 
   try {
     while (true) {
@@ -292,7 +312,7 @@ async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: P
       while (boundary !== -1) {
         const rawEvent = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
-        const finished = await handleStreamEvent(rawEvent, context, toolCallStates);
+        const finished = await handleStreamEvent(rawEvent, context, toolCallStates, reasoningSummaryState, reasoningDetailState);
         if (finished) {
           return finalizeChatGPTToolCalls(toolCallStates);
         }
@@ -302,7 +322,7 @@ async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: P
 
     buffer += decoder.decode();
     if (buffer.trim()) {
-      await handleStreamEvent(buffer, context, toolCallStates);
+      await handleStreamEvent(buffer, context, toolCallStates, reasoningSummaryState, reasoningDetailState);
     }
   } finally {
     reader.releaseLock();
@@ -311,7 +331,13 @@ async function parseChatGPTStream(stream: ReadableStream<Uint8Array>, context: P
   return finalizeChatGPTToolCalls(toolCallStates);
 }
 
-async function handleStreamEvent(rawEvent: string, context: ProviderRunContext, toolCallStates: Map<string, ChatGPTToolCallState>): Promise<boolean> {
+async function handleStreamEvent(
+  rawEvent: string,
+  context: ProviderRunContext,
+  toolCallStates: Map<string, ChatGPTToolCallState>,
+  reasoningSummaryState: ChatGPTReasoningTextState,
+  reasoningDetailState: ChatGPTReasoningTextState
+): Promise<boolean> {
   const data = rawEvent
     .split("\n")
     .filter((line) => line.startsWith("data:"))
@@ -331,7 +357,7 @@ async function handleStreamEvent(rawEvent: string, context: ProviderRunContext, 
   try {
     parsed = JSON.parse(data) as unknown;
   } catch (error) {
-    throw new Error(`Failed to parse OpenAI ChatGPT SSE event: ${trimForDisplay(data)} (${toErrorMessage(error)})`);
+    throw new Error(`Failed to parse OpenAI ChatGPT SSE event (${toErrorMessage(error)})`);
   }
 
   const streamError = streamErrorDiagnostic(parsed);
@@ -345,6 +371,8 @@ async function handleStreamEvent(rawEvent: string, context: ProviderRunContext, 
     await context.writer.writeUsage(usage);
   }
 
+  await collectChatGPTReasoningSummaryEvent(parsed, reasoningSummaryState, context, usage);
+  await collectChatGPTReasoningDetailEvent(parsed, reasoningDetailState, context, usage);
   collectChatGPTToolCallEvent(parsed, toolCallStates);
 
   for (const delta of extractTextDeltas(parsed)) {
@@ -360,6 +388,273 @@ interface ChatGPTToolCallState {
   callId?: string;
   name?: string;
   argumentsText: string;
+}
+
+interface ChatGPTReasoningTextItemState {
+  key: string;
+  itemId?: string;
+  outputIndex?: number;
+  order: number;
+  segments: Map<number, string>;
+  finalizedSegments: Set<number>;
+  finalized: boolean;
+}
+
+interface ChatGPTReasoningTextState {
+  items: Map<string, ChatGPTReasoningTextItemState>;
+  nextOrder: number;
+}
+
+async function collectChatGPTReasoningSummaryEvent(
+  value: unknown,
+  state: ChatGPTReasoningTextState,
+  context: ProviderRunContext,
+  usage: RunUsage | null
+): Promise<void> {
+  if (!isRecord(value)) {
+    return;
+  }
+
+  const eventType = typeof value.type === "string" ? value.type : "";
+  if (eventType === "response.output_item.done") {
+    const item = isRecord(value.item) ? value.item : isRecord(value.output_item) ? value.output_item : null;
+    if (!item || item.type !== "reasoning" || !Array.isArray(item.summary)) {
+      return;
+    }
+
+    const itemState = reasoningTextItemState(value, item, state);
+    itemState.segments.clear();
+    for (let index = 0; index < item.summary.length; index += 1) {
+      const summaryPart = item.summary[index];
+      if (!isRecord(summaryPart) || summaryPart.type !== "summary_text" || typeof summaryPart.text !== "string") {
+        continue;
+      }
+      itemState.segments.set(index, summaryPart.text);
+    }
+    itemState.finalizedSegments = new Set(itemState.segments.keys());
+    itemState.finalized = true;
+    await writeReasoningSummarySnapshot(state, itemState, context, eventType, true, usage);
+    return;
+  }
+
+  if (
+    eventType !== "response.reasoning_summary_part.added" &&
+    eventType !== "response.reasoning_summary_text.delta" &&
+    eventType !== "response.reasoning_summary_text.done"
+  ) {
+    return;
+  }
+
+  const item = isRecord(value.item) ? value.item : null;
+  const itemState = reasoningTextItemState(value, item, state);
+  const summaryIndex = nonNegativeInteger(value.summary_index) ?? nonNegativeInteger(value.part_index) ?? 0;
+
+  if (eventType === "response.reasoning_summary_part.added") {
+    if (itemState.finalized || itemState.finalizedSegments.has(summaryIndex)) {
+      return;
+    }
+    const part = isRecord(value.part) ? value.part : null;
+    if (!part || part.type !== "summary_text" || typeof part.text !== "string") {
+      return;
+    }
+    itemState.segments.set(summaryIndex, part.text);
+    await writeReasoningSummarySnapshot(state, itemState, context, eventType, false, usage);
+    return;
+  }
+
+  if (eventType === "response.reasoning_summary_text.delta") {
+    if (itemState.finalized || itemState.finalizedSegments.has(summaryIndex)) {
+      return;
+    }
+    if (typeof value.delta !== "string" || !value.delta) {
+      return;
+    }
+    itemState.segments.set(summaryIndex, `${itemState.segments.get(summaryIndex) ?? ""}${value.delta}`);
+    await writeReasoningSummarySnapshot(state, itemState, context, eventType, false, usage);
+    return;
+  }
+
+  if (itemState.finalized || typeof value.text !== "string") {
+    return;
+  }
+  itemState.segments.set(summaryIndex, value.text);
+  itemState.finalizedSegments.add(summaryIndex);
+  await writeReasoningSummarySnapshot(state, itemState, context, eventType, true, usage);
+}
+
+async function collectChatGPTReasoningDetailEvent(
+  value: unknown,
+  state: ChatGPTReasoningTextState,
+  context: ProviderRunContext,
+  usage: RunUsage | null
+): Promise<void> {
+  if (!isRecord(value)) {
+    return;
+  }
+
+  const eventType = typeof value.type === "string" ? value.type : "";
+  if (eventType === "response.output_item.done") {
+    const item = isRecord(value.item) ? value.item : isRecord(value.output_item) ? value.output_item : null;
+    if (!item || item.type !== "reasoning" || !Array.isArray(item.content)) {
+      return;
+    }
+
+    const itemState = reasoningTextItemState(value, item, state);
+    itemState.segments.clear();
+    for (let index = 0; index < item.content.length; index += 1) {
+      const contentPart = item.content[index];
+      if (!isRecord(contentPart) || contentPart.type !== "reasoning_text" || typeof contentPart.text !== "string") {
+        continue;
+      }
+      itemState.segments.set(index, contentPart.text);
+    }
+    itemState.finalizedSegments = new Set(itemState.segments.keys());
+    itemState.finalized = true;
+    await writeReasoningDetailSnapshot(state, itemState, context, eventType, true, usage);
+    return;
+  }
+
+  if (eventType !== "response.reasoning_text.delta" && eventType !== "response.reasoning_text.done") {
+    return;
+  }
+
+  const item = isRecord(value.item) ? value.item : null;
+  const itemState = reasoningTextItemState(value, item, state);
+  const contentIndex = nonNegativeInteger(value.content_index) ?? 0;
+
+  if (eventType === "response.reasoning_text.delta") {
+    if (itemState.finalized || itemState.finalizedSegments.has(contentIndex)) {
+      return;
+    }
+    if (typeof value.delta !== "string" || !value.delta) {
+      return;
+    }
+    itemState.segments.set(contentIndex, `${itemState.segments.get(contentIndex) ?? ""}${value.delta}`);
+    await writeReasoningDetailSnapshot(state, itemState, context, eventType, false, usage);
+    return;
+  }
+
+  if (itemState.finalized || typeof value.text !== "string") {
+    return;
+  }
+  itemState.segments.set(contentIndex, value.text);
+  itemState.finalizedSegments.add(contentIndex);
+  await writeReasoningDetailSnapshot(state, itemState, context, eventType, true, usage);
+}
+
+function reasoningTextItemState(
+  event: Record<string, unknown>,
+  item: Record<string, unknown> | null,
+  state: ChatGPTReasoningTextState
+): ChatGPTReasoningTextItemState {
+  const itemId = stringValue(event.item_id) ?? stringValue(event.output_item_id) ?? stringValue(item?.id);
+  const outputIndex = nonNegativeInteger(event.output_index);
+  const key = outputIndex !== undefined ? `output:${outputIndex}` : itemId ?? "reasoning:default";
+  const existing =
+    state.items.get(key) ??
+    (itemId ? [...state.items.values()].find((candidate) => candidate.itemId === itemId) : undefined) ??
+    (outputIndex !== undefined
+      ? [...state.items.values()].find((candidate) => candidate.outputIndex === outputIndex)
+      : undefined);
+  if (existing) {
+    if (existing.key !== key) {
+      state.items.delete(existing.key);
+      existing.key = key;
+      state.items.set(key, existing);
+    }
+    existing.itemId = itemId ?? existing.itemId;
+    existing.outputIndex = outputIndex ?? existing.outputIndex;
+    return existing;
+  }
+
+  const created: ChatGPTReasoningTextItemState = {
+    key,
+    itemId,
+    outputIndex,
+    order: state.nextOrder,
+    segments: new Map(),
+    finalizedSegments: new Set(),
+    finalized: false
+  };
+  state.nextOrder += 1;
+  state.items.set(key, created);
+  return created;
+}
+
+async function writeReasoningSummarySnapshot(
+  state: ChatGPTReasoningTextState,
+  sourceItem: ChatGPTReasoningTextItemState,
+  context: ProviderRunContext,
+  nativeEventType: string,
+  authoritative: boolean,
+  usage: RunUsage | null
+): Promise<void> {
+  if (!context.writer.writeReasoningSummary) {
+    return;
+  }
+
+  const summary = reasoningTextSnapshot(state);
+  if (!summary) {
+    return;
+  }
+
+  const record: ProviderReasoningSummaryRecord = {
+    summary,
+    provenance: {
+      provider: "openai-chatgpt",
+      nativeEventType,
+      itemId: sourceItem.itemId,
+      outputIndex: sourceItem.outputIndex,
+      summaryIndexes: [...sourceItem.segments.keys()].sort((left, right) => left - right),
+      authoritative
+    },
+    ...(usage ? { usage } : {})
+  };
+  await context.writer.writeReasoningSummary(record);
+}
+
+async function writeReasoningDetailSnapshot(
+  state: ChatGPTReasoningTextState,
+  sourceItem: ChatGPTReasoningTextItemState,
+  context: ProviderRunContext,
+  nativeEventType: string,
+  authoritative: boolean,
+  usage: RunUsage | null
+): Promise<void> {
+  if (!context.writer.writeReasoningDetail) {
+    return;
+  }
+
+  const detail = reasoningTextSnapshot(state);
+  if (!detail) {
+    return;
+  }
+
+  const record: ProviderReasoningDetailRecord = {
+    detail,
+    provenance: {
+      provider: "openai-chatgpt",
+      nativeEventType,
+      itemId: sourceItem.itemId,
+      outputIndex: sourceItem.outputIndex,
+      contentIndexes: [...sourceItem.segments.keys()].sort((left, right) => left - right),
+      authoritative
+    },
+    ...(usage ? { usage } : {})
+  };
+  await context.writer.writeReasoningDetail(record);
+}
+
+function reasoningTextSnapshot(state: ChatGPTReasoningTextState): string {
+  return [...state.items.values()]
+    .sort((left, right) => (left.outputIndex ?? Number.MAX_SAFE_INTEGER) - (right.outputIndex ?? Number.MAX_SAFE_INTEGER) || left.order - right.order)
+    .flatMap((item) => [...item.segments.entries()].sort(([left], [right]) => left - right).map(([, text]) => text.trim()).filter(Boolean))
+    .join("\n\n")
+    .trim();
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function buildCodexTools(tools: ModelToolDefinition[]): ChatGPTCodexRequestPayload["tools"] {
@@ -466,7 +761,7 @@ function extractTextDeltas(value: unknown): string[] {
   if (isReasoningLikeEvent(eventType) || /function_call|tool_call/i.test(eventType)) {
     return deltas;
   }
-  const topLevelTextIsDelta = !eventType || eventType.endsWith(".delta") || eventType === "delta";
+  const topLevelTextIsDelta = isPublicTextDeltaEvent(eventType);
 
   if (topLevelTextIsDelta && typeof value.delta === "string" && value.delta) {
     deltas.push(value.delta);
@@ -479,7 +774,7 @@ function extractTextDeltas(value: unknown): string[] {
   }
 
   const choices = value.choices;
-  if (Array.isArray(choices)) {
+  if (isPublicChoiceTextEvent(eventType) && Array.isArray(choices)) {
     for (const choice of choices) {
       if (!isRecord(choice)) {
         continue;
@@ -502,6 +797,20 @@ function extractTextDeltas(value: unknown): string[] {
   }
 
   return deltas;
+}
+
+function isPublicTextDeltaEvent(eventType: string): boolean {
+  return (
+    !eventType ||
+    eventType === "delta" ||
+    eventType === "output_text.delta" ||
+    eventType === "response.output_text.delta" ||
+    eventType === "response.refusal.delta"
+  );
+}
+
+function isPublicChoiceTextEvent(eventType: string): boolean {
+  return !eventType || eventType === "delta" || eventType === "chat.completion.chunk";
 }
 
 function isReasoningLikeEvent(eventType: string): boolean {
@@ -691,7 +1000,10 @@ function redactSensitiveText(value: string): string {
 }
 
 function isSensitiveKey(key: string): boolean {
-  return /authorization|cookie|token|secret|api[_-]?key|credential|account|email|refresh|access/i.test(key);
+  return (
+    /authorization|cookie|token|secret|api[_-]?key|credential|account|email|refresh|access|encrypted/i.test(key) ||
+    /reasoning[_-]?(text|content)|analysis|thinking|chain[_-]?of[_-]?thought/i.test(key)
+  );
 }
 
 function stringValue(value: unknown): string | undefined {

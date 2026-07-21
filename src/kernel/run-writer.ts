@@ -2,7 +2,17 @@ import { randomUUID } from "node:crypto";
 import type { RunEventBus } from "./event-bus";
 import type { StoreAdapter } from "../store/types";
 import type { JsonObject, Message, MessagePart, MessagePartType, Run, RunEvent, RunEventType, RunUsage } from "../shared/types";
-import type { ProviderMessagePartInput, ProviderRunWriter, ProviderToolCallRecord, ProviderToolResultRecord } from "../providers/types";
+import type {
+  ProviderMessagePartInput,
+  ProviderReasoningDetailRecord,
+  ProviderReasoningProvenance,
+  ProviderReasoningSummaryRecord,
+  ProviderRunWriter,
+  ProviderToolCallRecord,
+  ProviderToolResultRecord
+} from "../providers/types";
+
+type ReasoningPartType = "reasoning_summary" | "reasoning_detail";
 
 export interface RunWriterOptions {
   store: StoreAdapter;
@@ -19,16 +29,25 @@ export class RunWriter implements ProviderRunWriter {
   private text = "";
   private terminal = false;
   private metadata: JsonObject;
+  private readonly priorUsage: RunUsage | null;
+  private turnUsage: RunUsage | null = null;
   private usage: RunUsage | null;
+  private readonly reasoningPartIds: Record<ReasoningPartType, string | null>;
 
   constructor(options: RunWriterOptions) {
     this.store = options.store;
     this.eventBus = options.eventBus;
     this.run = options.run;
     this.assistantMessageId = options.assistantMessageId;
-    this.text = options.store.getMessage(options.assistantMessageId)?.parts.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
+    const assistantMessage = options.store.getMessage(options.assistantMessageId);
+    this.text = assistantMessage?.parts.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
     this.metadata = { ...options.run.metadata };
-    this.usage = options.run.usage;
+    this.priorUsage = options.run.usage ? { ...options.run.usage } : null;
+    this.usage = this.priorUsage;
+    this.reasoningPartIds = {
+      reasoning_summary: assistantMessage?.parts.find((part) => part.type === "reasoning_summary")?.id ?? null,
+      reasoning_detail: assistantMessage?.parts.find((part) => part.type === "reasoning_detail")?.id ?? null
+    };
   }
 
   get messageId(): string {
@@ -60,7 +79,8 @@ export class RunWriter implements ProviderRunWriter {
       return;
     }
 
-    this.usage = mergeRunUsage(this.usage, usage);
+    this.turnUsage = mergeRunUsage(this.turnUsage, usage);
+    this.usage = sumRunUsage(this.priorUsage, this.turnUsage);
     this.writeMetadata({ usage: runUsageToJsonObject(this.usage) });
   }
 
@@ -85,23 +105,61 @@ export class RunWriter implements ProviderRunWriter {
     });
   }
 
-  writeReasoningSummary(input: { summary?: string; usage?: RunUsage; metadata?: JsonObject }): MessagePart {
-    const content: JsonObject = {};
-    const summary = input.summary?.trim();
-    if (summary) {
-      content.summary = summary;
-    }
-    if (input.usage) {
-      content.usage = runUsageToJsonObject(input.usage);
+  writeReasoningSummary(input: ProviderReasoningSummaryRecord): MessagePart | null {
+    return this.writeReasoningSnapshot("reasoning_summary", "summary", input.summary, input.usage, input.provenance);
+  }
+
+  writeReasoningDetail(input: ProviderReasoningDetailRecord): MessagePart | null {
+    return this.writeReasoningSnapshot("reasoning_detail", "detail", input.detail, input.usage, input.provenance);
+  }
+
+  private writeReasoningSnapshot(
+    type: ReasoningPartType,
+    contentKey: "summary" | "detail",
+    value: string | undefined,
+    usage: RunUsage | undefined,
+    provenance: ProviderReasoningProvenance
+  ): MessagePart | null {
+    const text = value?.trim();
+    if (!text || this.terminal) {
+      return null;
     }
 
-    const usageText = input.usage ? formatUsage(input.usage) : "";
-    return this.appendStructuredPart({
-      type: "reasoning_summary",
-      text: summary || usageText || "Reasoning metadata recorded.",
-      content,
-      metadata: input.metadata
-    });
+    const content: JsonObject = { [contentKey]: text };
+    if (usage) {
+      content.usage = runUsageToJsonObject(usage);
+    }
+
+    const metadata = reasoningMetadata(provenance);
+    const now = new Date().toISOString();
+    const partId = this.reasoningPartIds[type];
+    let part = partId
+      ? this.store.updateMessagePart({
+          id: partId,
+          text,
+          content,
+          metadata,
+          updatedAt: now
+        })
+      : null;
+
+    if (!part) {
+      part = this.appendStructuredPart({
+        type,
+        text,
+        content,
+        metadata
+      });
+      this.reasoningPartIds[type] = part.id;
+    } else {
+      this.store.touchSession(this.run.sessionId, now);
+    }
+
+    const message = this.store.getMessage(this.assistantMessageId);
+    if (message) {
+      this.emit("assistant_message_updated", { message });
+    }
+    return part;
   }
 
   recordToolCall(input: ProviderToolCallRecord): MessagePart {
@@ -338,6 +396,9 @@ function structuredPartFallbackText(type: MessagePartType, content: JsonObject):
   if (type === "reasoning_summary") {
     return stringField(content, "summary") || "Reasoning metadata recorded.";
   }
+  if (type === "reasoning_detail") {
+    return stringField(content, "detail") || "Reasoning detail recorded.";
+  }
   if (type === "tool_call") {
     return stringField(content, "inputSummary") || `Tool call: ${stringField(content, "toolName") || stringField(content, "toolId") || "unknown"}`;
   }
@@ -358,14 +419,44 @@ function stringField(object: JsonObject, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function formatUsage(usage: RunUsage): string {
-  const summary = [
-    usage.inputTokens !== undefined ? `input ${usage.inputTokens}` : "",
-    usage.outputTokens !== undefined ? `output ${usage.outputTokens}` : "",
-    usage.reasoningTokens !== undefined ? `reasoning ${usage.reasoningTokens}` : "",
-    usage.totalTokens !== undefined ? `total ${usage.totalTokens}` : ""
-  ].filter(Boolean);
-  return summary.length > 0 ? `Usage: ${summary.join(" / ")}` : "";
+function reasoningMetadata(provenance: ProviderReasoningProvenance): JsonObject {
+  const metadata: JsonObject = { providerSupplied: true };
+  const provider = sanitizedMetadataString(provenance.provider, 120);
+  const nativeEventType = sanitizedMetadataString(provenance.nativeEventType, 160);
+  const itemId = sanitizedMetadataString(provenance.itemId, 160);
+  if (provider) {
+    metadata.provider = provider;
+  }
+  if (nativeEventType) {
+    metadata.nativeEventType = nativeEventType;
+  }
+  if (itemId) {
+    metadata.itemId = itemId;
+  }
+  if (typeof provenance.outputIndex === "number" && Number.isInteger(provenance.outputIndex) && provenance.outputIndex >= 0) {
+    metadata.outputIndex = provenance.outputIndex;
+  }
+  if (provenance.summaryIndexes) {
+    metadata.summaryIndexes = sanitizedIndexes(provenance.summaryIndexes);
+  }
+  if (provenance.contentIndexes) {
+    metadata.contentIndexes = sanitizedIndexes(provenance.contentIndexes);
+  }
+  if (typeof provenance.authoritative === "boolean") {
+    metadata.authoritative = provenance.authoritative;
+  }
+  return metadata;
+}
+
+function sanitizedIndexes(indexes: number[]): number[] {
+  return [...new Set(indexes)]
+    .filter((index) => Number.isInteger(index) && index >= 0)
+    .sort((a, b) => a - b)
+    .slice(0, 100);
+}
+
+function sanitizedMetadataString(value: string | undefined, maxLength: number): string {
+  return value?.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLength) ?? "";
 }
 
 function runUsageToJsonObject(usage: RunUsage): JsonObject {
@@ -400,6 +491,18 @@ function mergeRunUsage(current: RunUsage | null, update: RunUsage): RunUsage {
     usage.totalTokens = update.totalTokens;
   } else if (usage.inputTokens !== undefined && usage.outputTokens !== undefined && usage.totalTokens === undefined) {
     usage.totalTokens = usage.inputTokens + usage.outputTokens;
+  }
+  return usage;
+}
+
+function sumRunUsage(prior: RunUsage | null, current: RunUsage | null): RunUsage {
+  const usage: RunUsage = {};
+  for (const key of ["inputTokens", "outputTokens", "reasoningTokens", "totalTokens"] as const) {
+    const priorValue = prior?.[key];
+    const currentValue = current?.[key];
+    if (priorValue !== undefined || currentValue !== undefined) {
+      usage[key] = (priorValue ?? 0) + (currentValue ?? 0);
+    }
   }
   return usage;
 }

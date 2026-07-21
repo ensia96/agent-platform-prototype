@@ -533,6 +533,13 @@ input {
   color: #4c1d95;
 }
 
+.reasoningProvenance {
+  margin: 8px 0;
+  font-size: 12px;
+  color: #7c3aed;
+  overflow-wrap: anywhere;
+}
+
 .messagePartTool,
 .messagePartToolResult {
   border-color: #bfdbfe;

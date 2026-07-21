@@ -12,6 +12,7 @@
     "stop": "node scripts/daemon.mjs stop",
     "status": "node scripts/daemon.mjs status",
     "smoke:kernel": "tsx scripts/kernel-smoke.ts",
+    "smoke:reasoning": "tsx scripts/reasoning-smoke.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -175,7 +175,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
       throw new Error("OpenAI-compatible provider returned an empty response body");
     }
 
-    const toolCalls = await parseOpenAIStream(response.body, context);
+    const toolCalls = await parseOpenAICompatibleStream(response.body, context);
     return { toolCalls };
   }
 }
@@ -188,7 +188,10 @@ interface OpenAIToolCallState {
   argumentsText: string;
 }
 
-async function parseOpenAIStream(stream: ReadableStream<Uint8Array>, context: ProviderRunContext): Promise<ProviderToolCall[]> {
+export async function parseOpenAICompatibleStream(
+  stream: ReadableStream<Uint8Array>,
+  context: ProviderRunContext
+): Promise<ProviderToolCall[]> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -262,7 +265,7 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext, too
   try {
     parsed = JSON.parse(data) as OpenAIStreamEvent;
   } catch (error) {
-    throw new Error(`Failed to parse OpenAI-compatible SSE event: ${trimForDisplay(data)} (${toErrorMessage(error)})`);
+    throw new Error(`Failed to parse OpenAI-compatible SSE event (${toErrorMessage(error)})`);
   }
 
   const usage = extractRunUsage(parsed);

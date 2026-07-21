@@ -141,13 +141,21 @@ function MessagePartView({ part }: { part: MessagePart }) {
     );
   }
 
-  if (part.type === "reasoning_summary") {
+  if (part.type === "reasoning_summary" || part.type === "reasoning_detail") {
+    const contentKey = part.type === "reasoning_summary" ? "summary" : "detail";
+    const label = part.type === "reasoning_summary" ? "추론 요약" : "추론 상세";
     const usage = usageFromPart(part);
-    const summary = partString(part, "summary") || part.text;
+    const content = partString(part, contentKey).trim();
+    if (!content) {
+      return null;
+    }
+    const provider = metadataString(part, "provider");
+    const nativeEventType = metadataString(part, "nativeEventType");
     return (
-      <details className="messagePart messagePartReasoning">
-        <summary>Reasoning metadata</summary>
-        {summary && <pre>{summary}</pre>}
+      <details className="messagePart messagePartReasoning" open>
+        <summary>{label}{provider ? ` · ${provider}` : ""}</summary>
+        {nativeEventType && <p className="reasoningProvenance monospace">source: {nativeEventType}</p>}
+        <pre>{content}</pre>
         {usage && <UsageSummary usage={usage} />}
       </details>
     );
@@ -296,6 +304,11 @@ function partNumber(part: MessagePart, key: string): number | null {
 
 function partBoolean(part: MessagePart, key: string): boolean {
   return part.content[key] === true;
+}
+
+function metadataString(part: MessagePart, key: string): string {
+  const value = part.metadata[key];
+  return typeof value === "string" ? value : "";
 }
 
 function usageFromPart(part: MessagePart): RunUsage | null {

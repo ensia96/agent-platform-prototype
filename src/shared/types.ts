@@ -8,6 +8,7 @@ export type MessagePartType =
   | "text"
   | "error"
   | "reasoning_summary"
+  | "reasoning_detail"
   | "tool_call"
   | "tool_result"
   | "command_output"
@@ -256,6 +257,10 @@ export type ErrorMessagePartContent = JsonObject & {
 };
 export type ReasoningSummaryMessagePartContent = JsonObject & {
   summary?: string;
+  usage?: JsonObject;
+};
+export type ReasoningDetailMessagePartContent = JsonObject & {
+  detail?: string;
   usage?: JsonObject;
 };
 export type ToolCallMessagePartContent = JsonObject & {

@@ -222,8 +222,8 @@ function partContextText(part: MessagePart): { text: string; skipReason?: string
     return { text: "", skipReason: "error_part" };
   }
 
-  if (part.type === "reasoning_summary") {
-    return { text: "", skipReason: "reasoning_metadata_only" };
+  if (part.type === "reasoning_summary" || part.type === "reasoning_detail") {
+    return { text: "", skipReason: "reasoning_not_for_context" };
   }
 
   if (part.type === "tool_call") {

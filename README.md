@@ -129,10 +129,12 @@ Then send runs with provider profile `openai-compatible` from the UI selector or
 Chat runs accept optional `runOptions` (or legacy-compatible `options`) for model override, reasoning effort, and temperature. Provider support is intentionally conservative:
 
 - `openai-compatible`: model override and temperature are sent to `/chat/completions`; reasoning effort is recorded in run metadata only unless a future profile capability explicitly supports it.
-- `openai-chatgpt`: model override is sent to the experimental ChatGPT/Codex payload; reasoning effort and temperature are currently metadata-only/unsupported to avoid breaking the known-good backend contract.
+- `openai-chatgpt`: model override and a provider summary request (`reasoning.summary: "auto"`) are sent to the experimental ChatGPT/Codex payload; reasoning effort and temperature remain metadata-only/unsupported to avoid changing the known-good backend contract.
 - `mock`: options are accepted for UI/API consistency but are not sent to a model runtime.
 
-If a provider response or stream includes usage metadata, the daemon normalizes and stores available `inputTokens`, `outputTokens`, `reasoningTokens`, and `totalTokens`, then displays them in the Chat UI. The prototype does **not** store or render raw chain-of-thought/thinking text; only provider-reported usage/reasoning token counts or future provider-provided summaries should be surfaced.
+If a provider response or stream includes usage metadata, the daemon normalizes and stores available `inputTokens`, `outputTokens`, `reasoningTokens`, and `totalTokens`, then displays them in the Chat UI.
+
+`openai-chatgpt` maps explicit Responses-style provider summary and reasoning-text events to `reasoning_summary` (**추론 요약**) and `reasoning_detail` (**추론 상세**) parts. Either part may be absent when the provider omits it, and both are excluded from subsequent model context. `openai-compatible` records reported reasoning-token usage but does not map non-standard fields such as `reasoning_content`; generic analysis/thinking events and opaque or encrypted reasoning artifacts are not stored as reasoning parts.
 
 ### Structured messages and tool event model
 
@@ -140,7 +142,8 @@ Messages are no longer limited to a single text projection. `message_parts` keep
 
 - `text`
 - `error`
-- `reasoning_summary` (sanitized summary/usage metadata only; no raw thinking)
+- `reasoning_summary` (explicit provider summary plus sanitized provenance/usage)
+- `reasoning_detail` (explicit provider-visible reasoning text plus sanitized provenance/usage)
 - `tool_call`
 - `tool_result`
 - `command_output`
@@ -221,7 +224,7 @@ Every run now passes through a provider-neutral Context Builder before the provi
 - optional current, unsent input for preview requests
 - the current session `workingDirectory`, which is appended to the system/runtime context so the model can see the default execution path
 
-The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `workingDirectory`, `messages`, `availableTools`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning metadata are skipped by default. During a live tool loop, the kernel adds synthetic tool-result context for the in-progress assistant message so the provider can produce the final answer. Provider adapters are responsible for translating this context and `availableTools` into their native request shape, and for converting provider-native tool/function-call responses back into canonical tool-call events. OpenAI-compatible receives a chat `system` message plus context messages and native function tools, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions`, text history to `input`, and tools to its experimental function schema.
+The output is a `BuiltContext`/canonical context with `agent`, `systemPrompt`, `workingDirectory`, `messages`, `availableTools`, structured safe context part summaries, `runOptions`, `providerProfileId`, and metadata. Text parts are included as before. `tool_result`, `command_output`, and `file_ref` parts have conservative text conversion rules so they can later be re-injected into model context; error parts, failed tool results, tool calls without results, and reasoning parts are skipped by default. During a live tool loop, the kernel adds synthetic tool-result context for the in-progress assistant message so the provider can produce the final answer. Provider adapters are responsible for translating this context and `availableTools` into their native request shape, and for converting provider-native tool/function-call responses back into canonical tool-call events. OpenAI-compatible receives a chat `system` message plus context messages and native function tools, while the experimental ChatGPT/Codex adapter maps the system prompt to `instructions`, text history to `input`, and tools to its experimental function schema.
 
 The default agent is persisted in SQLite `agent_definitions`:
 
@@ -244,8 +247,8 @@ Beyond `shell.exec` and its approval policy, skills, files, MCP, additional tool
 
 ### Provider adapter tool translation
 
-- `openai-compatible`: sends Chat Completions `tools: [{ type: "function", function: ... }]` with `tool_choice: "auto"`, parses streaming `tool_calls` deltas, executes `shell_exec`, and loops back with tool-result context for the final assistant answer.
-- `openai-chatgpt`: sends an experimental ChatGPT/Codex Responses-style function schema whenever the selected agent exposes tools; stream parsing includes best-effort function-call extraction, but this backend contract may change.
+- `openai-compatible`: sends Chat Completions `tools: [{ type: "function", function: ... }]` with `tool_choice: "auto"`, parses streaming `tool_calls` deltas, executes `shell_exec`, and loops back with tool-result context for the final assistant answer. It tracks reported reasoning-token usage but does not map `reasoning_content` to a reasoning part.
+- `openai-chatgpt`: sends an experimental ChatGPT/Codex Responses-style function schema whenever the selected agent exposes tools, requests a provider reasoning summary, and parses explicit summary and provider-visible reasoning-text events separately from answer text and tool calls. Function-call and reasoning event contracts remain experimental and may change.
 - `mock`: text-only; it does not synthesize tool calls and otherwise keeps existing chat behavior.
 
 The kernel does not centrally decide whether a provider "supports tools". It always passes `BuiltContext.availableTools` to the selected adapter, executes any canonical tool calls the adapter returns, and treats provider/backend incompatibility as an adapter/provider error path.

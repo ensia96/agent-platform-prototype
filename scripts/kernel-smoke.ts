@@ -7,7 +7,7 @@ import { Kernel } from "../src/kernel/kernel";
 import type { ProviderRegistry } from "../src/providers/registry";
 import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput } from "../src/providers/types";
 import { toolSettingsSettingKey } from "../src/shared/tool-settings";
-import type { JsonObject, ProviderProfile, ProviderTestResponse, RunEvent, RunEventType, ToolSettings } from "../src/shared/types";
+import type { JsonObject, ProviderProfile, ProviderTestResponse, RunEvent, RunEventType, RunUsage, ToolSettings } from "../src/shared/types";
 import { SQLiteStore } from "../src/store/sqlite";
 import { ToolRegistry } from "../src/tools/registry";
 
@@ -56,6 +56,12 @@ async function runScenario(scenario: Scenario): Promise<string> {
     assertIncreasingEventSequence(events, scenario);
     assertScenarioEventOrder(events, scenario);
     assertMessagePartOrder(kernel.listMessages(session.id), created.run.id, scenario);
+    assert.deepEqual(kernel.getRun(created.run.id).usage, {
+      inputTokens: 17,
+      outputTokens: 8,
+      reasoningTokens: 3,
+      totalTokens: 25
+    });
 
     if (scenario === "deny") {
       assert.deepEqual(executedCwds, [], "deny: denied tool must not execute");
@@ -99,6 +105,12 @@ class ScriptedToolProvider implements ProviderAdapter {
   async run(input: ProviderRunInput, context: ProviderRunContext) {
     this.turns += 1;
     assert.equal(input.context.workingDirectory, this.expectedWorkingDirectory);
+    const usage: RunUsage =
+      this.turns === 1
+        ? { inputTokens: 10, outputTokens: 5, reasoningTokens: 2, totalTokens: 15 }
+        : { inputTokens: 7, outputTokens: 3, reasoningTokens: 1, totalTokens: 10 };
+    await context.writer.writeUsage(usage);
+    await context.writer.writeUsage(usage);
 
     if (this.turns === 1) {
       return {
