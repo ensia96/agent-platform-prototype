@@ -1,7 +1,9 @@
 import type { Message, MessagePart, RunUsage } from "../shared/types";
+import { MarkdownBody } from "./MarkdownBody";
 
 export function MessageBody({ message }: { message: Message }) {
   const timeline = buildMessageTimeline(message.parts);
+  const renderTextAsMarkdown = message.role === "user" || message.role === "assistant";
   return (
     <>
       {message.error && (
@@ -15,7 +17,7 @@ export function MessageBody({ message }: { message: Message }) {
           item.kind === "tool" ? (
             <ToolTimelineGroup key={`tool-${item.callId}-${item.parts[0]?.id ?? "part"}`} parts={item.parts} />
           ) : (
-            <MessagePartView key={item.part.id} part={item.part} />
+            <MessagePartView key={item.part.id} part={item.part} renderTextAsMarkdown={renderTextAsMarkdown} />
           )
         )}
       </div>
@@ -126,10 +128,13 @@ function ToolTimelineGroup({ parts }: { parts: MessagePart[] }) {
   );
 }
 
-function MessagePartView({ part }: { part: MessagePart }) {
+function MessagePartView({ part, renderTextAsMarkdown }: { part: MessagePart; renderTextAsMarkdown: boolean }) {
   if (part.type === "text") {
     const text = partText(part);
-    return text ? <pre className="messageTextPart">{text}</pre> : null;
+    if (!text) {
+      return null;
+    }
+    return renderTextAsMarkdown ? <MarkdownBody className="messageTextPart" content={text} /> : <pre className="messageTextPart">{text}</pre>;
   }
 
   if (part.type === "error") {
@@ -155,7 +160,7 @@ function MessagePartView({ part }: { part: MessagePart }) {
       <details className="messagePart messagePartReasoning" open>
         <summary>{label}{provider ? ` · ${provider}` : ""}</summary>
         {nativeEventType && <p className="reasoningProvenance monospace">source: {nativeEventType}</p>}
-        <pre>{content}</pre>
+        <MarkdownBody className="reasoningMarkdown" content={content} />
         {usage && <UsageSummary usage={usage} />}
       </details>
     );

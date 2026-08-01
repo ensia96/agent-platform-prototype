@@ -396,6 +396,185 @@ input {
   line-height: 1.5;
 }
 
+.markdownBody {
+  line-height: 1.55;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.markdownBody > :first-child {
+  margin-top: 0;
+}
+
+.markdownBody > :last-child {
+  margin-bottom: 0;
+}
+
+.markdownBody p {
+  margin: 0 0 0.75em;
+}
+
+.markdownBody h1,
+.markdownBody h2,
+.markdownBody h3,
+.markdownBody h4,
+.markdownBody h5,
+.markdownBody h6 {
+  color: inherit;
+  line-height: 1.3;
+  margin: 1em 0 0.45em;
+}
+
+.markdownBody h1 {
+  font-size: 1.4em;
+}
+
+.markdownBody h2 {
+  font-size: 1.25em;
+}
+
+.markdownBody h3 {
+  font-size: 1.12em;
+}
+
+.markdownBody h4,
+.markdownBody h5,
+.markdownBody h6 {
+  font-size: 1em;
+}
+
+.markdownBody ul,
+.markdownBody ol {
+  margin: 0 0 0.75em;
+  padding-left: 1.5em;
+}
+
+.markdownBody li + li {
+  margin-top: 0.25em;
+}
+
+.markdownBody li > p {
+  margin-bottom: 0.35em;
+}
+
+.markdownBody .contains-task-list {
+  list-style: none;
+  padding-left: 0.25em;
+}
+
+.markdownBody .task-list-item {
+  list-style: none;
+}
+
+.markdownBody .task-list-item input[type="checkbox"] {
+  accent-color: #2563eb;
+  appearance: auto;
+  cursor: default;
+  height: 13px;
+  margin: 0 0.45em 0 0;
+  padding: 0;
+  vertical-align: -1px;
+  width: 13px;
+}
+
+.markdownBody blockquote {
+  border-left: 3px solid #94a3b8;
+  color: #475569;
+  margin: 0 0 0.75em;
+  padding: 0.1em 0 0.1em 0.85em;
+}
+
+.markdownBody blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.markdownBody a {
+  color: #1d4ed8;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.markdownBody a:hover {
+  color: #1e40af;
+}
+
+.markdownBlockedLink {
+  color: #64748b;
+  text-decoration: line-through;
+}
+
+.markdownBody code {
+  background: rgba(15, 23, 42, 0.08);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.12em 0.35em;
+}
+
+.markdownBody pre {
+  background: #0f172a;
+  border-radius: 8px;
+  color: #e2e8f0;
+  margin: 0 0 0.75em;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 10px 12px;
+  white-space: pre;
+  word-break: normal;
+}
+
+.markdownBody pre code {
+  background: transparent;
+  border-radius: 0;
+  color: inherit;
+  font-size: 0.88em;
+  padding: 0;
+  white-space: inherit;
+}
+
+.markdownTableScroll {
+  margin: 0 0 0.75em;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdownBody table {
+  border-collapse: collapse;
+  font-size: 0.92em;
+  min-width: 100%;
+}
+
+.markdownBody th,
+.markdownBody td {
+  border: 1px solid #cbd5e1;
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdownBody th {
+  background: rgba(226, 232, 240, 0.72);
+  font-weight: 700;
+}
+
+.markdownBody hr {
+  border: 0;
+  border-top: 1px solid #cbd5e1;
+  margin: 1em 0;
+}
+
+.markdownImagePlaceholder {
+  color: #64748b;
+  display: inline-block;
+  font-size: 0.92em;
+}
+
+.messagePart .markdownBody strong {
+  display: inline;
+  margin-bottom: 0;
+}
+
 .messagePart {
   border: 1px solid #e2e8f0;
   border-radius: 10px;
