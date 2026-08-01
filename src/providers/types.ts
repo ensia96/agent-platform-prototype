@@ -4,6 +4,7 @@ import type {
   Message,
   MessagePart,
   MessagePartType,
+  ProviderModelCatalog,
   ProviderProfile,
   ProviderTestResponse,
   RunOptions,
@@ -136,6 +137,7 @@ export interface ProviderAdapter {
   id: string;
   label: string;
   test(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderTestResponse>;
+  listModels?(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderModelCatalog>;
   /**
    * Execute one provider turn. If the provider emits native tool/function calls,
    * convert them into canonical ProviderToolCall records; the kernel will handle

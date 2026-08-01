@@ -37,6 +37,7 @@ import type {
   ToolPermissionDecision
 } from "../shared/types";
 import { defaultMainAgentToolIds } from "../shared/model-tools";
+import { normalizeReasoningEffort } from "../shared/run-options";
 
 type SessionRow = {
   id: string;
@@ -986,8 +987,9 @@ function runOptionsFromJsonObject(value: JsonObject): RunOptions | null {
   if (typeof value.model === "string" && value.model.trim()) {
     runOptions.model = value.model;
   }
-  if (isReasoningEffort(value.reasoningEffort)) {
-    runOptions.reasoningEffort = value.reasoningEffort;
+  const reasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
+  if (reasoningEffort) {
+    runOptions.reasoningEffort = reasoningEffort;
   }
   if (typeof value.temperature === "number" && Number.isFinite(value.temperature)) {
     runOptions.temperature = value.temperature;
@@ -1047,8 +1049,4 @@ function usageFromMetadata(metadata: JsonObject): RunUsage | null {
   }
 
   return Object.keys(usage).length > 0 ? usage : null;
-}
-
-function isReasoningEffort(value: unknown): value is RunOptions["reasoningEffort"] {
-  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
 }

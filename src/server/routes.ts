@@ -169,6 +169,20 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
     res.json(providers.list());
   });
 
+  app.get("/api/providers/:id/models", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const catalog = await providers.getModelCatalog(req.params.id, { refresh: req.query.refresh === "1" });
+      if (!catalog) {
+        res.status(404).json({ error: "unknown_profile", message: `Provider profile '${req.params.id}' was not found.` });
+        return;
+      }
+      res.json(catalog);
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/providers/:id/test", async (req, res, next) => {
     try {
       const result = await providers.testProfile(req.params.id);
@@ -199,6 +213,9 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
       }
 
       const result = await openAIChatGPTAuth.pollDeviceAuth(attemptId);
+      if (result.status === "connected") {
+        providers.invalidateModelCatalog(openAIChatGPTProfileId);
+      }
       res.json(withOpenAIChatGPTProfile(result, providers));
     } catch (error) {
       next(error);
@@ -208,6 +225,7 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
   app.post("/api/providers/openai-chatgpt/logout", async (_req, res, next) => {
     try {
       await openAIChatGPTAuth.logout();
+      providers.invalidateModelCatalog(openAIChatGPTProfileId);
       const response: OpenAIChatGPTLogoutResponse = {
         providerProfileId: openAIChatGPTProfileId,
         ok: true,

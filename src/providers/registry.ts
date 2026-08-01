@@ -1,4 +1,4 @@
-import { MockProvider } from "./mock";
+import { MockProvider, mockModelId } from "./mock";
 import { OpenAIChatGPTProvider } from "./openai-chatgpt";
 import {
   defaultOpenAIChatGPTEndpoint,
@@ -13,6 +13,7 @@ import type { ProviderAdapter, ProviderCredential } from "./types";
 import type {
   ProviderFallbackInfo,
   ProviderListResponse,
+  ProviderModelCatalog,
   ProviderProfile,
   ProviderProfileType,
   ProviderResolution,
@@ -24,9 +25,16 @@ const mockProfileId = "mock";
 const openAIProfileId = "openai-compatible";
 const defaultOpenAIBaseUrl = "https://api.openai.com/v1";
 const defaultOpenAIModel = "gpt-4o-mini";
+const defaultModelCatalogTtlMs = 5 * 60 * 1000;
 
 export interface ProviderRegistryOptions {
   openAIChatGPTCredentials?: OpenAIChatGPTCredentialStore;
+  modelCatalogTtlMs?: number;
+  now?: () => number;
+}
+
+export interface ProviderModelCatalogRequestOptions {
+  refresh?: boolean;
 }
 
 export interface ProviderRunSelectionInput {
@@ -39,6 +47,11 @@ export interface ResolvedProviderRun {
   profile: ProviderProfile;
   credential: ProviderCredential;
   providerResolution: ProviderResolution;
+}
+
+interface ModelCatalogCacheEntry {
+  catalog: ProviderModelCatalog;
+  expiresAt: number;
 }
 
 export class ProviderRegistry {
@@ -55,12 +68,24 @@ export class ProviderRegistry {
     ["chatgpt-codex", openAIChatGPTProfileId],
     ["mock", mockProfileId]
   ]);
+  private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
+  private readonly modelCatalogRequests = new Map<string, Promise<ProviderModelCatalog>>();
+  private readonly modelCatalogGenerations = new Map<string, number>();
+  private readonly openAIChatGPTCredentials: OpenAIChatGPTCredentialStore;
+  private readonly modelCatalogTtlMs: number;
+  private readonly now: () => number;
 
   constructor(
     private readonly env: NodeJS.ProcessEnv,
     adapters: ProviderAdapter[],
-    private readonly options: Required<ProviderRegistryOptions>
+    options: ProviderRegistryOptions = {}
   ) {
+    this.openAIChatGPTCredentials = options.openAIChatGPTCredentials ?? new OpenAIChatGPTCredentialStore();
+    this.modelCatalogTtlMs =
+      typeof options.modelCatalogTtlMs === "number" && Number.isFinite(options.modelCatalogTtlMs) && options.modelCatalogTtlMs >= 0
+        ? options.modelCatalogTtlMs
+        : defaultModelCatalogTtlMs;
+    this.now = options.now ?? Date.now;
     for (const adapter of adapters) {
       this.adapters.set(adapter.id as ProviderProfileType, adapter);
     }
@@ -75,6 +100,49 @@ export class ProviderRegistry {
       providers: [...this.profiles.values()].map((profile) => this.profileWithRuntimeStatus(profile)),
       defaultProviderProfileId: this.getDefaultProviderProfileId()
     };
+  }
+
+  async getModelCatalog(id: string, options: ProviderModelCatalogRequestOptions = {}): Promise<ProviderModelCatalog | null> {
+    const profile = this.getProfile(id);
+    if (!profile) {
+      return null;
+    }
+    const cached = this.modelCatalogCache.get(profile.id);
+    if (!options.refresh && cached && cached.expiresAt > this.now()) {
+      return cloneModelCatalog(cached.catalog);
+    }
+
+    const currentRequest = this.modelCatalogRequests.get(profile.id);
+    if (currentRequest) {
+      return cloneModelCatalog(await currentRequest);
+    }
+
+    const generation = this.modelCatalogGenerations.get(profile.id) ?? 0;
+    const request = this.loadModelCatalog(profile, cached?.catalog ?? null, generation);
+    this.modelCatalogRequests.set(profile.id, request);
+    try {
+      return cloneModelCatalog(await request);
+    } finally {
+      if (this.modelCatalogRequests.get(profile.id) === request) {
+        this.modelCatalogRequests.delete(profile.id);
+      }
+    }
+  }
+
+  invalidateModelCatalog(id?: string): void {
+    if (id === undefined) {
+      for (const profileId of this.profiles.keys()) {
+        this.invalidateModelCatalog(profileId);
+      }
+      return;
+    }
+    const profileId = this.normalizeProfileId(id);
+    if (!profileId) {
+      return;
+    }
+    this.modelCatalogGenerations.set(profileId, (this.modelCatalogGenerations.get(profileId) ?? 0) + 1);
+    this.modelCatalogCache.delete(profileId);
+    this.modelCatalogRequests.delete(profileId);
   }
 
   async testProfile(id: string): Promise<ProviderTestResponse | null> {
@@ -177,6 +245,51 @@ export class ProviderRegistry {
     };
   }
 
+  private async loadModelCatalog(
+    profile: ProviderProfile,
+    lastGood: ProviderModelCatalog | null,
+    generation: number
+  ): Promise<ProviderModelCatalog> {
+    const currentProfile = this.profileWithRuntimeStatus(profile);
+    const adapter = this.adapters.get(currentProfile.type);
+    try {
+      if (!adapter?.listModels) {
+        throw new Error("Provider adapter does not implement model listing.");
+      }
+      const catalog = await adapter.listModels(currentProfile, this.resolveCredential(currentProfile));
+      const normalized: ProviderModelCatalog = {
+        ...catalog,
+        providerProfileId: currentProfile.id,
+        stale: false,
+        models: catalog.models.map(cloneModelCatalogItem)
+      };
+      if (normalized.status === "available" && (this.modelCatalogGenerations.get(profile.id) ?? 0) === generation) {
+        this.modelCatalogCache.set(profile.id, {
+          catalog: cloneModelCatalog(normalized),
+          expiresAt: this.now() + this.modelCatalogTtlMs
+        });
+      }
+      return normalized;
+    } catch {
+      const warning = "Remote model catalog is currently unavailable; no provider error body or credential data is exposed.";
+      if (lastGood?.status === "available") {
+        const staleCatalog: ProviderModelCatalog = {
+          ...cloneModelCatalog(lastGood),
+          stale: true,
+          warning: joinWarnings(lastGood.warning, warning)
+        };
+        if ((this.modelCatalogGenerations.get(profile.id) ?? 0) === generation) {
+          this.modelCatalogCache.set(profile.id, {
+            catalog: cloneModelCatalog(staleCatalog),
+            expiresAt: this.now()
+          });
+        }
+        return staleCatalog;
+      }
+      return configuredModelCatalog(currentProfile, new Date(this.now()).toISOString(), warning);
+    }
+  }
+
   private getDefaultProviderProfileId(): string {
     const openAIProfile = this.profiles.get(openAIProfileId);
     if (openAIProfile?.enabled && this.resolveCredential(openAIProfile).apiKey) {
@@ -213,7 +326,7 @@ export class ProviderRegistry {
   private resolveCredential(profile: ProviderProfile): ProviderCredential {
     const credentialRef = profile.credentialRef?.trim();
     if (credentialRef === openAIChatGPTCredentialRef) {
-      const inspection = this.options.openAIChatGPTCredentials.inspectSync?.();
+      const inspection = this.openAIChatGPTCredentials.inspectSync?.();
       if (inspection?.kind === "present") {
         return {
           oauth: {
@@ -240,7 +353,7 @@ export class ProviderRegistry {
       return cloneProfile(profile);
     }
 
-    const inspection = this.options.openAIChatGPTCredentials.inspectSync?.();
+    const inspection = this.openAIChatGPTCredentials.inspectSync?.();
     const status = chatGPTStatusFromInspection(inspection);
     return {
       ...profile,
@@ -263,7 +376,7 @@ export function createDefaultProviderRegistry(env: NodeJS.ProcessEnv, options: P
         clientId: env.OPENAI_CHATGPT_CLIENT_ID
       })
     ],
-    { openAIChatGPTCredentials }
+    { ...options, openAIChatGPTCredentials }
   );
 }
 
@@ -287,7 +400,7 @@ function createDefaultProfiles(env: NodeJS.ProcessEnv): ProviderProfile[] {
       enabled: true,
       runOptionSupport: {
         model: "unsupported",
-        reasoningEffort: "metadata-only",
+        reasoningEffort: "unsupported",
         temperature: "unsupported",
         usage: "unsupported"
       },
@@ -341,7 +454,7 @@ function createDefaultProfiles(env: NodeJS.ProcessEnv): ProviderProfile[] {
       defaultRunOptions: { model: openAIChatGPTModel },
       runOptionSupport: {
         model: "supported",
-        reasoningEffort: "metadata-only",
+        reasoningEffort: "supported",
         temperature: "unsupported",
         usage: "provider-reported"
       },
@@ -362,6 +475,49 @@ function cloneProfile(profile: ProviderProfile): ProviderProfile {
     ...profile,
     status: { ...profile.status }
   };
+}
+
+function configuredModelCatalog(profile: ProviderProfile, fetchedAt: string, warning: string): ProviderModelCatalog {
+  const model = profile.defaultRunOptions?.model?.trim() || profile.model?.trim();
+  return {
+    providerProfileId: profile.id,
+    status: model ? "configured-only" : "unavailable",
+    source: "configured",
+    stale: false,
+    fetchedAt,
+    warning,
+    customModelAllowed: profile.type !== "mock",
+    models: model
+      ? [
+          {
+            id: model,
+            reasoning: { support: profile.type === "mock" ? "unsupported" : "unknown", efforts: [] }
+          }
+        ]
+      : []
+  };
+}
+
+function cloneModelCatalog(catalog: ProviderModelCatalog): ProviderModelCatalog {
+  return {
+    ...catalog,
+    models: catalog.models.map(cloneModelCatalogItem)
+  };
+}
+
+function cloneModelCatalogItem(item: ProviderModelCatalog["models"][number]): ProviderModelCatalog["models"][number] {
+  return {
+    ...item,
+    reasoning: {
+      ...item.reasoning,
+      efforts: item.reasoning.efforts.map((effort) => ({ ...effort }))
+    }
+  };
+}
+
+function joinWarnings(...warnings: Array<string | undefined>): string | undefined {
+  const values = [...new Set(warnings.map((warning) => warning?.trim()).filter((warning): warning is string => Boolean(warning)))];
+  return values.length > 0 ? values.join(" ") : undefined;
 }
 
 function credentialStatusFor(profile: ProviderProfile, credential: ProviderCredential): ProviderStatus["credentialStatus"] {

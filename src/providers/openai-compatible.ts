@@ -1,14 +1,33 @@
-import type { ProviderAdapter, ProviderRunContext, ProviderRunInput, ProviderRunResult, ProviderToolCall } from "./types";
+import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput, ProviderRunResult, ProviderToolCall } from "./types";
 import { extractRunUsage } from "./usage";
-import type { BuiltContext, JsonObject, ModelToolDefinition, ProviderProfile, ProviderStatus, ProviderTestResponse } from "../shared/types";
+import type {
+  BuiltContext,
+  JsonObject,
+  ModelToolDefinition,
+  ProviderModelCatalog,
+  ProviderModelCatalogItem,
+  ProviderProfile,
+  ProviderStatus,
+  ProviderTestResponse
+} from "../shared/types";
 
 const defaultBaseUrl = "https://api.openai.com/v1";
 const defaultModel = "gpt-4o-mini";
 const testTimeoutMs = 15_000;
+const modelIdMaxLength = 200;
+
+export interface OpenAICompatibleProviderOptions {
+  fetch?: typeof fetch;
+}
 
 export class OpenAICompatibleProvider implements ProviderAdapter {
   readonly id = "openai-compatible";
   readonly label = "OpenAI-compatible streaming provider";
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(options: OpenAICompatibleProviderOptions = {}) {
+    this.fetchImpl = options.fetch ?? fetch;
+  }
 
   async test(profile: ProviderProfile, credential: { apiKey?: string }): Promise<ProviderTestResponse> {
     const checkedAt = new Date().toISOString();
@@ -36,52 +55,11 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
       };
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), testTimeoutMs);
     const startedAt = Date.now();
 
     try {
-      const response = await fetch(`${baseUrl}/models`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: "application/json"
-        },
-        signal: controller.signal
-      });
+      const catalog = await this.listModels(profile, credential);
       const latencyMs = Date.now() - startedAt;
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        const displayBody = trimForDisplay(body);
-        const status: ProviderStatus = {
-          state: "error",
-          message: `OpenAI-compatible /models test failed (${response.status}): ${displayBody || response.statusText}`,
-          credentialStatus: "present",
-          checkedAt,
-          errorCode: "connection_failed"
-        };
-
-        return {
-          ok: false,
-          profile: { ...profile, status },
-          status,
-          code: "connection_failed",
-          message: status.message,
-          checkedAt,
-          latencyMs,
-          details: {
-            baseUrl,
-            model,
-            endpoint: `${baseUrl}/models`,
-            status: response.status,
-            statusText: response.statusText,
-            body: displayBody
-          }
-        };
-      }
-
-      await response.body?.cancel().catch(() => undefined);
       const status: ProviderStatus = {
         state: "connected",
         message: `Connected to ${baseUrl} using ${model}.`,
@@ -96,15 +74,13 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
         message: status.message,
         checkedAt,
         latencyMs,
-        details: { baseUrl, model, endpoint: `${baseUrl}/models` }
+        details: { baseUrl, model, endpoint: `${baseUrl}/models`, modelCount: catalog.models.length }
       };
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
       const status: ProviderStatus = {
         state: "error",
-        message: isAbortLike(error)
-          ? `OpenAI-compatible /models test timed out after ${testTimeoutMs / 1000}s.`
-          : `OpenAI-compatible /models test failed: ${toErrorMessage(error)}`,
+        message: `OpenAI-compatible /models test failed: ${toErrorMessage(error)}`,
         credentialStatus: "present",
         checkedAt,
         errorCode: "connection_failed"
@@ -120,6 +96,44 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
         latencyMs,
         details: { baseUrl, model, endpoint: `${baseUrl}/models` }
       };
+    }
+  }
+
+  async listModels(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderModelCatalog> {
+    const apiKey = credential.apiKey?.trim() ?? "";
+    if (!apiKey) {
+      throw new Error(`${credentialRefLabel(profile)} is required to list OpenAI-compatible models.`);
+    }
+
+    const baseUrl = getBaseUrl(profile);
+    const endpoint = `${baseUrl}/models`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), testTimeoutMs);
+    try {
+      const response = await this.fetchImpl(endpoint, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: "application/json"
+        },
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(`OpenAI-compatible /models request failed with status ${response.status} ${response.statusText}.`);
+      }
+      let body: unknown;
+      try {
+        body = (await response.json()) as unknown;
+      } catch {
+        throw new Error("OpenAI-compatible /models returned invalid JSON.");
+      }
+      return parseOpenAICompatibleModelCatalog(body, profile.id);
+    } catch (error) {
+      if (isAbortLike(error)) {
+        throw new Error(`OpenAI-compatible /models request timed out after ${testTimeoutMs / 1000}s.`);
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
@@ -156,7 +170,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
       requestBody.temperature = input.context.runOptions.temperature;
     }
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await this.fetchImpl(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -178,6 +192,49 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     const toolCalls = await parseOpenAICompatibleStream(response.body, context);
     return { toolCalls };
   }
+}
+
+export function parseOpenAICompatibleModelCatalog(
+  value: unknown,
+  providerProfileId: string,
+  fetchedAt = new Date().toISOString()
+): ProviderModelCatalog {
+  if (!isJsonObject(value) || !Array.isArray(value.data)) {
+    throw new Error("OpenAI-compatible /models response must contain a data array.");
+  }
+
+  const models: ProviderModelCatalogItem[] = [];
+  const seen = new Set<string>();
+  for (const item of value.data) {
+    if (!isJsonObject(item)) {
+      continue;
+    }
+    const id = catalogIdentifier(item.id, modelIdMaxLength);
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const owner = catalogString(item.owned_by, 200);
+    const created = typeof item.created === "number" && Number.isFinite(item.created) && item.created >= 0 ? item.created : undefined;
+    models.push({
+      id,
+      ...(owner ? { owner } : {}),
+      ...(created !== undefined ? { created } : {}),
+      reasoning: { support: "unknown", efforts: [] }
+    });
+  }
+
+  return {
+    providerProfileId,
+    status: "available",
+    source: "provider",
+    stale: false,
+    fetchedAt,
+    warning:
+      "The OpenAI-compatible /models contract does not identify chat compatibility or reasoning support; entries may include embedding, audio, or other non-chat models.",
+    customModelAllowed: true,
+    models
+  };
 }
 
 interface OpenAIToolCallState {
@@ -392,6 +449,19 @@ function parseToolArguments(value: string): { value: JsonObject; error?: string 
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function catalogString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) {
+    return undefined;
+  }
+  const text = value.trim();
+  return text && text.length <= maxLength ? text : undefined;
+}
+
+function catalogIdentifier(value: unknown, maxLength: number): string | undefined {
+  const identifier = catalogString(value, maxLength);
+  return typeof value === "string" && value === identifier ? identifier : undefined;
 }
 
 function stripTrailingSlash(value: string): string {

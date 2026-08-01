@@ -40,6 +40,8 @@ npm run start      # build dashboard, then start the local daemon in the backgro
 npm run status     # check daemon.pid and GET /api/status
 npm run stop       # send SIGTERM and clean daemon pid/metadata after exit
 npm run typecheck  # TypeScript check
+npm run smoke:model-catalog # provider model parser/cache/request fixtures (no real provider calls)
+npm run smoke:reasoning     # reasoning payload/stream/persistence fixtures
 ```
 
 The same scripts work with Yarn:
@@ -93,6 +95,7 @@ Useful environment variables:
 - `POST /api/context/preview` body `{ "sessionId": "...", "agentId": "main", "providerProfileId": "mock", "text": "optional current input", "runOptions": { ... } }`
 - `POST /api/sessions/:id/context/preview` previews the provider-neutral context for a session without starting a run
 - `GET /api/providers` returns provider profiles, credential/status details, and the default profile id
+- `GET /api/providers/:id/models` returns the canonical model catalog; add `?refresh=1` to bypass a valid cached result. Responses use `Cache-Control: no-store`
 - `POST /api/providers/:id/test` tests a provider profile without storing secrets
 - `POST /api/providers/openai-chatgpt/auth/start` starts the experimental ChatGPT/Codex device authorization flow
 - `POST /api/providers/openai-chatgpt/auth/poll` body `{ "attemptId": "..." }` polls/completes that device authorization flow
@@ -107,7 +110,7 @@ Useful environment variables:
 - `PATCH /api/sessions/:id` body `{ "workingDirectory": "/absolute/project/path" }` updates the session cwd after resolving/validating that it exists and is a directory
 - `GET /api/sessions/:id/messages`
 - `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually invokes the local shell tool. `cwd` is optional; when omitted, the session `workingDirectory` is used. Relative `cwd` values resolve from the session `workingDirectory`; absolute values resolve as-is. `timeoutMs` is optional; when omitted, Tool Settings `shell.defaultTimeoutMs` is used. The response is one of: executed immediately, pending permission, or denied by policy.
-- `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "minimal" | "low" | "medium" | "high" | "xhigh", "temperature": 0.2 } }`
+- `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "provider-defined-value", "temperature": 0.2 } }`
 - `GET /api/runs/:id/events` SSE stream
 - `POST /api/runs/:id/cancel`
 - `POST /api/runs/:id/resume` resumes a run that is waiting for already-resolved tool permission
@@ -124,13 +127,25 @@ OPENAI_MODEL=gpt-4o-mini
 
 Then send runs with provider profile `openai-compatible` from the UI selector or API. Use `GET /api/providers` or the Settings → Providers panel to inspect profile status and run a `/models` connection test.
 
+### Provider model catalogs
+
+The Chat Run Inspector lazily loads models only for the selected provider. Settings → Providers does not call model endpoints automatically; use **Load models** or **Refresh models** on a provider card. Exact provider model IDs are preserved rather than normalized or guessed.
+
+- `openai-compatible`: requests `GET {baseUrl}/models` and exposes valid `data[].id`, `owned_by`, and `created` fields. The standard `/models` response does not declare chat compatibility or reasoning support, so the catalog marks reasoning as `unknown`, permits a custom model ID, and warns that embedding/audio/other non-chat models may be present. Reasoning capabilities are never inferred from model names.
+- `openai-chatgpt`: requests the experimental internal `GET https://chatgpt.com/backend-api/codex/models?client_version=<local-adapter-version>` endpoint with the same OAuth/account headers as the Codex runtime. Entries whose backend visibility is exactly `list` are exposed as suggestions ordered by advertised priority, while exact custom model IDs remain accepted for compatibility and configured fallback. Reasoning choices are enabled only for an exact catalog match; `none`, `max`, and unknown future strings are preserved, while the internal `ultra` value is intentionally excluded from the picker. This backend contract is unsupported and may change without notice.
+- `mock`: returns its single built-in mock model without network access.
+
+Successful remote catalogs are cached in memory for five minutes. Concurrent callers share one request; `refresh=1` bypasses a valid cached result. A failed refresh returns the last successful catalog as `stale`, or the configured default model as a `configured-only` fallback when no successful result exists. Cache entries are invalidated after ChatGPT connect/reconnect/logout. Raw provider error bodies, credentials, and unrecognized backend fields are not copied into the canonical API response.
+
 ### Run options and usage visibility
 
 Chat runs accept optional `runOptions` (or legacy-compatible `options`) for model override, reasoning effort, and temperature. Provider support is intentionally conservative:
 
-- `openai-compatible`: model override and temperature are sent to `/chat/completions`; reasoning effort is recorded in run metadata only unless a future profile capability explicitly supports it.
-- `openai-chatgpt`: model override and a provider summary request (`reasoning.summary: "auto"`) are sent to the experimental ChatGPT/Codex payload; reasoning effort and temperature remain metadata-only/unsupported to avoid changing the known-good backend contract.
+- `openai-compatible`: model override and temperature are sent to `/chat/completions`; reasoning effort is recorded in run metadata only and is not sent because the standard catalog does not advertise a compatible request contract.
+- `openai-chatgpt`: model override, `reasoning.summary: "auto"`, and a selected advertised reasoning effort are sent to the experimental ChatGPT/Codex payload. An empty selection omits `reasoning.effort`; `none` is sent explicitly. Temperature remains unsupported.
 - `mock`: options are accepted for UI/API consistency but are not sent to a model runtime.
+
+Reasoning effort is a validated provider-defined string rather than a closed application enum (non-empty after trimming, at most 64 characters, and no control characters). The UI only offers efforts advertised for the exact selected ChatGPT/Codex model and clears an incompatible choice when the provider/model changes.
 
 If a provider response or stream includes usage metadata, the daemon normalizes and stores available `inputTokens`, `outputTokens`, `reasoningTokens`, and `totalTokens`, then displays them in the Chat UI.
 
@@ -299,8 +314,8 @@ The kernel deals in store/provider interfaces, the provider-neutral context buil
 
 The React UI has two tabs:
 
-- `Chat`: existing session/run streaming flow, agent tool-call/result rendering, pending shell permission approvals, and a debug/manual Shell Tool panel for `shell.exec`
-- `Settings`: daemon status, Tool Settings regex permission policy and built-in shell timeout/output settings, main agent/system prompt/tool visibility, provider profiles with credential presence, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
+- `Chat`: existing session/run streaming flow, lazy provider model/effort selection, agent tool-call/result rendering, pending shell permission approvals, and a debug/manual Shell Tool panel for `shell.exec`
+- `Settings`: daemon status, Tool Settings regex permission policy and built-in shell timeout/output settings, main agent/system prompt/tool visibility, provider profiles with credential presence, manual model catalog load/refresh, OpenAI ChatGPT OAuth connect/disconnect, connection tests, adapter registry placeholders (`opencode`, `claude-code`, `codex`, `gemini-cli`), and a small stored setting editor
 
 ## Notes
 

@@ -5,12 +5,12 @@ import {
   toolSettingsSettingKey,
   validateToolSettings
 } from "../shared/tool-settings";
+import { hasControlCharacters, maxReasoningEffortLength, normalizeReasoningEffort } from "../shared/run-options";
 import type {
   CreateSessionRequest,
   JsonObject,
   JsonValue,
   PermissionRequestStatus,
-  ReasoningEffort,
   RunOptions,
   ShellExecRequest,
   ToolSettings,
@@ -278,11 +278,21 @@ function parseRunOptionsValue(rawOptions: unknown): RunOptions | undefined {
   }
 
   if ("reasoningEffort" in rawOptions) {
-    if (rawOptions.reasoningEffort !== null && rawOptions.reasoningEffort !== undefined && rawOptions.reasoningEffort !== "") {
-      if (!isReasoningEffort(rawOptions.reasoningEffort)) {
-        throw new KernelError("Run option 'reasoningEffort' must be one of minimal, low, medium, high, xhigh.", 400);
+    if (rawOptions.reasoningEffort !== null && rawOptions.reasoningEffort !== undefined) {
+      if (typeof rawOptions.reasoningEffort !== "string") {
+        throw new KernelError("Run option 'reasoningEffort' must be a string.", 400);
       }
-      options.reasoningEffort = rawOptions.reasoningEffort;
+      if (hasControlCharacters(rawOptions.reasoningEffort)) {
+        throw new KernelError("Run option 'reasoningEffort' must not contain control characters.", 400);
+      }
+      const effort = rawOptions.reasoningEffort.trim();
+      if (effort.length > maxReasoningEffortLength) {
+        throw new KernelError(`Run option 'reasoningEffort' must be ${maxReasoningEffortLength} characters or fewer.`, 400);
+      }
+      const normalized = normalizeReasoningEffort(effort);
+      if (normalized) {
+        options.reasoningEffort = normalized;
+      }
     }
   }
 
@@ -299,10 +309,6 @@ function parseRunOptionsValue(rawOptions: unknown): RunOptions | undefined {
   }
 
   return options;
-}
-
-function isReasoningEffort(value: unknown): value is ReasoningEffort {
-  return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh";
 }
 
 function isValidSettingKey(key: string): boolean {

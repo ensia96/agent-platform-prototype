@@ -69,13 +69,17 @@ function verifyChatGPTSummaryRequest(): void {
     credential: { oauth: { type: "oauth", access: "fixture-access" } },
     requestedRunOptions: { model: "fixture-model", reasoningEffort: "high" },
     runOptions: { model: "fixture-model", reasoningEffort: "high" },
-    unsupportedRunOptions: ["reasoningEffort"]
+    unsupportedRunOptions: []
   };
 
   const payload = buildCodexRequestPayload(input);
-  assert.deepEqual(payload.reasoning, { summary: "auto" });
-  assert.equal("effort" in payload.reasoning, false, "experimental reasoning effort must remain metadata-only");
+  assert.deepEqual(payload.reasoning, { summary: "auto", effort: "high" });
   assert.equal(input.context.runOptions.reasoningEffort, "high", "building the request must not mutate the selected run options");
+
+  input.context.runOptions.reasoningEffort = "none";
+  assert.deepEqual(buildCodexRequestPayload(input).reasoning, { summary: "auto", effort: "none" }, "none must be explicit");
+  delete input.context.runOptions.reasoningEffort;
+  assert.deepEqual(buildCodexRequestPayload(input).reasoning, { summary: "auto" }, "blank effort must be omitted");
 }
 
 async function verifyChatGPTReasoningParser(): Promise<void> {
@@ -378,7 +382,16 @@ function verifyRunWriterPersistenceAndEvents(): void {
     const store = new SQLiteStore({ dbPath, defaultWorkingDirectory: directory });
     const now = new Date().toISOString();
     const session = store.createSession({ id: "session", title: "reasoning", workingDirectory: directory, createdAt: now, updatedAt: now });
-    const run = store.createRun({ id: "run", sessionId: session.id, provider: "mock", status: "running", createdAt: now, updatedAt: now });
+    const run = store.createRun({
+      id: "run",
+      sessionId: session.id,
+      provider: "mock",
+      status: "running",
+      metadata: { runOptions: { reasoningEffort: "future-tier" } },
+      createdAt: now,
+      updatedAt: now
+    });
+    assert.equal(run.runOptions?.reasoningEffort, "future-tier", "provider-defined efforts must survive SQLite decoding");
     const message = store.createMessage({
       id: "assistant-1",
       sessionId: session.id,
@@ -489,6 +502,7 @@ function verifyRunWriterPersistenceAndEvents(): void {
 
     store.updateMessageStatus(message.id, "completed", new Date().toISOString(), null);
     const reloadedStore = new SQLiteStore({ dbPath, defaultWorkingDirectory: directory });
+    assert.equal(reloadedStore.getRun(run.id)?.runOptions?.reasoningEffort, "future-tier");
     const reloadedMessage = reloadedStore.getMessage(message.id)!;
     const summaryPart = reloadedMessage.parts.find((part) => part.type === "reasoning_summary");
     const detailPart = reloadedMessage.parts.find((part) => part.type === "reasoning_detail");

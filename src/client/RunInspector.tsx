@@ -4,6 +4,7 @@ import type {
   ContextPreviewResponse,
   InvokeToolResponse,
   PermissionRequest,
+  ProviderModelCatalog,
   ProviderProfile,
   ProviderResolution,
   ReasoningEffort,
@@ -13,6 +14,7 @@ import type {
   ToolDefinition
 } from "../shared/types";
 import { formatUsage } from "./MessageBody";
+import { advertisedReasoningEfforts, effectiveRunModelId, type ModelCatalogLoadState } from "./model-catalog";
 import { agentToolIds, formatRunOptions } from "./SettingsPanel";
 import { PendingPermissionsPanel, ShellToolPanel, type ShellToolState } from "./ToolPanels";
 
@@ -31,7 +33,11 @@ export interface RunInspectorProps {
     modelOverride: string;
     reasoningEffort: ReasoningEffort | "";
     temperature: string;
+    modelCatalog: ProviderModelCatalog | null;
+    modelCatalogState: ModelCatalogLoadState;
+    modelCatalogError: string | null;
     disabled: boolean;
+    onRefreshModelCatalog: () => void;
     onAgentChange: (value: string) => void;
     onProviderChange: (value: string) => void;
     onModelOverrideChange: (value: string) => void;
@@ -87,6 +93,11 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const selectedAgent = setup.agents.find((agent) => agent.id === setup.agentId) ?? null;
   const selectedProvider = setup.providers.find((provider) => provider.id === setup.providerProfileId) ?? null;
+  const defaultModelId = effectiveRunModelId(selectedProvider, selectedAgent, "");
+  const effectiveModelId = effectiveRunModelId(selectedProvider, selectedAgent, setup.modelOverride);
+  const reasoningEfforts = advertisedReasoningEfforts(setup.modelCatalog, selectedProvider, selectedAgent, setup.modelOverride);
+  const selectedCatalogModel = setup.modelCatalog?.models.find((model) => model.id === effectiveModelId) ?? null;
+  const catalogHasFixedChoices = setup.modelCatalog !== null && !setup.modelCatalog.customModelAllowed;
   const runState = runStatus.waitingForApproval
     ? "waiting for approval"
     : runStatus.activeRunId
@@ -225,27 +236,62 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
 
             <label>
               Model override
-              <input
-                value={setup.modelOverride}
-                onChange={(event) => setup.onModelOverrideChange(event.target.value)}
-                placeholder={selectedProvider?.model ?? "provider default"}
-                disabled={setup.disabled}
-              />
+              {catalogHasFixedChoices ? (
+                <select
+                  value={setup.modelOverride}
+                  onChange={(event) => setup.onModelOverrideChange(event.target.value)}
+                  disabled={setup.disabled || setup.modelCatalogState === "loading"}
+                >
+                  <option value="">provider/default{defaultModelId ? ` (${defaultModelId})` : ""}</option>
+                  {setup.modelCatalog?.models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.displayName && model.displayName !== model.id ? `${model.displayName} (${model.id})` : model.id}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <>
+                  <input
+                    value={setup.modelOverride}
+                    onChange={(event) => setup.onModelOverrideChange(event.target.value)}
+                    placeholder={selectedProvider?.model ?? "provider default"}
+                    list="run-model-catalog"
+                    disabled={setup.disabled}
+                  />
+                  <datalist id="run-model-catalog">
+                    {setup.modelCatalog?.models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}
+                  </datalist>
+                </>
+              )}
             </label>
+            <div className="inspectorHint catalogStatus" role="status">
+              <span>{modelCatalogSummary(setup.modelCatalog, setup.modelCatalogState, setup.modelCatalogError)}</span>
+              <button
+                type="button"
+                className="textButton"
+                onClick={setup.onRefreshModelCatalog}
+                disabled={setup.disabled || !setup.providerProfileId || setup.modelCatalogState === "loading"}
+              >
+                Refresh models
+              </button>
+              {setup.modelCatalog?.warning && <span>{setup.modelCatalog.warning}</span>}
+            </div>
             <div className="inspectorFormRow">
               <label>
                 Reasoning effort
                 <select
                   value={setup.reasoningEffort}
                   onChange={(event) => setup.onReasoningEffortChange(event.target.value as ReasoningEffort | "")}
-                  disabled={setup.disabled}
+                  disabled={setup.disabled || reasoningEfforts.length === 0}
                 >
-                  <option value="">provider/default</option>
-                  <option value="minimal">minimal</option>
-                  <option value="low">low</option>
-                  <option value="medium">medium</option>
-                  <option value="high">high</option>
-                  <option value="xhigh">xhigh</option>
+                  <option value="">
+                    {selectedCatalogModel?.reasoning.defaultEffort
+                      ? `provider/default (${selectedCatalogModel.reasoning.defaultEffort})`
+                      : "provider/default"}
+                  </option>
+                  {reasoningEfforts.map((option) => (
+                    <option key={option.value} value={option.value}>{option.value}</option>
+                  ))}
                 </select>
               </label>
               <label>
@@ -452,6 +498,30 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
       {preview.warnings.length > 0 && <p className="inspectorHint">Warnings: {preview.warnings.join(" ")}</p>}
     </div>
   );
+}
+
+function modelCatalogSummary(
+  catalog: ProviderModelCatalog | null,
+  state: ModelCatalogLoadState,
+  error: string | null
+): string {
+  if (state === "loading") {
+    return "Loading provider models…";
+  }
+  if (state === "error") {
+    return `Model catalog unavailable: ${error ?? "request failed"}`;
+  }
+  if (!catalog) {
+    return "Model catalog has not been loaded.";
+  }
+  if (catalog.status === "unavailable") {
+    return "Provider model catalog is unavailable.";
+  }
+  const stale = catalog.stale ? "stale " : "";
+  const count = `${catalog.models.length} model${catalog.models.length === 1 ? "" : "s"}`;
+  return catalog.status === "configured-only"
+    ? `Using ${stale}configured model fallback (${count}).`
+    : `Loaded ${count}${catalog.stale ? " from the last successful catalog" : ""}.`;
 }
 
 function providerOptionLabel(profile: ProviderProfile): string {

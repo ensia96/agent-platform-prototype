@@ -15,7 +15,8 @@ export type MessagePartType =
   | "file_ref";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
 export type RunStatus = "running" | "waiting_permission" | "completed" | "cancelled" | "failed";
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+/** Provider-defined opaque value, validated at runtime before persistence or use. */
+export type ReasoningEffort = string;
 export type ProviderProfileType = "openai-compatible" | "openai-chatgpt" | "mock";
 export type ProviderProfileSource = "env" | "builtin" | "user";
 export type ProviderCredentialStatus = "present" | "missing" | "expired" | "not_required";
@@ -212,6 +213,41 @@ export interface ProviderRunOptionSupport {
   reasoningEffort: RunOptionSupport;
   temperature: RunOptionSupport;
   usage: RunOptionSupport;
+}
+
+export type ProviderModelCatalogStatus = "available" | "configured-only" | "unavailable";
+export type ProviderModelCatalogSource = "provider" | "configured" | "builtin";
+export type ProviderModelReasoningSupport = "supported" | "unsupported" | "unknown";
+
+export interface ProviderReasoningEffortOption {
+  value: ReasoningEffort;
+  description?: string;
+}
+
+export interface ProviderModelReasoningCapabilities {
+  support: ProviderModelReasoningSupport;
+  efforts: ProviderReasoningEffortOption[];
+  defaultEffort?: ReasoningEffort;
+}
+
+export interface ProviderModelCatalogItem {
+  id: string;
+  displayName?: string;
+  description?: string;
+  owner?: string;
+  created?: number;
+  reasoning: ProviderModelReasoningCapabilities;
+}
+
+export interface ProviderModelCatalog {
+  providerProfileId: string;
+  status: ProviderModelCatalogStatus;
+  source: ProviderModelCatalogSource;
+  stale: boolean;
+  fetchedAt: ISODateString;
+  warning?: string;
+  customModelAllowed: boolean;
+  models: ProviderModelCatalogItem[];
 }
 
 export interface Session {

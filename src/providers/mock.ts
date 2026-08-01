@@ -1,5 +1,7 @@
 import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput } from "./types";
-import type { ProviderProfile, ProviderTestResponse } from "../shared/types";
+import type { ProviderModelCatalog, ProviderProfile, ProviderTestResponse } from "../shared/types";
+
+export const mockModelId = "mock-stream-v1";
 
 export class MockProvider implements ProviderAdapter {
   readonly id = "mock";
@@ -20,6 +22,25 @@ export class MockProvider implements ProviderAdapter {
       status,
       message: status.message,
       checkedAt
+    };
+  }
+
+  async listModels(profile: ProviderProfile, _credential: ProviderCredential): Promise<ProviderModelCatalog> {
+    return {
+      providerProfileId: profile.id,
+      status: "available",
+      source: "builtin",
+      stale: false,
+      fetchedAt: new Date().toISOString(),
+      customModelAllowed: false,
+      models: [
+        {
+          id: mockModelId,
+          displayName: "Local mock streaming model",
+          description: "Deterministic local fixture model used to verify streaming without provider credentials.",
+          reasoning: { support: "unsupported", efforts: [] }
+        }
+      ]
     };
   }
 

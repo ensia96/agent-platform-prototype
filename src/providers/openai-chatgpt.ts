@@ -1,5 +1,6 @@
 import { refreshOpenAIChatGPTCredential } from "./openai-chatgpt-auth";
 import { extractRunUsage } from "./usage";
+import { normalizeReasoningEffort } from "../shared/run-options";
 import {
   defaultOpenAIChatGPTEndpoint,
   defaultOpenAIChatGPTIssuer,
@@ -22,6 +23,8 @@ import type {
   BuiltContext,
   JsonObject,
   ModelToolDefinition,
+  ProviderModelCatalog,
+  ProviderModelCatalogItem,
   ProviderProfile,
   ProviderStatus,
   ProviderTestResponse,
@@ -29,9 +32,13 @@ import type {
 } from "../shared/types";
 
 const refreshSkewMs = 60_000;
+const modelCatalogTimeoutMs = 15_000;
 const defaultCodexInstructions =
   "You are ChatGPT, a helpful assistant. Answer the user's message directly and concisely unless they ask for more detail.";
 const diagnosticBodyPreviewLimit = 1000;
+export const openAIChatGPTClientVersion = "0.0.0";
+export const openAIChatGPTUserAgent = `agent-platform-prototype/${openAIChatGPTClientVersion}`;
+export const openAIChatGPTOriginator = "agent-platform-prototype";
 
 interface ChatGPTCodexRequestPayload {
   model: string;
@@ -40,6 +47,7 @@ interface ChatGPTCodexRequestPayload {
   stream: true;
   reasoning: {
     summary: "auto";
+    effort?: string;
   };
   tools?: Array<{
     type: "function";
@@ -68,6 +76,7 @@ interface OpenAIChatGPTProviderOptions {
   issuer?: string;
   endpoint?: string;
   clientId?: string;
+  fetch?: typeof fetch;
 }
 
 export class OpenAIChatGPTProvider implements ProviderAdapter {
@@ -78,6 +87,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
   private readonly issuer: string;
   private readonly endpoint: string;
   private readonly clientId?: string;
+  private readonly fetchImpl: typeof fetch;
   private refreshPromise: Promise<OpenAIChatGPTCredential> | null = null;
 
   constructor(options: OpenAIChatGPTProviderOptions) {
@@ -85,6 +95,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     this.issuer = options.issuer?.trim() || defaultOpenAIChatGPTIssuer;
     this.endpoint = options.endpoint?.trim() || defaultOpenAIChatGPTEndpoint;
     this.clientId = options.clientId?.trim() || undefined;
+    this.fetchImpl = options.fetch ?? fetch;
   }
 
   async test(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderTestResponse> {
@@ -155,6 +166,41 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     }
   }
 
+  async listModels(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderModelCatalog> {
+    if (!credential.oauth) {
+      throw new Error("OpenAI ChatGPT authentication is required to list models.");
+    }
+    const usable = await this.ensureUsableCredential(credential.oauth as OpenAIChatGPTCredential);
+    const endpoint = buildOpenAIChatGPTModelsEndpoint(getEndpoint(profile));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), modelCatalogTimeoutMs);
+    try {
+      const response = await this.fetchImpl(endpoint, {
+        method: "GET",
+        headers: buildCodexHeaders(usable, "application/json"),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error(`OpenAI ChatGPT model catalog request failed with status ${response.status} ${response.statusText}.`);
+      }
+      let body: unknown;
+      try {
+        body = (await response.json()) as unknown;
+      } catch {
+        throw new Error("OpenAI ChatGPT model catalog returned invalid JSON.");
+      }
+      return parseOpenAIChatGPTModelCatalog(body, profile.id);
+    } catch (error) {
+      if (isAbortLike(error)) {
+        throw new Error(`OpenAI ChatGPT model catalog request timed out after ${modelCatalogTimeoutMs / 1000}s.`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async run(input: ProviderRunInput, context: ProviderRunContext): Promise<ProviderRunResult> {
     if (!input.credential.oauth) {
       if (input.profile.status.state === "error") {
@@ -165,19 +211,17 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
 
     const credential = await this.ensureUsableCredential(input.credential.oauth as OpenAIChatGPTCredential);
     const endpoint = getEndpoint(input.profile);
-    const headers = new Headers({
-      Authorization: `Bearer ${credential.access}`,
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-      "User-Agent": "agent-platform-prototype/0.0.0",
-      originator: "agent-platform-prototype",
-      "session-id": input.session.id
-    });
-    if (credential.accountId) {
-      headers.set("ChatGPT-Account-Id", credential.accountId);
-    }
+    const headers = buildCodexHeaders(credential, "text/event-stream", input.session.id);
 
     const payload = buildCodexRequestPayload(input);
+    await context.writer.writeMetadata({
+      providerRequestOptions: {
+        provider: this.id,
+        model: payload.model,
+        reasoningSummary: payload.reasoning.summary,
+        reasoningEffort: payload.reasoning.effort ?? null
+      }
+    });
     if ((payload.tools?.length ?? 0) > 0) {
       await context.writer.writeMetadata({
         toolTranslation: {
@@ -199,12 +243,12 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       inputMessages: payload.input.length,
       hasInstructions: payload.instructions.trim().length > 0,
       requestedReasoningEffort: input.requestedRunOptions.reasoningEffort ?? null,
-      reasoningEffortSent: false,
+      reasoningEffortSent: payload.reasoning.effort ?? null,
       reasoningSummaryRequested: payload.reasoning.summary,
       accountIdPresent: Boolean(credential.accountId)
     });
 
-    const response = await fetch(endpoint, {
+    const response = await this.fetchImpl(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
@@ -249,6 +293,142 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
   }
 }
 
+export function buildOpenAIChatGPTModelsEndpoint(responsesEndpoint: string): string {
+  const endpoint = new URL(responsesEndpoint);
+  const marker = "/codex/";
+  const markerIndex = endpoint.pathname.lastIndexOf(marker);
+  if (markerIndex === -1) {
+    throw new Error("OpenAI ChatGPT endpoint must contain a /codex/ path segment to derive the models endpoint.");
+  }
+  endpoint.pathname = `${endpoint.pathname.slice(0, markerIndex + marker.length)}models`;
+  endpoint.search = "";
+  endpoint.searchParams.set("client_version", openAIChatGPTClientVersion);
+  endpoint.hash = "";
+  return endpoint.toString();
+}
+
+export function parseOpenAIChatGPTModelCatalog(
+  value: unknown,
+  providerProfileId: string,
+  fetchedAt = new Date().toISOString()
+): ProviderModelCatalog {
+  if (!isRecord(value) || !Array.isArray(value.models)) {
+    throw new Error("OpenAI ChatGPT model catalog response must contain a models array.");
+  }
+
+  const candidates: Array<{ item: ProviderModelCatalogItem; priority: number; index: number }> = [];
+  for (let index = 0; index < value.models.length; index += 1) {
+    const model = value.models[index];
+    if (!isRecord(model) || model.visibility !== "list") {
+      continue;
+    }
+    const id = catalogIdentifier(model.slug, 200);
+    if (!id) {
+      continue;
+    }
+    const hasReasoningLevelList = Array.isArray(model.supported_reasoning_levels);
+    const efforts = parseChatGPTEfforts(model.supported_reasoning_levels);
+    const defaultEffort = normalizeReasoningEffort(model.default_reasoning_level);
+    const advertisedDefault = defaultEffort && defaultEffort.toLowerCase() !== "ultra" && efforts.some((item) => item.value === defaultEffort)
+      ? defaultEffort
+      : undefined;
+    const displayName = catalogText(model.display_name, 200, false);
+    const description = catalogText(model.description, 1000, true);
+    candidates.push({
+      item: {
+        id,
+        ...(displayName ? { displayName } : {}),
+        ...(description ? { description } : {}),
+        reasoning: {
+          support: efforts.length > 0 ? "supported" : hasReasoningLevelList ? "unsupported" : "unknown",
+          efforts,
+          ...(advertisedDefault ? { defaultEffort: advertisedDefault } : {})
+        }
+      },
+      priority: typeof model.priority === "number" && Number.isFinite(model.priority) ? model.priority : Number.MAX_SAFE_INTEGER,
+      index
+    });
+  }
+
+  candidates.sort((left, right) => left.priority - right.priority || left.index - right.index);
+  const seen = new Set<string>();
+  const models = candidates.flatMap(({ item }) => {
+    if (seen.has(item.id)) {
+      return [];
+    }
+    seen.add(item.id);
+    return [item];
+  });
+
+  return {
+    providerProfileId,
+    status: "available",
+    source: "provider",
+    stale: false,
+    fetchedAt,
+    warning: "Experimental ChatGPT/Codex internal model catalog; availability and response fields may change without notice.",
+    customModelAllowed: true,
+    models
+  };
+}
+
+function parseChatGPTEfforts(value: unknown): Array<{ value: string; description?: string }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const efforts: Array<{ value: string; description?: string }> = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const effort = normalizeReasoningEffort(item.effort);
+    if (!effort || effort.toLowerCase() === "ultra" || seen.has(effort)) {
+      continue;
+    }
+    seen.add(effort);
+    const description = catalogText(item.description, 500, true);
+    efforts.push({ value: effort, ...(description ? { description } : {}) });
+  }
+  return efforts;
+}
+
+function catalogText(value: unknown, maxLength: number, allowNewlines: boolean): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const forbiddenControls = allowNewlines
+    ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u
+    : /[\u0000-\u001f\u007f-\u009f]/u;
+  if (forbiddenControls.test(value)) {
+    return undefined;
+  }
+  const text = value.trim();
+  return text && text.length <= maxLength ? text : undefined;
+}
+
+function catalogIdentifier(value: unknown, maxLength: number): string | undefined {
+  const identifier = catalogText(value, maxLength, false);
+  return typeof value === "string" && value === identifier ? identifier : undefined;
+}
+
+function buildCodexHeaders(credential: OpenAIChatGPTCredential, accept: string, sessionId?: string): Headers {
+  const headers = new Headers({
+    Authorization: `Bearer ${credential.access}`,
+    "Content-Type": "application/json",
+    Accept: accept,
+    "User-Agent": openAIChatGPTUserAgent,
+    originator: openAIChatGPTOriginator
+  });
+  if (sessionId) {
+    headers.set("session-id", sessionId);
+  }
+  if (credential.accountId) {
+    headers.set("ChatGPT-Account-Id", credential.accountId);
+  }
+  return headers;
+}
+
 export function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexRequestPayload {
   const systemInstructions = input.context.messages
     .filter((message) => message.role === "system")
@@ -257,8 +437,6 @@ export function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexR
   const instructions = [defaultCodexInstructions, input.context.systemPrompt.trim(), ...systemInstructions].filter(Boolean).join("\n\n").trim();
   const inputMessages = buildCodexInputMessages(input.context);
 
-  // The ChatGPT/Codex backend's public contract for reasoning effort is not stable.
-  // Keep requested reasoning effort in run metadata for now rather than risking the known-good payload shape.
   const payload: ChatGPTCodexRequestPayload = {
     model: getRunModel(input),
     instructions,
@@ -267,6 +445,10 @@ export function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexR
     reasoning: { summary: "auto" },
     input: inputMessages
   };
+  const reasoningEffort = normalizeReasoningEffort(input.context.runOptions.reasoningEffort);
+  if (reasoningEffort) {
+    payload.reasoning.effort = reasoningEffort;
+  }
   if (input.context.availableTools.length > 0) {
     payload.tools = buildCodexTools(input.context.availableTools);
     payload.tool_choice = "auto";
@@ -1045,6 +1227,10 @@ function trimForDisplay(value: string, maxLength = 500): string {
 
 function toErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortLike(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || /aborted/i.test(error.message));
 }
 
 function createAbortError(): Error {

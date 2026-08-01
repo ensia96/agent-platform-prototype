@@ -10,6 +10,7 @@ import type {
   PermissionListResponse,
   PermissionRequest,
   ProviderListResponse,
+  ProviderModelCatalog,
   ProviderProfile,
   ProviderResolution,
   ReasoningEffort,
@@ -23,6 +24,7 @@ import type {
 import { requestJson, toErrorMessage } from "./api";
 import { ChatHeader } from "./ChatHeader";
 import { compareParts, MessageBody, partText } from "./MessageBody";
+import { reconcileModelOverride, reconcileReasoningEffort, type ModelCatalogLoadState } from "./model-catalog";
 import { RunInspector } from "./RunInspector";
 import { SettingsPanel } from "./SettingsPanel";
 import { shellToolStateFromResponse, type ShellToolState } from "./ToolPanels";
@@ -48,6 +50,9 @@ export function App() {
   const [modelOverride, setModelOverride] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
   const [temperature, setTemperature] = useState("");
+  const [modelCatalog, setModelCatalog] = useState<ProviderModelCatalog | null>(null);
+  const [modelCatalogState, setModelCatalogState] = useState<ModelCatalogLoadState>("idle");
+  const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
   const [lastProviderResolution, setLastProviderResolution] = useState<ProviderResolution | null>(null);
   const [lastRunOptions, setLastRunOptions] = useState<RunOptions | null>(null);
   const [lastRunUsage, setLastRunUsage] = useState<RunUsage | null>(null);
@@ -81,8 +86,17 @@ export function App() {
   const messagesLoadIdRef = useRef(0);
   const selectedSessionIdRef = useRef(selectedSessionId);
   const composerIsComposingRef = useRef(false);
+  const modelCatalogAbortRef = useRef<AbortController | null>(null);
+  const modelCatalogRequestIdRef = useRef(0);
+  const providerProfileIdRef = useRef(providerProfileId);
+  const modelOverrideRef = useRef(modelOverride);
+  const previousActiveTabRef = useRef<Tab>(activeTab);
   selectedSessionIdRef.current = selectedSessionId;
+  providerProfileIdRef.current = providerProfileId;
+  modelOverrideRef.current = modelOverride;
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
+  const selectedProvider = providers.find((profile) => profile.id === providerProfileId) ?? null;
+  const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
 
   useEffect(() => {
     void loadSessions();
@@ -110,11 +124,16 @@ export function App() {
   }, [selectedSessionId, selectedSession?.workingDirectory]);
 
   useEffect(() => {
+    const returningToChat = previousActiveTabRef.current !== "chat" && activeTab === "chat";
+    previousActiveTabRef.current = activeTab;
     if (activeTab === "chat") {
       void loadProviders();
       void loadAgents();
       void loadTools();
       void loadPendingPermissions();
+      if (returningToChat && providerProfileIdRef.current) {
+        void loadProviderModelCatalog(providerProfileIdRef.current);
+      }
     }
   }, [activeTab]);
 
@@ -123,6 +142,26 @@ export function App() {
       setInspectorOpen(true);
     }
   }, [activeTab, pendingPermissions.length]);
+
+  useEffect(() => {
+    modelCatalogAbortRef.current?.abort();
+    setModelCatalog(null);
+    setModelCatalogError(null);
+    setReasoningEffort("");
+    if (!providerProfileId) {
+      setModelCatalogState("idle");
+      return;
+    }
+    void loadProviderModelCatalog(providerProfileId);
+    return () => modelCatalogAbortRef.current?.abort();
+  }, [providerProfileId]);
+
+  useEffect(() => {
+    if (!modelCatalog) {
+      return;
+    }
+    setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, selectedProvider, selectedAgent, modelOverride, current));
+  }, [modelCatalog, modelOverride, selectedAgent, selectedProvider]);
 
   useEffect(() => {
     writeSendOnEnterPreference(sendOnEnter);
@@ -195,6 +234,38 @@ export function App() {
       );
     } catch (requestError) {
       setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function loadProviderModelCatalog(profileId: string, refresh = false) {
+    modelCatalogAbortRef.current?.abort();
+    const controller = new AbortController();
+    modelCatalogAbortRef.current = controller;
+    const requestId = modelCatalogRequestIdRef.current + 1;
+    modelCatalogRequestIdRef.current = requestId;
+    setModelCatalogState("loading");
+    setModelCatalogError(null);
+    try {
+      const query = refresh ? "?refresh=1" : "";
+      const catalog = await requestJson<ProviderModelCatalog>(`/api/providers/${encodeURIComponent(profileId)}/models${query}`, {
+        signal: controller.signal
+      });
+      if (controller.signal.aborted || requestId !== modelCatalogRequestIdRef.current || providerProfileIdRef.current !== profileId) {
+        return;
+      }
+      setModelCatalog(catalog);
+      setModelCatalogState("loaded");
+      const profile = providers.find((item) => item.id === profileId) ?? null;
+      const agent = agents.find((item) => item.id === agentId) ?? null;
+      const nextModelOverride = reconcileModelOverride(catalog, modelOverrideRef.current);
+      setModelOverride(nextModelOverride);
+      setReasoningEffort((current) => reconcileReasoningEffort(catalog, profile, agent, nextModelOverride, current));
+    } catch (requestError) {
+      if (controller.signal.aborted || requestId !== modelCatalogRequestIdRef.current) {
+        return;
+      }
+      setModelCatalogState("error");
+      setModelCatalogError(toErrorMessage(requestError));
     }
   }
 
@@ -713,7 +784,6 @@ export function App() {
     }
   }
 
-  const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
   const shellTool = tools.find((tool) => tool.id === "shell.exec") ?? null;
   const waitingForApproval = Boolean(
     activeRunId && pendingPermissions.some((permission) => !permission.runId || permission.runId === activeRunId)
@@ -776,7 +846,7 @@ export function App() {
           <section className="chatWorkspace">
             <ChatHeader
               session={selectedSession}
-              provider={selectedProviderProfile}
+              provider={selectedProvider}
               modelOverride={modelOverride}
               activeRunId={activeRunId}
               waitingForApproval={waitingForApproval}
@@ -877,7 +947,16 @@ export function App() {
                   reasoningEffort,
                   temperature,
                   disabled: Boolean(activeRunId),
-                  onAgentChange: setAgentId,
+                  modelCatalog,
+                  modelCatalogState,
+                  modelCatalogError,
+                  onRefreshModelCatalog: () => void loadProviderModelCatalog(providerProfileId, true),
+                  onAgentChange: (value) => {
+                    setAgentId(value);
+                    const profile = providers.find((item) => item.id === providerProfileId) ?? null;
+                    const agent = agents.find((item) => item.id === value) ?? null;
+                    setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, profile, agent, modelOverride, current));
+                  },
                   onProviderChange: (value) => {
                     setProviderProfileId(value);
                     setModelOverride("");
@@ -885,7 +964,12 @@ export function App() {
                     setTemperature("");
                     setProviderNotice(null);
                   },
-                  onModelOverrideChange: setModelOverride,
+                  onModelOverrideChange: (value) => {
+                    setModelOverride(value);
+                    const profile = providers.find((item) => item.id === providerProfileId) ?? null;
+                    const agent = agents.find((item) => item.id === agentId) ?? null;
+                    setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, profile, agent, value, current));
+                  },
                   onReasoningEffortChange: setReasoningEffort,
                   onTemperatureChange: setTemperature
                 }}

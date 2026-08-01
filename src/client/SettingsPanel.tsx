@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { defaultShellToolSettings, defaultToolSettings, ToolSettingsValidationError, validateToolSettings } from "../shared/tool-settings";
 import type {
   AgentDefinition,
@@ -10,6 +10,7 @@ import type {
   OpenAIChatGPTAuthStartResponse,
   OpenAIChatGPTLogoutResponse,
   ProviderListResponse,
+  ProviderModelCatalog,
   ProviderProfile,
   ProviderTestResponse,
   RunOptions,
@@ -36,6 +37,11 @@ export function SettingsPanel() {
   const [agentsData, setAgentsData] = useState<AgentListResponse | null>(null);
   const [providerTests, setProviderTests] = useState<Record<string, ProviderTestResponse>>({});
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
+  const [providerModelCatalogs, setProviderModelCatalogs] = useState<Record<string, ProviderModelCatalog>>({});
+  const [providerModelCatalogStates, setProviderModelCatalogStates] = useState<Record<string, LoadState>>({});
+  const [providerModelCatalogErrors, setProviderModelCatalogErrors] = useState<Record<string, string>>({});
+  const providerModelCatalogAbortControllers = useRef(new Map<string, AbortController>());
+  const providerModelCatalogRequestIds = useRef(new Map<string, number>());
   const [chatGPTAuthStart, setChatGPTAuthStart] = useState<OpenAIChatGPTAuthStartResponse | null>(null);
   const [chatGPTAuthPoll, setChatGPTAuthPoll] = useState<OpenAIChatGPTAuthPollResponse | null>(null);
   const [chatGPTAuthBusy, setChatGPTAuthBusy] = useState<"start" | "poll" | "logout" | null>(null);
@@ -54,6 +60,11 @@ export function SettingsPanel() {
 
   useEffect(() => {
     void loadDashboardSettings();
+    return () => {
+      for (const controller of providerModelCatalogAbortControllers.current.values()) {
+        controller.abort();
+      }
+    };
   }, []);
 
   async function loadDashboardSettings() {
@@ -198,6 +209,46 @@ export function SettingsPanel() {
     }
   }
 
+  async function loadProviderModels(profileId: string, refresh: boolean) {
+    providerModelCatalogAbortControllers.current.get(profileId)?.abort();
+    const controller = new AbortController();
+    providerModelCatalogAbortControllers.current.set(profileId, controller);
+    const requestId = (providerModelCatalogRequestIds.current.get(profileId) ?? 0) + 1;
+    providerModelCatalogRequestIds.current.set(profileId, requestId);
+    setProviderModelCatalogStates((current) => ({ ...current, [profileId]: "loading" }));
+    setProviderModelCatalogErrors((current) => omitRecordKey(current, profileId));
+    try {
+      const query = refresh ? "?refresh=1" : "";
+      const catalog = await requestJson<ProviderModelCatalog>(`/api/providers/${encodeURIComponent(profileId)}/models${query}`, {
+        signal: controller.signal
+      });
+      if (controller.signal.aborted || providerModelCatalogRequestIds.current.get(profileId) !== requestId) {
+        return;
+      }
+      setProviderModelCatalogs((current) => ({ ...current, [profileId]: catalog }));
+      setProviderModelCatalogStates((current) => ({ ...current, [profileId]: "idle" }));
+    } catch (requestError) {
+      if (controller.signal.aborted || providerModelCatalogRequestIds.current.get(profileId) !== requestId) {
+        return;
+      }
+      setProviderModelCatalogStates((current) => ({ ...current, [profileId]: "error" }));
+      setProviderModelCatalogErrors((current) => ({ ...current, [profileId]: toErrorMessage(requestError) }));
+    } finally {
+      if (providerModelCatalogAbortControllers.current.get(profileId) === controller) {
+        providerModelCatalogAbortControllers.current.delete(profileId);
+      }
+    }
+  }
+
+  function clearProviderModelCatalog(profileId: string) {
+    providerModelCatalogAbortControllers.current.get(profileId)?.abort();
+    providerModelCatalogAbortControllers.current.delete(profileId);
+    providerModelCatalogRequestIds.current.set(profileId, (providerModelCatalogRequestIds.current.get(profileId) ?? 0) + 1);
+    setProviderModelCatalogs((current) => omitRecordKey(current, profileId));
+    setProviderModelCatalogStates((current) => omitRecordKey(current, profileId));
+    setProviderModelCatalogErrors((current) => omitRecordKey(current, profileId));
+  }
+
   async function startOpenAIChatGPTAuth() {
     setChatGPTAuthBusy("start");
     setChatGPTAuthPoll(null);
@@ -231,6 +282,7 @@ export function SettingsPanel() {
       });
       setChatGPTAuthPoll(result);
       if (result.status === "connected") {
+        clearProviderModelCatalog("openai-chatgpt");
         setChatGPTAuthStart(null);
         await loadDashboardSettings();
       }
@@ -248,6 +300,7 @@ export function SettingsPanel() {
       await requestJson<OpenAIChatGPTLogoutResponse>("/api/providers/openai-chatgpt/logout", { method: "POST" });
       setChatGPTAuthStart(null);
       setChatGPTAuthPoll(null);
+      clearProviderModelCatalog("openai-chatgpt");
       await loadDashboardSettings();
     } catch (requestError) {
       setError(toErrorMessage(requestError));
@@ -487,6 +540,9 @@ export function SettingsPanel() {
           <div className="registryList providerList">
             {providersData?.providers.map((profile) => {
               const testResult = providerTests[profile.id];
+              const modelCatalog = providerModelCatalogs[profile.id];
+              const modelCatalogState = providerModelCatalogStates[profile.id] ?? "idle";
+              const modelCatalogError = providerModelCatalogErrors[profile.id];
               const isOpenAIChatGPT = profile.id === "openai-chatgpt";
               return (
                 <div className="registryItem providerItem" key={profile.id}>
@@ -571,7 +627,20 @@ export function SettingsPanel() {
                         </button>
                       </>
                     )}
+                    <button
+                      onClick={() => void loadProviderModels(profile.id, Boolean(modelCatalog))}
+                      disabled={modelCatalogState === "loading"}
+                    >
+                      {modelCatalogState === "loading" ? "Loading models..." : modelCatalog ? "Refresh models" : "Load models"}
+                    </button>
                   </div>
+                  {modelCatalogError && (
+                    <div className="testResult failure">
+                      <strong>Model catalog unavailable</strong>
+                      <p>{modelCatalogError}</p>
+                    </div>
+                  )}
+                  {modelCatalog && <ProviderModelCatalogPanel catalog={modelCatalog} />}
                   {isOpenAIChatGPT && chatGPTAuthStart && (
                     <div className="authBox">
                       <strong>Device authorization</strong>
@@ -650,6 +719,67 @@ export function SettingsPanel() {
       </div>
     </section>
   );
+}
+
+function ProviderModelCatalogPanel({ catalog }: { catalog: ProviderModelCatalog }) {
+  return (
+    <div className="modelCatalogPanel">
+      <dl className="providerDetails">
+        <dt>Catalog status</dt>
+        <dd>{catalog.status}{catalog.stale ? " · stale" : ""}</dd>
+        <dt>Catalog source</dt>
+        <dd>{catalog.source}</dd>
+        <dt>Fetched</dt>
+        <dd>{formatTimestamp(catalog.fetchedAt)}</dd>
+        <dt>Custom model ID</dt>
+        <dd>{catalog.customModelAllowed ? "allowed" : "catalog choices only"}</dd>
+      </dl>
+      {catalog.warning && <p className="muted">{catalog.warning}</p>}
+      <details open={catalog.models.length <= 12}>
+        <summary>{catalog.models.length} exact model ID{catalog.models.length === 1 ? "" : "s"}</summary>
+        {catalog.models.length > 0 ? (
+          <ul className="modelCatalogList">
+            {catalog.models.map((model) => (
+              <li key={model.id}>
+                <code>{model.id}</code>
+                {model.displayName && model.displayName !== model.id && <span>{model.displayName}</span>}
+                {model.description && <span className="muted">{model.description}</span>}
+                <span className="muted">{formatCatalogReasoning(model.reasoning)}</span>
+                {model.owner && <span className="muted">owner: {model.owner}</span>}
+                {model.created !== undefined && <span className="muted">created: {formatUnixTimestamp(model.created)}</span>}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">No models were advertised.</p>
+        )}
+      </details>
+    </div>
+  );
+}
+
+function formatCatalogReasoning(reasoning: ProviderModelCatalog["models"][number]["reasoning"]): string {
+  if (reasoning.support !== "supported") {
+    return `reasoning: ${reasoning.support}`;
+  }
+  const efforts = reasoning.efforts.map((effort) => effort.value).join(", ") || "no advertised efforts";
+  return `reasoning: ${efforts}${reasoning.defaultEffort ? ` · default ${reasoning.defaultEffort}` : ""}`;
+}
+
+function formatTimestamp(value: string): string {
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.getTime()) ? value : timestamp.toLocaleString();
+}
+
+function formatUnixTimestamp(value: number): string {
+  const timestamp = new Date(value * 1000);
+  return Number.isNaN(timestamp.getTime()) ? String(value) : timestamp.toLocaleString();
+}
+
+function omitRecordKey<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const remaining = { ...record };
+  delete remaining[key];
+  return remaining;
 }
 
 function SettingsNavigation({

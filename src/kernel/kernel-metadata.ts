@@ -1,4 +1,5 @@
 import { defaultMainAgentToolIds } from "../shared/model-tools";
+import { normalizeReasoningEffort } from "../shared/run-options";
 import type { ProviderMessage } from "../providers/types";
 import type {
   AgentDefinition,
@@ -74,7 +75,7 @@ export function buildRunOptionPlan(profile: ProviderProfile, requested: RunOptio
       unsupportedRunOptions.push("temperature");
     }
     if (requestedRunOptions.reasoningEffort) {
-      unsupportedRunOptions.push("reasoningEffort");
+      runOptions.reasoningEffort = requestedRunOptions.reasoningEffort;
     }
     return { requestedRunOptions, runOptions, unsupportedRunOptions };
   }
@@ -101,8 +102,9 @@ function cleanRunOptions(options: RunOptions): RunOptions {
   if (model) {
     output.model = model;
   }
-  if (options.reasoningEffort) {
-    output.reasoningEffort = options.reasoningEffort;
+  const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort);
+  if (reasoningEffort) {
+    output.reasoningEffort = reasoningEffort;
   }
   if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
     output.temperature = options.temperature;

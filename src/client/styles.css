@@ -959,6 +959,42 @@ input {
   overflow-wrap: anywhere;
 }
 
+.modelCatalogPanel {
+  border-top: 1px solid #e2e8f0;
+  margin-top: 12px;
+  padding-top: 10px;
+}
+
+.modelCatalogPanel details > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.modelCatalogList {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+.modelCatalogList li {
+  border-left: 3px solid #dbeafe;
+  min-width: 0;
+  padding-left: 9px;
+}
+
+.registryItem .modelCatalogList code {
+  display: block;
+  margin: 0;
+}
+
+.registryItem .modelCatalogList span {
+  display: block;
+  float: none;
+  margin-top: 2px;
+}
+
 .statusBadge {
   border-radius: 999px;
   padding: 3px 8px;
@@ -1520,6 +1556,18 @@ body {
   line-height: 1.45;
   margin: -3px 0 0;
   overflow-wrap: anywhere;
+}
+
+.catalogStatus {
+  display: grid;
+  gap: 5px;
+}
+
+.catalogStatus .textButton {
+  border: 0;
+  color: #2563eb;
+  justify-self: start;
+  padding: 0;
 }
 
 .runStateRow,

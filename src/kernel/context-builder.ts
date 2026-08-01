@@ -12,6 +12,7 @@ import type {
   RunOptions,
   Session
 } from "../shared/types";
+import { normalizeReasoningEffort } from "../shared/run-options";
 
 export const defaultAgentId = "main";
 
@@ -270,8 +271,9 @@ function cleanRunOptions(options: RunOptions): RunOptions {
   if (model) {
     output.model = model;
   }
-  if (options.reasoningEffort) {
-    output.reasoningEffort = options.reasoningEffort;
+  const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort);
+  if (reasoningEffort) {
+    output.reasoningEffort = reasoningEffort;
   }
   if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
     output.temperature = options.temperature;
