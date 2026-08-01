@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type {
   AgentDefinition,
   AgentListResponse,
@@ -21,19 +21,25 @@ import type {
   ToolListResponse
 } from "../shared/types";
 import { requestJson, toErrorMessage } from "./api";
-import { compareParts, formatUsage, MessageBody, partText } from "./MessageBody";
-import { agentToolIds, formatRunOptions, SettingsPanel } from "./SettingsPanel";
-import { PendingPermissionsPanel, ShellToolPanel, shellToolStateFromResponse, type ShellToolState } from "./ToolPanels";
+import { ChatHeader } from "./ChatHeader";
+import { compareParts, MessageBody, partText } from "./MessageBody";
+import { RunInspector } from "./RunInspector";
+import { SettingsPanel } from "./SettingsPanel";
+import { shellToolStateFromResponse, type ShellToolState } from "./ToolPanels";
 
 type LoadState = "idle" | "loading" | "error";
 type Tab = "chat" | "settings";
 type SaveState = "idle" | "saving" | "saved";
+const INSPECTOR_OVERLAY_QUERY = "(max-width: 1180px)";
+const MESSAGE_BOTTOM_THRESHOLD_PX = 96;
+const COMPOSER_SEND_ON_ENTER_STORAGE_KEY = "agent-platform.composer.sendOnEnter.v1";
 
 export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
+  const [sendOnEnter, setSendOnEnter] = useState(readSendOnEnterPreference);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [agents, setAgents] = useState<AgentDefinition[]>([]);
   const [tools, setTools] = useState<ToolDefinition[]>([]);
@@ -63,7 +69,19 @@ export function App() {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("chat");
+  const [inspectorOpen, setInspectorOpen] = useState(
+    () => typeof window === "undefined" || !window.matchMedia(INSPECTOR_OVERLAY_QUERY).matches
+  );
+  const inspectorModal = useMediaQuery(INSPECTOR_OVERLAY_QUERY);
   const eventsRef = useRef<EventSource | null>(null);
+  const inspectorToggleRef = useRef<HTMLButtonElement>(null);
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const messagesShouldFollowRef = useRef(true);
+  const messagesScrollFrameRef = useRef<number | null>(null);
+  const messagesLoadIdRef = useRef(0);
+  const selectedSessionIdRef = useRef(selectedSessionId);
+  const composerIsComposingRef = useRef(false);
+  selectedSessionIdRef.current = selectedSessionId;
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
 
   useEffect(() => {
@@ -76,11 +94,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    messagesShouldFollowRef.current = true;
     if (!selectedSessionId) {
+      messagesLoadIdRef.current += 1;
       setMessages([]);
       return;
     }
-    void loadMessages(selectedSessionId);
+    void loadMessages(selectedSessionId, true);
   }, [selectedSessionId]);
 
   useEffect(() => {
@@ -98,6 +118,37 @@ export function App() {
     }
   }, [activeTab]);
 
+  useEffect(() => {
+    if (activeTab === "chat" && pendingPermissions.length > 0) {
+      setInspectorOpen(true);
+    }
+  }, [activeTab, pendingPermissions.length]);
+
+  useEffect(() => {
+    writeSendOnEnterPreference(sendOnEnter);
+  }, [sendOnEnter]);
+
+  useEffect(() => {
+    if (activeTab === "chat" && messagesShouldFollowRef.current) {
+      scheduleMessagesToBottom();
+    }
+  }, [activeTab, error, inspectorOpen, messages]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      if (messagesShouldFollowRef.current) {
+        scheduleMessagesToBottom();
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      if (messagesScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(messagesScrollFrameRef.current);
+      }
+    };
+  }, []);
+
   async function loadSessions() {
     setLoadState("loading");
     setError(null);
@@ -112,12 +163,26 @@ export function App() {
     }
   }
 
-  async function loadMessages(sessionId: string) {
+  async function loadMessages(sessionId: string, followAfterLoad = false) {
+    if (sessionId !== selectedSessionIdRef.current) {
+      return;
+    }
+    const loadId = messagesLoadIdRef.current + 1;
+    messagesLoadIdRef.current = loadId;
     setError(null);
     try {
-      setMessages(await requestJson<Message[]>(`/api/sessions/${sessionId}/messages`));
+      const nextMessages = await requestJson<Message[]>(`/api/sessions/${sessionId}/messages`);
+      if (loadId !== messagesLoadIdRef.current || sessionId !== selectedSessionIdRef.current) {
+        return;
+      }
+      if (followAfterLoad) {
+        messagesShouldFollowRef.current = true;
+      }
+      setMessages(nextMessages);
     } catch (requestError) {
-      setError(toErrorMessage(requestError));
+      if (loadId === messagesLoadIdRef.current && sessionId === selectedSessionIdRef.current) {
+        setError(toErrorMessage(requestError));
+      }
     }
   }
 
@@ -210,6 +275,7 @@ export function App() {
     let sessionId = selectedSessionId;
     try {
       const runOptions = buildRunOptionsFromForm(modelOverride, reasoningEffort, temperature);
+      followLatestMessages();
       if (!sessionId) {
         const session = await requestJson<Session>("/api/sessions", { method: "POST" });
         setSessions((current) => [session, ...current]);
@@ -584,6 +650,59 @@ export function App() {
     );
   }
 
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const nativeEvent = event.nativeEvent;
+    if (composerIsComposingRef.current || nativeEvent.isComposing || nativeEvent.keyCode === 229) {
+      return;
+    }
+    if (event.key !== "Enter" || event.altKey) {
+      return;
+    }
+
+    const usesSubmitShortcut = event.ctrlKey || event.metaKey;
+    const usesPlainEnter = sendOnEnter && !event.shiftKey;
+    if (!usesSubmitShortcut && !usesPlainEnter) {
+      return;
+    }
+    if (event.repeat) {
+      event.preventDefault();
+      return;
+    }
+
+    event.preventDefault();
+    event.currentTarget.form?.requestSubmit();
+  }
+
+  function handleMessagesScroll() {
+    const container = messagesScrollRef.current;
+    if (!container) {
+      return;
+    }
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    messagesShouldFollowRef.current = distanceFromBottom <= MESSAGE_BOTTOM_THRESHOLD_PX;
+  }
+
+  function followLatestMessages() {
+    messagesShouldFollowRef.current = true;
+    scheduleMessagesToBottom();
+  }
+
+  function scheduleMessagesToBottom() {
+    if (messagesScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(messagesScrollFrameRef.current);
+    }
+    messagesScrollFrameRef.current = window.requestAnimationFrame(() => {
+      messagesScrollFrameRef.current = null;
+      if (!messagesShouldFollowRef.current) {
+        return;
+      }
+      const container = messagesScrollRef.current;
+      if (container) {
+        container.scrollTop = container.scrollHeight;
+      }
+    });
+  }
+
   function openRunEventsIfAgentResume(response: InvokeToolResponse) {
     if (response.run.provider.startsWith("tool:")) {
       return;
@@ -594,16 +713,23 @@ export function App() {
     }
   }
 
-  const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
   const selectedProviderProfile = providers.find((profile) => profile.id === providerProfileId) ?? null;
   const shellTool = tools.find((tool) => tool.id === "shell.exec") ?? null;
+  const waitingForApproval = Boolean(
+    activeRunId && pendingPermissions.some((permission) => !permission.runId || permission.runId === activeRunId)
+  );
 
   return (
-    <main className="appShell">
+    <main
+      className={`appShell ${activeTab === "chat" ? `chatLayout ${inspectorOpen ? "inspectorOpen" : "inspectorClosed"}` : "settingsLayout"}`}
+    >
       <aside className="sidebar">
         <div className="sidebarHeader">
-          <h1>Prototype</h1>
-          {activeTab === "chat" && <button onClick={createSession}>New</button>}
+          <div>
+            <span className="eyebrow">Local workspace</span>
+            <h1>Agent Platform</h1>
+          </div>
+          {activeTab === "chat" && <button onClick={createSession}>New session</button>}
         </div>
 
         <nav className="tabList" aria-label="Dashboard sections">
@@ -616,7 +742,11 @@ export function App() {
         </nav>
 
         {activeTab === "chat" ? (
-          <>
+          <section className="sidebarSessions" aria-label="Sessions">
+            <div className="sidebarSectionHeading">
+              <strong>Sessions</strong>
+              <span>{sessions.length}</span>
+            </div>
             {loadState === "loading" && <p className="muted">Loading sessions...</p>}
             <div className="sessionList">
               {sessions.map((session) => (
@@ -624,222 +754,191 @@ export function App() {
                   className={session.id === selectedSessionId ? "session active" : "session"}
                   key={session.id}
                   onClick={() => setSelectedSessionId(session.id)}
+                  aria-current={session.id === selectedSessionId ? "page" : undefined}
                 >
-                  <strong>{session.title}</strong>
-                  <span className="sessionCwd monospace">{session.workingDirectory}</span>
-                  <span>{new Date(session.updatedAt).toLocaleString()}</span>
+                  <strong className="sessionTitle">{session.title}</strong>
+                  <span className="sessionCwd monospace" title={session.workingDirectory}>
+                    {session.workingDirectory}
+                  </span>
+                  <span className="sessionUpdated">Updated {new Date(session.updatedAt).toLocaleDateString()}</span>
                 </button>
               ))}
+              {loadState !== "loading" && sessions.length === 0 && <p className="muted sidebarEmpty">No sessions yet.</p>}
             </div>
-          </>
+          </section>
         ) : (
           <p className="muted sidebarNote">Daemon lifecycle stays in the CLI. Settings and registries live here.</p>
         )}
       </aside>
 
       {activeTab === "chat" ? (
-        <section className="chatPane">
-        <header className="chatHeader">
-          <div>
-            <h2>{selectedSession?.title ?? "No session"}</h2>
-            <p className="muted">SQLite-backed local chat with SSE streaming.</p>
-          </div>
-          <div className="chatControls">
-            <div className="agentPicker">
-              <label>
-                Agent
-                <select value={agentId || "main"} onChange={(event) => setAgentId(event.target.value)} disabled={Boolean(activeRunId)}>
-                  {agents.length > 0 ? (
-                    agents.map((agent) => (
-                      <option key={agent.id} value={agent.id}>
-                        {agent.name} ({agent.id})
-                      </option>
-                    ))
-                  ) : (
-                    <option value="main">Mango (main)</option>
-                  )}
-                </select>
-              </label>
-              <p className="muted providerSummary">
-                {selectedAgent
-                  ? `System prompt: ${selectedAgent.systemPrompt.slice(0, 96)}${selectedAgent.systemPrompt.length > 96 ? "…" : ""} · tools: ${agentToolIds(selectedAgent).join(", ") || "none"}`
-                  : "Main agent"}
-              </p>
+        <>
+          <section className="chatWorkspace">
+            <ChatHeader
+              session={selectedSession}
+              provider={selectedProviderProfile}
+              modelOverride={modelOverride}
+              activeRunId={activeRunId}
+              waitingForApproval={waitingForApproval}
+              lastProviderResolution={lastProviderResolution}
+              lastUnsupportedRunOptions={lastUnsupportedRunOptions}
+              inspectorOpen={inspectorOpen}
+              inspectorModal={inspectorModal}
+              pendingPermissionCount={pendingPermissions.length}
+              inspectorToggleRef={inspectorToggleRef}
+              onToggleInspector={() => setInspectorOpen((current) => !current)}
+            />
+
+            {error && (
+              <div className="chatAlertArea">
+                <div className="error">{error}</div>
+              </div>
+            )}
+
+            <div className="messages" ref={messagesScrollRef} onScroll={handleMessagesScroll}>
+              <div className="messageStream">
+                {messages.length === 0 && <p className="muted empty">Create a session and send a message.</p>}
+                {messages.map((message) => (
+                  <article className={`message ${message.role}`} key={message.id}>
+                    <div className="messageMeta">
+                      <strong>{message.role}</strong>
+                      <span>{message.status}</span>
+                    </div>
+                    <MessageBody message={message} />
+                  </article>
+                ))}
+              </div>
             </div>
 
-            <div className="providerPicker">
-              <label>
-                Provider
-                <select
-                  value={providerProfileId || "mock"}
-                  onChange={(event) => {
-                    setProviderProfileId(event.target.value);
+            <form
+              className="composer"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void startRun();
+              }}
+            >
+              <div className="composerInner">
+                <textarea
+                  value={input}
+                  placeholder="Send a message..."
+                  onChange={(event) => setInput(event.target.value)}
+                  onCompositionStart={() => {
+                    composerIsComposingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    composerIsComposingRef.current = false;
+                  }}
+                  onKeyDown={handleComposerKeyDown}
+                  disabled={Boolean(activeRunId)}
+                  rows={3}
+                />
+                <div className="composerActions">
+                  <label className="composerPreference">
+                    <input
+                      type="checkbox"
+                      checked={sendOnEnter}
+                      aria-describedby="composer-keyboard-hint"
+                      onChange={(event) => setSendOnEnter(event.target.checked)}
+                    />
+                    <span>Enter로 전송</span>
+                  </label>
+                  <span className="composerKeyboardHint" id="composer-keyboard-hint">
+                    {sendOnEnter ? "Shift+Enter 줄바꿈" : "Ctrl/⌘+Enter 전송"}
+                  </span>
+                  {activeRunId ? (
+                    <button type="button" onClick={cancelRun}>
+                      Cancel
+                    </button>
+                  ) : (
+                    <button type="submit" disabled={!input.trim()}>
+                      Run
+                    </button>
+                  )}
+                </div>
+              </div>
+            </form>
+          </section>
+
+          {inspectorOpen && (
+            <>
+              {inspectorModal && (
+                <button type="button" className="inspectorBackdrop" aria-label="Close run inspector" onClick={() => setInspectorOpen(false)} />
+              )}
+              <RunInspector
+                onClose={() => setInspectorOpen(false)}
+                modal={inspectorModal}
+                returnFocusRef={inspectorToggleRef}
+                setup={{
+                  agents,
+                  agentId,
+                  providers,
+                  providerProfileId,
+                  modelOverride,
+                  reasoningEffort,
+                  temperature,
+                  disabled: Boolean(activeRunId),
+                  onAgentChange: setAgentId,
+                  onProviderChange: (value) => {
+                    setProviderProfileId(value);
                     setModelOverride("");
                     setReasoningEffort("");
                     setTemperature("");
                     setProviderNotice(null);
-                  }}
-                  disabled={Boolean(activeRunId)}
-                >
-                  {providers.length > 0 ? (
-                    providers.map((profile) => (
-                      <option key={profile.id} value={profile.id}>
-                        {providerOptionLabel(profile)}
-                      </option>
-                    ))
-                  ) : (
-                    <>
-                      <option value="mock">mock</option>
-                      <option value="openai-compatible">openai-compatible</option>
-                    </>
-                  )}
-                </select>
-              </label>
-              {selectedProviderProfile && (
-                <p className="muted providerSummary">
-                  {selectedProviderProfile.type}
-                  {selectedProviderProfile.model ? ` · default ${selectedProviderProfile.model}` : ""} · {selectedProviderProfile.status.state}
-                </p>
-              )}
-            </div>
-
-            <div className="runOptionsPanel" aria-label="Run options">
-              <label>
-                Model override
-                <input
-                  value={modelOverride}
-                  onChange={(event) => setModelOverride(event.target.value)}
-                  placeholder={selectedProviderProfile?.model ?? "provider default"}
-                  disabled={Boolean(activeRunId)}
-                />
-              </label>
-              <label>
-                Reasoning effort
-                <select
-                  value={reasoningEffort}
-                  onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort | "")}
-                  disabled={Boolean(activeRunId)}
-                >
-                  <option value="">provider/default</option>
-                  <option value="minimal">minimal</option>
-                  <option value="low">low</option>
-                  <option value="medium">medium</option>
-                  <option value="high">high</option>
-                  <option value="xhigh">xhigh</option>
-                </select>
-              </label>
-              <label>
-                Temperature
-                <input
-                  type="number"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  value={temperature}
-                  onChange={(event) => setTemperature(event.target.value)}
-                  placeholder="default"
-                  disabled={Boolean(activeRunId)}
-                />
-              </label>
-              <p className="muted runOptionsNote">
-                Experimental: unsupported options are kept as metadata only. Raw thinking is not stored or shown.
-              </p>
-            </div>
-          </div>
-        </header>
-
-        <div className="chatBanners">
-          <SessionWorkingDirectoryPanel
-            session={selectedSession}
-            value={workingDirectoryDraft}
-            state={workingDirectorySaveState}
-            error={workingDirectoryError}
-            disabled={Boolean(activeRunId)}
-            onChange={(value) => {
-              setWorkingDirectoryDraft(value);
-              setWorkingDirectorySaveState("idle");
-              setWorkingDirectoryError(null);
-            }}
-            onSave={() => void saveSessionWorkingDirectory()}
-          />
-          {providerNotice && <div className="providerNotice">{providerNotice}</div>}
-          {lastProviderResolution && (
-            <div className="providerRunMeta">
-              Last run: {lastProviderResolution.providerProfileName} ({lastProviderResolution.providerType}
-              {lastProviderResolution.model ? ` · ${lastProviderResolution.model}` : ""})
-              {formatRunOptions(lastRunOptions) ? ` · options: ${formatRunOptions(lastRunOptions)}` : ""}
-              {lastUnsupportedRunOptions.length > 0 ? ` · metadata-only: ${lastUnsupportedRunOptions.join(", ")}` : ""}
-              {lastRunUsage ? ` · usage: ${formatUsage(lastRunUsage)}` : ""}
-            </div>
+                  },
+                  onModelOverrideChange: setModelOverride,
+                  onReasoningEffortChange: setReasoningEffort,
+                  onTemperatureChange: setTemperature
+                }}
+                sessionContext={{
+                  session: selectedSession,
+                  workingDirectoryDraft,
+                  saveState: workingDirectorySaveState,
+                  error: workingDirectoryError,
+                  disabled: Boolean(activeRunId),
+                  onWorkingDirectoryChange: (value) => {
+                    setWorkingDirectoryDraft(value);
+                    setWorkingDirectorySaveState("idle");
+                    setWorkingDirectoryError(null);
+                  },
+                  onSaveWorkingDirectory: () => void saveSessionWorkingDirectory()
+                }}
+                runStatus={{
+                  activeRunId,
+                  waitingForApproval,
+                  providerNotice,
+                  lastProviderResolution,
+                  lastRunOptions,
+                  lastRunUsage,
+                  lastUnsupportedRunOptions
+                }}
+                permissions={{
+                  items: pendingPermissions,
+                  busyRequestId: permissionActionId,
+                  onRefresh: () => void loadPendingPermissions(),
+                  onApprove: (requestId) => void approvePermission(requestId),
+                  onDeny: (requestId) => void denyPermission(requestId)
+                }}
+                advanced={{
+                  contextPreview,
+                  contextPreviewState,
+                  onPreviewContext: () => void previewContext(),
+                  shellTool,
+                  sessionWorkingDirectory: selectedSession?.workingDirectory ?? null,
+                  shellCommand,
+                  shellCwd,
+                  shellTimeoutMs,
+                  shellToolState,
+                  lastShellResponse,
+                  shellDisabled: Boolean(activeRunId),
+                  onShellCommandChange: setShellCommand,
+                  onShellCwdChange: setShellCwd,
+                  onShellTimeoutChange: setShellTimeoutMs,
+                  onRunShell: () => void executeShellTool()
+                }}
+              />
+            </>
           )}
-          {error && <div className="error">{error}</div>}
-          {contextPreview && <ContextPreviewPanel preview={contextPreview} />}
-          <PendingPermissionsPanel
-            permissions={pendingPermissions}
-            busyRequestId={permissionActionId}
-            onRefresh={() => void loadPendingPermissions()}
-            onApprove={(requestId) => void approvePermission(requestId)}
-            onDeny={(requestId) => void denyPermission(requestId)}
-          />
-          <ShellToolPanel
-            tool={shellTool}
-            sessionWorkingDirectory={selectedSession?.workingDirectory ?? null}
-            command={shellCommand}
-            cwd={shellCwd}
-            timeoutMs={shellTimeoutMs}
-            state={shellToolState}
-            lastResponse={lastShellResponse}
-            disabled={Boolean(activeRunId)}
-            onCommandChange={setShellCommand}
-            onCwdChange={setShellCwd}
-            onTimeoutChange={setShellTimeoutMs}
-            onRun={() => void executeShellTool()}
-          />
-        </div>
-
-        <div className="messages">
-          {messages.length === 0 && <p className="muted empty">Create a session and send a message.</p>}
-          {messages.map((message) => (
-            <article className={`message ${message.role}`} key={message.id}>
-              <div className="messageMeta">
-                <strong>{message.role}</strong>
-                <span>{message.status}</span>
-              </div>
-              <MessageBody message={message} />
-            </article>
-          ))}
-        </div>
-
-        <form
-          className="composer"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void startRun();
-          }}
-        >
-          <textarea
-            value={input}
-            placeholder="Send a message..."
-            onChange={(event) => setInput(event.target.value)}
-            disabled={Boolean(activeRunId)}
-            rows={3}
-          />
-          <div className="composerActions">
-            <button type="button" onClick={() => void previewContext()} disabled={Boolean(activeRunId) || contextPreviewState === "loading"}>
-              {contextPreviewState === "loading" ? "Previewing..." : "Context Preview"}
-            </button>
-            {activeRunId ? (
-              <button type="button" onClick={cancelRun}>
-                Cancel
-              </button>
-            ) : (
-              <button type="submit" disabled={!input.trim()}>
-                Run
-              </button>
-            )}
-          </div>
-        </form>
-        </section>
+        </>
       ) : (
         <SettingsPanel />
       )}
@@ -847,122 +946,40 @@ export function App() {
   );
 }
 
-function SessionWorkingDirectoryPanel({
-  session,
-  value,
-  state,
-  error,
-  disabled,
-  onChange,
-  onSave
-}: {
-  session: Session | null;
-  value: string;
-  state: SaveState;
-  error: string | null;
-  disabled: boolean;
-  onChange: (value: string) => void;
-  onSave: () => void;
-}) {
-  const saving = state === "saving";
-  const changed = Boolean(session) && value.trim() !== session?.workingDirectory;
-  return (
-    <section className="workingDirectoryPanel">
-      <div>
-        <strong>Session working directory</strong>
-        <p className="muted monospace">{session?.workingDirectory ?? "No session selected"}</p>
-      </div>
-      <form
-        className="workingDirectoryForm"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onSave();
-        }}
-      >
-        <label>
-          cwd
-          <input
-            value={value}
-            onChange={(event) => onChange(event.target.value)}
-            placeholder="/absolute/project/path"
-            disabled={!session || disabled || saving}
-          />
-        </label>
-        <button type="submit" disabled={!session || disabled || saving || !value.trim() || !changed}>
-          {saving ? "Saving..." : "Save cwd"}
-        </button>
-      </form>
-      <p className="muted workingDirectoryHint">
-        shell.exec without cwd uses this path; relative shell cwd values resolve from it.
-      </p>
-      {error && <div className="inlineError">{error}</div>}
-      {state === "saved" && !error && <div className="inlineSuccess">Saved.</div>}
-    </section>
-  );
+function readSendOnEnterPreference(): boolean {
+  if (typeof window === "undefined") {
+    return true;
+  }
+  try {
+    return window.localStorage.getItem(COMPOSER_SEND_ON_ENTER_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
 }
 
-function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
-  return (
-    <details className="contextPreview" open>
-      <summary>
-        Context preview · {preview.context.agent.name} · {preview.context.messages.length} messages · {preview.providerResolution.providerProfileName}
-      </summary>
-      <div className="contextPreviewGrid">
-        <section>
-          <h4>System prompt</h4>
-          <pre>{preview.context.systemPrompt}</pre>
-        </section>
-        <section>
-          <h4>Run options</h4>
-          <pre>{JSON.stringify(preview.context.runOptions, null, 2)}</pre>
-        </section>
-        <section>
-          <h4>Working directory</h4>
-          <pre>{preview.context.workingDirectory}</pre>
-        </section>
-        <section>
-          <h4>Available tools</h4>
-          {preview.context.availableTools.length === 0 ? (
-            <p className="muted">No model tools available.</p>
-          ) : (
-            <ul className="contextToolList">
-              {preview.context.availableTools.map((tool) => (
-                <li key={tool.id}>
-                  <strong>{tool.id}</strong> <span className="muted">as {tool.providerName}</span>
-                  <p>{tool.description}</p>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-        <section className="contextMessagesPreview">
-          <h4>Messages</h4>
-          {preview.context.messages.length === 0 ? (
-            <p className="muted">No text messages in context.</p>
-          ) : (
-            preview.context.messages.map((message, index) => (
-              <div className="contextMessage" key={`${message.messageId ?? "current"}-${index}`}>
-                <strong>
-                  {index + 1}. {message.role}
-                  {message.source ? ` · ${message.source}` : ""}
-                </strong>
-                {message.parts && message.parts.length > 0 && (
-                  <span className="muted contextPartTypes">parts: {message.parts.map((part) => part.type).join(", ")}</span>
-                )}
-                <pre>{message.content}</pre>
-              </div>
-            ))
-          )}
-        </section>
-      </div>
-      {preview.warnings.length > 0 && <p className="muted">Warnings: {preview.warnings.join(" ")}</p>}
-    </details>
-  );
+function writeSendOnEnterPreference(sendOnEnter: boolean) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(COMPOSER_SEND_ON_ENTER_STORAGE_KEY, String(sendOnEnter));
+  } catch {
+    return;
+  }
 }
 
-function providerOptionLabel(profile: ProviderProfile): string {
-  const model = profile.model ? ` · ${profile.model}` : "";
-  return `${profile.name}${model} · ${profile.status.state}`;
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => typeof window !== "undefined" && window.matchMedia(query).matches);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia(query);
+    const updateMatch = () => setMatches(mediaQuery.matches);
+    updateMatch();
+    mediaQuery.addEventListener("change", updateMatch);
+    return () => mediaQuery.removeEventListener("change", updateMatch);
+  }, [query]);
+
+  return matches;
 }
 
 function buildRunOptionsFromForm(modelOverride: string, reasoningEffort: ReasoningEffort | "", temperature: string): RunOptions {

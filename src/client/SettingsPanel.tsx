@@ -19,6 +19,15 @@ import type {
 import { requestJson, toErrorMessage } from "./api";
 
 type LoadState = "idle" | "loading" | "error";
+type SettingsSection = "providers" | "agent" | "tools" | "system" | "advanced";
+
+const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
+  { id: "providers", label: "Providers & Models", description: "Provider profiles, runtime status, authentication, and model defaults." },
+  { id: "agent", label: "Agent", description: "Main agent identity, system prompt, and model tool access." },
+  { id: "tools", label: "Tools & Permissions", description: "shell.exec policy, approval rules, timeout, and output limits." },
+  { id: "system", label: "System", description: "Daemon health and persisted application settings." },
+  { id: "advanced", label: "Advanced", description: "Adapter registry and future runtime integration points." }
+];
 
 export function SettingsPanel() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
@@ -41,6 +50,7 @@ export function SettingsPanel() {
   const [saveState, setSaveState] = useState<LoadState>("idle");
   const [agentSaveState, setAgentSaveState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<SettingsSection>("providers");
 
   useEffect(() => {
     void loadDashboardSettings();
@@ -259,6 +269,8 @@ export function SettingsPanel() {
     }
   }
 
+  const activeSectionDefinition = settingsSections.find((section) => section.id === activeSection)!;
+
   return (
     <section className="settingsPane">
       <header className="settingsHeader">
@@ -274,8 +286,17 @@ export function SettingsPanel() {
       {error && <div className="error">{error}</div>}
       {loadState === "loading" && <p className="muted settingsLoading">Loading settings...</p>}
 
-      <div className="settingsGrid">
-        <article className="settingsCard">
+      <div className="settingsWorkspace">
+        <SettingsNavigation activeSection={activeSection} onChange={setActiveSection} />
+        <section className="settingsSectionContent" aria-labelledby={`settings-${activeSection}-title`}>
+          <header className="settingsSectionHeader">
+            <span className="eyebrow">Settings area</span>
+            <h3 id={`settings-${activeSection}-title`}>{activeSectionDefinition.label}</h3>
+            <p className="muted">{activeSectionDefinition.description}</p>
+          </header>
+          <div className={`settingsSectionCards section-${activeSection}`}>
+        {activeSection === "system" && (
+          <article className="settingsCard">
           <h3>Daemon status</h3>
           {status ? (
             <dl className="statusGrid">
@@ -299,9 +320,11 @@ export function SettingsPanel() {
           ) : (
             <p className="muted">No daemon status loaded yet.</p>
           )}
-        </article>
+          </article>
+        )}
 
-        <article className="settingsCard toolSettingsCard">
+        {activeSection === "tools" && (
+          <article className="settingsCard toolSettingsCard">
           <div className="cardHeaderRow">
             <h3>Tool Settings</h3>
             <span className="muted">shell.exec policy and shell settings</span>
@@ -407,9 +430,11 @@ export function SettingsPanel() {
               Reset to default allow
             </button>
           </div>
-        </article>
+          </article>
+        )}
 
-        <article className="settingsCard agentSettingsCard">
+        {activeSection === "agent" && (
+          <article className="settingsCard agentSettingsCard">
           <div className="cardHeaderRow">
             <h3>Main Agent</h3>
             {agentsData && <span className="muted">default: {agentsData.defaultAgentId}</span>}
@@ -450,9 +475,11 @@ export function SettingsPanel() {
             <dt>Tools</dt>
             <dd>{agentToolIds(agentsData?.agents.find((agent) => agent.id === "main") ?? { id: "main", toolIds: [] }).join(", ") || "none"}</dd>
           </dl>
-        </article>
+          </article>
+        )}
 
-        <article className="settingsCard">
+        {activeSection === "providers" && (
+          <article className="settingsCard">
           <div className="cardHeaderRow">
             <h3>Providers</h3>
             {providersData && <span className="muted">default: {providersData.defaultProviderProfileId}</span>}
@@ -587,9 +614,11 @@ export function SettingsPanel() {
               );
             }) ?? <p className="muted">No provider profile data loaded yet.</p>}
           </div>
-        </article>
+          </article>
+        )}
 
-        <article className="settingsCard">
+        {activeSection === "advanced" && (
+          <article className="settingsCard">
           <h3>Adapter registry</h3>
           <div className="registryList">
             {settingsData?.adapters.map((adapter) => (
@@ -600,9 +629,11 @@ export function SettingsPanel() {
               </div>
             )) ?? <p className="muted">No adapter registry data loaded yet.</p>}
           </div>
-        </article>
+          </article>
+        )}
 
-        <article className="settingsCard">
+        {activeSection === "system" && (
+          <article className="settingsCard">
           <h3>Stored app settings</h3>
           <label className="settingEditor">
             Instance label
@@ -612,9 +643,36 @@ export function SettingsPanel() {
             Save label
           </button>
           <pre className="settingsJson">{JSON.stringify(settingsData?.settings ?? {}, null, 2)}</pre>
-        </article>
+          </article>
+        )}
+          </div>
+        </section>
       </div>
     </section>
+  );
+}
+
+function SettingsNavigation({
+  activeSection,
+  onChange
+}: {
+  activeSection: SettingsSection;
+  onChange: (section: SettingsSection) => void;
+}) {
+  return (
+    <nav className="settingsSectionNav" aria-label="Settings sections">
+      {settingsSections.map((section) => (
+        <button
+          type="button"
+          key={section.id}
+          className={section.id === activeSection ? "settingsSectionTab active" : "settingsSectionTab"}
+          aria-pressed={section.id === activeSection}
+          onClick={() => onChange(section.id)}
+        >
+          {section.label}
+        </button>
+      ))}
+    </nav>
   );
 }
 
