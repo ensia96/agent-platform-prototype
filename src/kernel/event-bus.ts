@@ -12,7 +12,15 @@ export class RunEventBus {
     }
 
     for (const listener of listeners) {
-      listener(event);
+      try {
+        listener(event);
+      } catch (error) {
+        console.error("Run event listener failed", {
+          runId: event.runId,
+          eventType: event.type,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
   }
 

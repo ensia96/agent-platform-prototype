@@ -5,12 +5,10 @@ import { resolve } from "node:path";
 import { buildContext, defaultAgentId } from "./context-builder";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import {
-  agentToJson,
   booleanField,
   buildContextRunMetadata,
   buildRunMetadata,
   buildRunOptionPlan,
-  contextSummaryToJson,
   effectiveAgentToolIds,
   mergeRunOptions,
   numberField,
@@ -19,6 +17,13 @@ import {
   toProviderMessages
 } from "./kernel-metadata";
 import { RunWriter } from "./run-writer";
+import {
+  toPublicMessage,
+  toPublicProviderResolution,
+  toPublicRunEvent,
+  toPublicToolExecutionResult,
+  toPublicToolInvocation
+} from "./public-projection";
 import {
   appendLimitedText,
   buildPermissionBlockedResult,
@@ -38,12 +43,13 @@ import {
 } from "./tool-execution";
 import type { ProviderAdapter, ProviderRunInput, ProviderToolCall } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
-import type { StoreAdapter, StoredPermissionRequest, UpdateAgentDefinitionInput } from "../store/types";
+import type { CreateRunInput, StoreAdapter, StoredPermissionRequest, UpdateAgentDefinitionInput } from "../store/types";
+import { ActiveRunExistsStoreError } from "../store/types";
 import { providerToolNameToToolId, toModelToolDefinition } from "../shared/model-tools";
 import { normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
 import { evaluateToolPermission, type ToolPermissionEvaluation } from "../tools/permission-policy";
 import type { ToolRegistry } from "../tools/registry";
-import { ToolInputError, type RegisteredTool } from "../tools/types";
+import { ToolExecutionAbortError, ToolInputError, type RegisteredTool } from "../tools/types";
 import type {
   AgentDefinition,
   BuiltContext,
@@ -55,6 +61,8 @@ import type {
   MessagePart,
   PermissionRequest,
   PermissionRequestStatus,
+  PublicRunPhase,
+  PublicRunSummary,
   ProviderResolution,
   Run,
   RunEvent,
@@ -70,6 +78,7 @@ import type {
   ToolSettings,
   ToolResultStatus
 } from "../shared/types";
+import { ACTIVE_RUN_STATUSES, isTerminalRunStatus } from "../shared/types";
 
 export interface StartRunOptions {
   agentId?: string;
@@ -108,12 +117,38 @@ interface PreparedToolInvocation {
   resumeAgentRun: boolean;
   toolLoopIteration?: number;
   providerToolCallName?: string;
+  execution: RunExecution;
+}
+
+type RunExecutionPhase = "idle" | "provider" | "tool" | "waiting_permission";
+type RunTermination = "cancelled" | "interrupted";
+
+interface RunExecution {
+  runId: string;
+  controller: AbortController;
+  phase: RunExecutionPhase;
+  providerId: string | null;
+  toolId: string | null;
+  termination: RunTermination | null;
+  activePromise: Promise<unknown> | null;
 }
 
 export class KernelError extends Error {
-  constructor(message: string, readonly statusCode = 500) {
+  constructor(
+    message: string,
+    readonly statusCode = 500,
+    readonly code?: string,
+    readonly details?: Record<string, unknown>
+  ) {
     super(message);
     this.name = "KernelError";
+  }
+}
+
+class RunTerminationError extends Error {
+  constructor(readonly termination: RunTermination) {
+    super(termination === "cancelled" ? "Run cancelled." : "Run interrupted.");
+    this.name = "AbortError";
   }
 }
 
@@ -132,7 +167,8 @@ export class Kernel {
   private readonly eventBus: RunEventBus;
   private readonly tools: ToolRegistry;
   private readonly defaultWorkingDirectory: string;
-  private readonly controllers = new Map<string, AbortController>();
+  private readonly executions = new Map<string, RunExecution>();
+  private shuttingDown = false;
 
   constructor(options: KernelOptions) {
     this.store = options.store;
@@ -179,7 +215,7 @@ export class Kernel {
 
   listMessages(sessionId: string): Message[] {
     this.getSession(sessionId);
-    return this.store.listMessages(sessionId);
+    return this.store.listMessages(sessionId).map(toPublicMessage);
   }
 
   listTools(): ToolDefinition[] {
@@ -187,14 +223,44 @@ export class Kernel {
   }
 
   async invokeTool(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions = {}): Promise<InvokeToolResponse> {
+    this.assertAcceptingWork();
     const prepared = this.prepareToolInvocation(sessionId, toolId, input, options);
     if (prepared.permission.decision === "allowed") {
-      return this.executePreparedToolInvocation(prepared, { state: "executed" });
+      return this.trackExecution(prepared.execution, () => this.executePreparedToolInvocation(prepared, { state: "executed" }));
     }
     if (prepared.permission.decision === "requires_approval") {
       return this.createPendingPermissionResponse(prepared);
     }
-    return this.denyPreparedToolInvocation(prepared, null);
+    const response = this.denyPreparedToolInvocation(prepared, null);
+    this.releaseTerminalExecution(prepared.execution);
+    return response;
+  }
+
+  startToolInvocation(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions = {}): InvokeToolResponse {
+    this.assertAcceptingWork();
+    const prepared = this.prepareToolInvocation(sessionId, toolId, input, options);
+    if (prepared.permission.decision === "requires_approval") {
+      return this.createPendingPermissionResponse(prepared);
+    }
+    if (prepared.permission.decision === "denied") {
+      const response = this.denyPreparedToolInvocation(prepared, null);
+      this.releaseTerminalExecution(prepared.execution);
+      return response;
+    }
+
+    queueMicrotask(() => {
+      void this.trackExecution(prepared.execution, () => this.executePreparedToolInvocation(prepared, { state: "executed" })).catch((error) =>
+        this.handleQueuedExecutionError(prepared.run.id, prepared.execution, error)
+      );
+    });
+    return {
+      state: "running",
+      invocation: toPublicToolInvocation(prepared.invocation),
+      run: this.toPublicRunSummary(this.store.getRun(prepared.run.id) ?? prepared.run),
+      message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id) ?? prepared.assistantMessage),
+      toolCallPartId: prepared.toolCallPart.id,
+      commandOutputPartId: prepared.commandOutputPart.id
+    };
   }
 
   listAgentDefinitions(): AgentDefinition[] {
@@ -241,7 +307,7 @@ export class Kernel {
 
     return {
       ...contextResult,
-      providerResolution,
+      providerResolution: toPublicProviderResolution(providerResolution),
       requestedRunOptions: optionPlan.requestedRunOptions,
       unsupportedRunOptions: optionPlan.unsupportedRunOptions
     };
@@ -255,7 +321,70 @@ export class Kernel {
     return run;
   }
 
+  listRuns(sessionId?: string, activeOnly = false): Run[] {
+    if (sessionId) {
+      this.getSession(sessionId);
+    }
+    return this.store.listRuns({
+      ...(sessionId ? { sessionId } : {}),
+      ...(activeOnly ? { statuses: ACTIVE_RUN_STATUSES } : {})
+    });
+  }
+
+  getPublicRun(runId: string): PublicRunSummary {
+    return this.toPublicRunSummary(this.getRun(runId));
+  }
+
+  listPublicRuns(sessionId?: string, activeOnly = false): PublicRunSummary[] {
+    return this.listRuns(sessionId, activeOnly).map((run) => this.toPublicRunSummary(run));
+  }
+
+  /** Call only after the server owns the exclusive database lease and has bound its listening socket. */
+  reconcileStartupState(): void {
+    const reconciledAt = new Date().toISOString();
+    this.store.expirePendingPermissionsForTerminalRuns(reconciledAt);
+    const pendingPermissionRunIds = new Set(this.store.listPermissionRequests({ status: "pending" }).map((request) => request.runId));
+    for (const run of this.store.listRuns({ statuses: ["running"] })) {
+      if (pendingPermissionRunIds.has(run.id)) {
+        this.store.transitionRunStatus(run.id, ["running"], "waiting_permission", null, reconciledAt);
+      }
+    }
+    const staleRuns = this.store.listRuns({ statuses: ["running", "cancelling"] });
+    for (const run of staleRuns) {
+      this.finalizeRunTermination(run, "interrupted", "The daemon restarted before the run reached a terminal state.");
+    }
+  }
+
+  async shutdown(timeoutMs = 5_000): Promise<void> {
+    this.shuttingDown = true;
+    const activePromises: Promise<unknown>[] = [];
+    for (const execution of this.executions.values()) {
+      const run = this.store.getRun(execution.runId);
+      if (!run || (run.status !== "running" && run.status !== "cancelling")) {
+        continue;
+      }
+      execution.termination ??= run.status === "cancelling" ? "cancelled" : "interrupted";
+      execution.controller.abort(new RunTerminationError(execution.termination));
+      if (execution.activePromise) {
+        activePromises.push(execution.activePromise);
+      }
+    }
+
+    await settleWithin(activePromises, timeoutMs);
+    for (const run of this.store.listRuns({ statuses: ["running", "cancelling"] })) {
+      if (run.status === "cancelling") {
+        this.finalizeRunTermination(run, "cancelled");
+      } else {
+        this.finalizeRunTermination(run, "interrupted", "The daemon stopped before the run reached a terminal state.");
+      }
+    }
+    for (const execution of this.executions.values()) {
+      this.releaseTerminalExecution(execution);
+    }
+  }
+
   startRun(sessionId: string, text: string, options: StartRunOptions = {}): CreateRunResponse {
+    this.assertAcceptingWork();
     const session = this.getSession(sessionId);
     const prompt = text.trim();
     if (!prompt) {
@@ -275,7 +404,7 @@ export class Kernel {
     };
     const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {});
     const now = new Date().toISOString();
-    const run = this.store.createRun({
+    const run = this.createRun({
       id: randomUUID(),
       sessionId,
       provider: resolvedProvider.profile.id,
@@ -341,24 +470,24 @@ export class Kernel {
       providerProfileId: resolvedProvider.profile.id,
       requestedProvider: options.provider ?? null,
       requestedProviderProfileId: options.providerProfileId ?? null,
-      providerResolution,
-      agent: agentToJson(agent),
+      providerResolution: toPublicProviderResolution(providerResolution),
+      agentId: agent.id,
+      agentName: agent.name,
       requestedRunOptions: optionPlan.requestedRunOptions,
       runOptions: optionPlan.runOptions,
       unsupportedRunOptions: optionPlan.unsupportedRunOptions,
-      context: contextSummaryToJson(contextResult.context, contextResult.warnings, contextResult.skippedMessageIds),
       model: optionPlan.runOptions.model ?? null
     });
     this.emit(run, "user_message_created", { message: userMessageWithParts });
     this.emit(run, "assistant_message_created", { message: assistantMessageWithParts });
 
-    const controller = new AbortController();
-    this.controllers.set(run.id, controller);
+    const execution = this.getOrCreateExecution(run.id);
     const writer = new RunWriter({
       store: this.store,
       eventBus: this.eventBus,
       run: runWithMetadata,
-      assistantMessageId: assistantMessage.id
+      assistantMessageId: assistantMessage.id,
+      signal: execution.controller.signal
     });
 
     const providerInput: ProviderRunInput = {
@@ -374,16 +503,18 @@ export class Kernel {
     };
 
     queueMicrotask(() => {
-      void this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, controller, writer);
+      void this.trackExecution(execution, () =>
+        this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, execution, writer)
+      ).catch((error) => this.handleQueuedExecutionError(run.id, execution, error));
     });
 
     return {
-      run: runWithMetadata,
+      run: this.toPublicRunSummary(runWithMetadata),
       agentId: agent.id,
       agentName: agent.name,
       provider: resolvedProvider.adapter.id,
       providerProfileId: resolvedProvider.profile.id,
-      providerResolution,
+      providerResolution: toPublicProviderResolution(providerResolution),
       model: optionPlan.runOptions.model ?? null,
       runOptions: optionPlan.runOptions,
       requestedRunOptions: optionPlan.requestedRunOptions,
@@ -395,32 +526,43 @@ export class Kernel {
 
   cancelRun(runId: string): Run {
     const run = this.getRun(runId);
-    if (run.status !== "running" && run.status !== "waiting_permission") {
+    if (isTerminalRunStatus(run.status)) {
       return run;
     }
 
-    const controller = this.controllers.get(runId);
-    if (controller) {
-      controller.abort();
-      return run;
-    }
-
-    const assistantMessage = this.getLatestAssistantMessageForRun(runId);
-    if (!assistantMessage) {
-      throw new KernelError("Assistant message for run not found", 404);
-    }
-
-    const writer = new RunWriter({
-      store: this.store,
-      eventBus: this.eventBus,
-      run,
-      assistantMessageId: assistantMessage.id
+    const cancellation = this.store.requestRunCancellation({
+      runId,
+      updatedAt: new Date().toISOString(),
+      event: {
+        id: randomUUID(),
+        type: "run_cancelling",
+        payload: { runId, status: "cancelling" }
+      }
     });
-    writer.cancel();
+    const cancellingRun = cancellation?.run ?? this.getRun(runId);
+    if (isTerminalRunStatus(cancellingRun.status)) {
+      return cancellingRun;
+    }
+    if (cancellation?.event) {
+      this.eventBus.publish(cancellation.event);
+    }
+
+    const execution = this.executions.get(runId);
+    if (execution) {
+      execution.termination = "cancelled";
+      execution.controller.abort(new RunTerminationError("cancelled"));
+      if (!execution.activePromise) {
+        this.finalizeRequestedTermination(execution);
+        this.releaseTerminalExecution(execution);
+      }
+    } else {
+      this.finalizeRunTermination(cancellingRun, "cancelled");
+    }
     return this.getRun(runId);
   }
 
   resumeRun(runId: string): Run {
+    this.assertAcceptingWork();
     const run = this.getRun(runId);
     if (run.status !== "waiting_permission") {
       throw new KernelError("Run is not waiting for permission.", 409);
@@ -430,20 +572,28 @@ export class Kernel {
       throw new KernelError("Run still has pending permissions. Approve or deny them before resuming.", 409);
     }
     const now = new Date().toISOString();
-    this.store.updateRunStatus(run.id, "running", null, now);
+    const resumed = this.store.transitionRunStatus(run.id, ["waiting_permission"], "running", null, now);
+    if (!resumed) {
+      throw new KernelError("Run changed before it could be resumed.", 409);
+    }
     this.store.mergeRunMetadata(run.id, { toolLoopState: "manual_resume_requested" }, now);
     this.queueResumeAgentRun(run.id);
     return this.getRun(run.id)!;
   }
 
-  listRunEvents(runId: string): RunEvent[] {
+  listRunEvents(runId: string, after = 0): RunEvent[] {
     this.getRun(runId);
-    return this.store.listEvents(runId);
+    return this.store.listEvents(runId, after).map(toPublicRunEvent);
+  }
+
+  getLatestRunEventSeq(runId: string): number {
+    this.getRun(runId);
+    return this.store.getLatestEventSeq(runId);
   }
 
   subscribeRunEvents(runId: string, listener: RunEventListener): () => void {
     this.getRun(runId);
-    return this.eventBus.subscribe(runId, listener);
+    return this.eventBus.subscribe(runId, (event) => listener(toPublicRunEvent(event)));
   }
 
   listPermissionRequests(status?: PermissionRequestStatus): PermissionRequest[] {
@@ -451,79 +601,103 @@ export class Kernel {
   }
 
   async approvePermissionRequest(id: string): Promise<InvokeToolResponse> {
+    this.assertAcceptingWork();
     const request = this.getResolvablePermissionRequest(id);
     const run = this.getRun(request.runId);
     const isAgentToolPermission = booleanField(request.metadata, "agentToolLoop") === true;
-    if (isAgentToolPermission ? run.status !== "waiting_permission" && run.status !== "running" : run.status !== "running") {
-      throw new KernelError("Permission request can only be approved while its tool run is still running.", 409);
+    if (run.status !== "waiting_permission") {
+      throw new KernelError("Permission request can only be approved while its run is waiting for permission.", 409);
     }
 
     const resolvedAt = new Date().toISOString();
-    if (isAgentToolPermission) {
-      this.store.updateRunStatus(run.id, "running", null, resolvedAt);
-      this.store.mergeRunMetadata(
-        run.id,
-        {
-          toolLoopState: "resuming_after_permission",
-          resolvedPermissionRequestId: request.id
-        },
-        resolvedAt
-      );
+    const approvedRequest = this.store.resolvePermissionRequest(request.id, "approved", resolvedAt);
+    if (!approvedRequest) {
+      throw new KernelError("Permission request or run changed before approval completed.", 409);
     }
-    const approvedRequest = this.store.resolvePermissionRequest(request.id, "approved", resolvedAt)!;
-    this.emit(run, "permission.approved", {
-      requestId: approvedRequest.id,
-      status: "approved",
-      reason: approvedRequest.reason,
-      riskLevel: approvedRequest.riskLevel,
-      request: toPublicPermissionRequest(approvedRequest)
-    });
-
-    const response = await this.executePreparedToolInvocation(this.prepareToolInvocationFromPermission(approvedRequest), {
-      state: "executed",
-      permissionRequest: toPublicPermissionRequest(approvedRequest),
-      finishRun: !isAgentToolPermission
-    });
-    if (isAgentToolPermission) {
+    let prepared: PreparedToolInvocation;
+    try {
+      if (isAgentToolPermission) {
+        this.store.mergeRunMetadata(
+          run.id,
+          {
+            toolLoopState: "resuming_after_permission",
+            resolvedPermissionRequestId: request.id
+          },
+          resolvedAt
+        );
+      }
+      const resumedRun = this.getRun(run.id);
+      this.emit(resumedRun, "permission.approved", {
+        requestId: approvedRequest.id,
+        status: "approved",
+        reason: approvedRequest.reason,
+        riskLevel: approvedRequest.riskLevel,
+        request: toPublicPermissionRequest(approvedRequest)
+      });
+      prepared = this.prepareToolInvocationFromPermission(approvedRequest);
+    } catch (error) {
+      this.failResolvedPermissionPreparation(run.id, error);
+      throw error;
+    }
+    const response = await this.trackExecution(prepared.execution, () =>
+      this.executePreparedToolInvocation(prepared, {
+        state: "executed",
+        permissionRequest: toPublicPermissionRequest(approvedRequest),
+        finishRun: !isAgentToolPermission
+      })
+    );
+    if (isAgentToolPermission && this.store.getRun(approvedRequest.runId)?.status === "running") {
       this.queueResumeAgentRun(approvedRequest.runId);
     }
     return response;
   }
 
   denyPermissionRequest(id: string): InvokeToolResponse {
+    this.assertAcceptingWork();
     const request = this.getResolvablePermissionRequest(id);
     const run = this.getRun(request.runId);
     const isAgentToolPermission = booleanField(request.metadata, "agentToolLoop") === true;
-    if (isAgentToolPermission ? run.status !== "waiting_permission" && run.status !== "running" : run.status !== "running") {
-      throw new KernelError("Permission request can only be denied while its tool run is still running.", 409);
+    if (run.status !== "waiting_permission") {
+      throw new KernelError("Permission request can only be denied while its run is waiting for permission.", 409);
     }
 
     const resolvedAt = new Date().toISOString();
-    if (isAgentToolPermission) {
-      this.store.updateRunStatus(run.id, "running", null, resolvedAt);
-      this.store.mergeRunMetadata(
-        run.id,
-        {
-          toolLoopState: "resuming_after_permission_denial",
-          resolvedPermissionRequestId: request.id
-        },
-        resolvedAt
-      );
+    const deniedRequest = this.store.resolvePermissionRequest(request.id, "denied", resolvedAt);
+    if (!deniedRequest) {
+      throw new KernelError("Permission request or run changed before denial completed.", 409);
     }
-    const deniedRequest = this.store.resolvePermissionRequest(request.id, "denied", resolvedAt)!;
-    this.emit(run, "permission.denied", {
-      requestId: deniedRequest.id,
-      status: "denied",
-      reason: deniedRequest.reason,
-      riskLevel: deniedRequest.riskLevel,
-      request: toPublicPermissionRequest(deniedRequest)
-    });
-
-    const response = this.denyPreparedToolInvocation(this.prepareToolInvocationFromPermission(deniedRequest), deniedRequest, {
+    let prepared: PreparedToolInvocation;
+    try {
+      if (isAgentToolPermission) {
+        this.store.mergeRunMetadata(
+          run.id,
+          {
+            toolLoopState: "resuming_after_permission_denial",
+            resolvedPermissionRequestId: request.id
+          },
+          resolvedAt
+        );
+      }
+      const resumedRun = this.getRun(run.id);
+      this.emit(resumedRun, "permission.denied", {
+        requestId: deniedRequest.id,
+        status: "denied",
+        reason: deniedRequest.reason,
+        riskLevel: deniedRequest.riskLevel,
+        request: toPublicPermissionRequest(deniedRequest)
+      });
+      prepared = this.prepareToolInvocationFromPermission(deniedRequest);
+    } catch (error) {
+      this.failResolvedPermissionPreparation(run.id, error);
+      throw error;
+    }
+    const response = this.denyPreparedToolInvocation(prepared, deniedRequest, {
       finishRun: !isAgentToolPermission
     });
-    if (isAgentToolPermission) {
+    if (isAgentToolPermission && this.store.getRun(deniedRequest.runId)?.status === "running") {
       this.queueResumeAgentRun(deniedRequest.runId);
+    } else {
+      this.releaseTerminalExecution(prepared.execution);
     }
     return response;
   }
@@ -560,7 +734,7 @@ export class Kernel {
       settings: toolSettings
     });
     const now = new Date().toISOString();
-    const run = this.store.createRun({
+    const run = this.createRun({
       id: randomUUID(),
       sessionId,
       provider: `tool:${registeredTool.definition.id}`,
@@ -613,16 +787,17 @@ export class Kernel {
       permissionDecision: permission.decision,
       permissionAction: permission.action,
       permissionRuleId: permission.ruleId,
-      riskLevel: permission.riskLevel,
-      invocation
+      riskLevel: permission.riskLevel
     });
     this.emit(run, "assistant_message_created", { message: this.store.getMessage(assistantMessage.id)! });
 
+    const execution = this.getOrCreateExecution(run.id);
     const writer = new RunWriter({
       store: this.store,
       eventBus: this.eventBus,
       run,
-      assistantMessageId: assistantMessage.id
+      assistantMessageId: assistantMessage.id,
+      signal: execution.controller.signal
     });
 
     const toolCallPart = writer.recordToolCall({
@@ -667,7 +842,8 @@ export class Kernel {
       toolCallPart,
       commandOutputPart,
       createdAt: now,
-      resumeAgentRun: false
+      resumeAgentRun: false,
+      execution
     };
   }
 
@@ -710,6 +886,7 @@ export class Kernel {
       updatedAt: request.updatedAt
     };
 
+    const execution = this.getOrCreateExecution(run.id);
     return {
       registeredTool,
       executionInput: request.executionInput,
@@ -720,13 +897,20 @@ export class Kernel {
       run,
       assistantMessage,
       invocation,
-      writer: new RunWriter({ store: this.store, eventBus: this.eventBus, run, assistantMessageId: assistantMessage.id }),
+      writer: new RunWriter({
+        store: this.store,
+        eventBus: this.eventBus,
+        run,
+        assistantMessageId: assistantMessage.id,
+        signal: execution.controller.signal
+      }),
       toolCallPart,
       commandOutputPart,
       createdAt: request.createdAt,
       resumeAgentRun: booleanField(request.metadata, "agentToolLoop") === true,
       toolLoopIteration: numberField(request.metadata, "toolLoopIteration") ?? undefined,
-      providerToolCallName: stringField(request.metadata, "providerToolCallName") || undefined
+      providerToolCallName: stringField(request.metadata, "providerToolCallName") || undefined,
+      execution
     };
   }
 
@@ -779,16 +963,20 @@ export class Kernel {
       request: toPublicPermissionRequest(permissionRequest)
     });
 
-    if (prepared.resumeAgentRun) {
-      this.markRunWaitingForPermission(prepared.run, prepared.assistantMessage.id, permissionRequest.id);
+    this.markRunWaitingForPermission(prepared.run, prepared.assistantMessage.id, permissionRequest.id);
+    const waitingMessage = this.store.getMessage(prepared.assistantMessage.id);
+    if (waitingMessage) {
+      this.emit(prepared.run, "assistant_message_updated", { message: waitingMessage });
     }
+    prepared.execution.phase = "waiting_permission";
+    prepared.execution.toolId = prepared.registeredTool.definition.id;
 
     return {
       state: "pending_permission",
-      invocation: { ...prepared.invocation, status: "pending_permission", updatedAt: now },
+      invocation: toPublicToolInvocation({ ...prepared.invocation, status: "pending_permission", updatedAt: now }),
       permissionRequest: toPublicPermissionRequest(permissionRequest),
-      run: this.store.getRun(prepared.run.id)!,
-      message: this.store.getMessage(prepared.assistantMessage.id)!,
+      run: this.toPublicRunSummary(this.store.getRun(prepared.run.id)!),
+      message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id)!),
       toolCallPartId: toolCallPart.id,
       commandOutputPartId: prepared.commandOutputPart.id
     };
@@ -799,6 +987,9 @@ export class Kernel {
     responseOptions: { state: "executed"; permissionRequest?: PermissionRequest; finishRun?: boolean }
   ): Promise<InvokeToolResponse> {
     const { registeredTool, executionInput, caller, permission, run, assistantMessage, invocation, writer } = prepared;
+    const execution = prepared.execution;
+    execution.phase = "tool";
+    execution.toolId = registeredTool.definition.id;
     const executionCwd = prepared.executionCwd;
     const commandOutputMaxChars = commandOutputMaxCharsForTool(registeredTool.definition.id, this.getToolSettings());
     let toolCallPart = prepared.toolCallPart;
@@ -827,6 +1018,10 @@ export class Kernel {
     });
 
     const onToolEvent = (event: ToolExecutionEvent): void => {
+      const currentRun = this.store.getRun(run.id);
+      if (execution.controller.signal.aborted || !currentRun || isTerminalRunStatus(currentRun.status)) {
+        return;
+      }
       if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
         const delta = typeof event.payload.text === "string" ? event.payload.text : "";
         if (!delta) {
@@ -865,34 +1060,67 @@ export class Kernel {
       const output = await registeredTool.executor.execute(executionInput, {
         invocation: runningInvocation,
         cwd: executionCwd,
-        signal: new AbortController().signal,
+        signal: execution.controller.signal,
         emit: onToolEvent
       });
+      if (execution.controller.signal.aborted) {
+        throw new ToolExecutionAbortError("Tool execution was cancelled.", output);
+      }
       const completedAt = new Date().toISOString();
       result = buildToolExecutionResult(invocation, registeredTool.definition.id, output, startedAt, completedAt);
     } catch (error) {
       const completedAt = new Date().toISOString();
       const toolError = toError(error);
+      const cancelled = execution.controller.signal.aborted || error instanceof ToolExecutionAbortError || isAbortLike(error);
       result = {
         invocationId: invocation.id,
         toolId: registeredTool.definition.id,
-        status: "failed",
-        output: {},
+        status: cancelled ? "cancelled" : "failed",
+        output: error instanceof ToolExecutionAbortError ? error.output : {},
         error: toolError.message,
         startedAt,
         completedAt,
         durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
         metadata: {
-          failedBeforeResult: true
+          ...(cancelled ? { cancelled: true } : { failedBeforeResult: true })
         }
       };
     }
 
     const completedAt = result.completedAt;
     const finalInvocation: ToolInvocation = { ...invocation, status: result.status, updatedAt: completedAt };
+    const persistedRun = this.store.getRun(run.id);
+    const terminating = execution.controller.signal.aborted;
+    if (!persistedRun || isTerminalRunStatus(persistedRun.status)) {
+      return {
+        state: responseOptions.state,
+        invocation: toPublicToolInvocation(finalInvocation),
+        result: toPublicToolExecutionResult(result),
+        permissionRequest: responseOptions.permissionRequest,
+        run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun ?? run),
+        message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
+        toolCallPartId: toolCallPart.id,
+        commandOutputPartId: commandOutputPart.id
+      };
+    }
+    if (!terminating && persistedRun.status !== "running") {
+      if (persistedRun.status === "cancelling") {
+        this.finishAbortedWriter(execution, writer);
+      }
+      return {
+        state: responseOptions.state,
+        invocation: toPublicToolInvocation(finalInvocation),
+        result: toPublicToolExecutionResult(result),
+        permissionRequest: responseOptions.permissionRequest,
+        run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun),
+        message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
+        toolCallPartId: toolCallPart.id,
+        commandOutputPartId: commandOutputPart.id
+      };
+    }
     commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, completedAt, commandOutputMetadataFromResult(result, commandOutputTruncated));
-    toolCallPart = this.updateToolCallStatus(toolCallPart, result.status, completedAt);
-    this.emit(run, result.status === "completed" ? "tool.completed" : "tool.failed", {
+    toolCallPart = this.updateToolCallStatus(toolCallPart, terminating ? "cancelled" : result.status, completedAt);
+    this.emit(run, !terminating && result.status === "completed" ? "tool.completed" : "tool.failed", {
       messageId: assistantMessage.id,
       partId: toolCallPart.id,
       part: toolCallPart,
@@ -901,39 +1129,61 @@ export class Kernel {
       callId: invocation.id,
       toolId: registeredTool.definition.id,
       toolName: registeredTool.definition.name,
-      status: result.status,
+      status: terminating ? "cancelled" : result.status,
       error: result.error,
       durationMs: result.durationMs
     });
-    const toolResultPart = writer.recordToolResult({
-      callId: invocation.id,
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      status: result.status,
-      outputSummary: summarizeToolResult(result),
-      error: result.error ?? undefined,
-      metadata: {
-        durationMs: result.durationMs,
-        permissionDecision: permission.decision,
-        permissionAction: permission.action,
-        permissionRuleId: permission.ruleId,
-        riskLevel: permission.riskLevel,
-        ...(prepared.resumeAgentRun
-          ? {
-              agentToolLoop: true,
-              toolLoopIteration: prepared.toolLoopIteration ?? null,
-              providerToolCallName: prepared.providerToolCallName ?? null
-            }
-          : {}),
-        ...(result.metadata ?? {})
-      }
-    });
+    const toolResultPart = writer.recordToolResult(
+      {
+        callId: invocation.id,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name,
+        status: terminating ? "cancelled" : result.status,
+        outputSummary: summarizeToolResult(result),
+        error: result.error ?? undefined,
+        metadata: {
+          durationMs: result.durationMs,
+          permissionDecision: permission.decision,
+          permissionAction: permission.action,
+          permissionRuleId: permission.ruleId,
+          riskLevel: permission.riskLevel,
+          ...(prepared.resumeAgentRun
+            ? {
+                agentToolLoop: true,
+                toolLoopIteration: prepared.toolLoopIteration ?? null,
+                providerToolCallName: prepared.providerToolCallName ?? null
+              }
+            : {}),
+          ...(result.metadata ?? {})
+        }
+      },
+      { allowWhileTerminating: terminating }
+    );
+
+    if (terminating) {
+      this.finishAbortedWriter(execution, writer);
+      return {
+        state: responseOptions.state,
+        invocation: toPublicToolInvocation(finalInvocation),
+        result: toPublicToolExecutionResult(result),
+        permissionRequest: responseOptions.permissionRequest,
+        run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun),
+        message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
+        toolCallPartId: toolCallPart.id,
+        commandOutputPartId: commandOutputPart.id,
+        toolResultPartId: toolResultPart.id
+      };
+    }
 
     if (responseOptions.finishRun !== false) {
       if (result.status === "completed") {
         writer.complete();
       } else if (result.status === "cancelled") {
-        writer.cancel();
+        if (execution.termination === "interrupted") {
+          writer.interrupt();
+        } else {
+          writer.cancel();
+        }
       } else {
         writer.fail(new Error(result.error ?? "Tool execution failed."));
       }
@@ -941,11 +1191,11 @@ export class Kernel {
 
     return {
       state: responseOptions.state,
-      invocation: finalInvocation,
-      result,
+      invocation: toPublicToolInvocation(finalInvocation),
+      result: toPublicToolExecutionResult(result),
       permissionRequest: responseOptions.permissionRequest,
-      run: this.store.getRun(run.id)!,
-      message: this.store.getMessage(assistantMessage.id)!,
+      run: this.toPublicRunSummary(this.store.getRun(run.id)!),
+      message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
       toolCallPartId: toolCallPart.id,
       commandOutputPartId: commandOutputPart.id,
       toolResultPartId: toolResultPart.id
@@ -1044,11 +1294,11 @@ export class Kernel {
 
     return {
       state: "denied",
-      invocation: { ...prepared.invocation, status: result.status, updatedAt: completedAt },
-      result,
+      invocation: toPublicToolInvocation({ ...prepared.invocation, status: result.status, updatedAt: completedAt }),
+      result: toPublicToolExecutionResult(result),
       permissionRequest: toPublicPermissionRequest(permissionRequest),
-      run: this.store.getRun(prepared.run.id)!,
-      message: this.store.getMessage(prepared.assistantMessage.id)!,
+      run: this.toPublicRunSummary(this.store.getRun(prepared.run.id)!),
+      message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id)!),
       toolCallPartId: toolCallPart.id,
       commandOutputPartId: prepared.commandOutputPart.id,
       toolResultPartId: toolResultPart.id
@@ -1064,6 +1314,244 @@ export class Kernel {
       throw new KernelError(`Permission request is already ${request.status}.`, 409);
     }
     return request;
+  }
+
+  private getOrCreateExecution(runId: string): RunExecution {
+    const existing = this.executions.get(runId);
+    if (existing) {
+      return existing;
+    }
+    const execution: RunExecution = {
+      runId,
+      controller: new AbortController(),
+      phase: "idle",
+      providerId: null,
+      toolId: null,
+      termination: null,
+      activePromise: null
+    };
+    this.executions.set(runId, execution);
+    return execution;
+  }
+
+  private createRun(input: CreateRunInput): Run {
+    try {
+      return this.store.createRun(input);
+    } catch (error) {
+      if (error instanceof ActiveRunExistsStoreError) {
+        throw new KernelError(
+          "This session already has an active run. Reconnect to or cancel it before starting another run.",
+          409,
+          "active_run_exists",
+          { run: this.toPublicRunSummary(error.activeRun) }
+        );
+      }
+      throw error;
+    }
+  }
+
+  private toPublicRunSummary(run: Run): PublicRunSummary {
+    return {
+      id: run.id,
+      sessionId: run.sessionId,
+      provider: sanitizedPublicString(run.provider, 160) ?? "unknown",
+      status: run.status,
+      model: sanitizedPublicString(run.model, 240),
+      runOptions: publicRunOptions(run.runOptions),
+      usage: run.usage ? { ...run.usage } : null,
+      currentPhase: this.publicRunPhase(run),
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+      error: sanitizedPublicString(run.error, 1_000)
+    };
+  }
+
+  private publicRunPhase(run: Run): PublicRunPhase | null {
+    if (run.status === "waiting_permission") {
+      return "waiting_permission";
+    }
+    if (run.status === "cancelling") {
+      return "cancelling";
+    }
+    if (run.status !== "running") {
+      return null;
+    }
+    const phase = this.executions.get(run.id)?.phase;
+    return phase === "provider" || phase === "tool" ? phase : "running";
+  }
+
+  private assertAcceptingWork(): void {
+    if (this.shuttingDown) {
+      throw new KernelError("The daemon is shutting down and is not accepting new work.", 503);
+    }
+  }
+
+  private async trackExecution<T>(execution: RunExecution, operation: () => Promise<T>): Promise<T> {
+    if (execution.activePromise) {
+      throw new KernelError(`Run '${execution.runId}' already has active work.`, 409);
+    }
+
+    let activePromise: Promise<T> | null = null;
+    try {
+      const run = this.store.getRun(execution.runId);
+      if (!run || run.status !== "running") {
+        throw new KernelError(`Run '${execution.runId}' is not available for execution.`, 409);
+      }
+      if (execution.controller.signal.aborted) {
+        throw execution.controller.signal.reason instanceof Error
+          ? execution.controller.signal.reason
+          : new RunTerminationError(execution.termination ?? "cancelled");
+      }
+
+      activePromise = operation();
+      execution.activePromise = activePromise;
+      return await activePromise;
+    } catch (error) {
+      this.finalizeExecutionError(execution, error);
+      throw error;
+    } finally {
+      if (activePromise && execution.activePromise === activePromise) {
+        execution.activePromise = null;
+      }
+      const run = this.store.getRun(execution.runId);
+      execution.phase = run?.status === "waiting_permission" ? "waiting_permission" : "idle";
+      if (execution.phase === "idle") {
+        execution.toolId = null;
+      }
+      this.finalizeRequestedTermination(execution);
+      this.releaseTerminalExecution(execution);
+    }
+  }
+
+  private finishAbortedWriter(execution: RunExecution, writer: RunWriter): void {
+    if (execution.termination === "interrupted") {
+      writer.interrupt();
+    } else {
+      writer.cancel();
+    }
+  }
+
+  private finalizeRequestedTermination(execution: RunExecution): void {
+    if (!execution.termination) {
+      return;
+    }
+    const run = this.store.getRun(execution.runId);
+    if (!run || isTerminalRunStatus(run.status)) {
+      return;
+    }
+    if (execution.termination === "cancelled" && run.status !== "cancelling") {
+      return;
+    }
+    this.finalizeRunTermination(run, execution.termination);
+  }
+
+  private finalizeRunTermination(run: Run, termination: RunTermination, reason?: string): void {
+    if (isTerminalRunStatus(run.status)) {
+      return;
+    }
+    const assistantMessage = this.getLatestAssistantMessageForRun(run.id);
+    if (assistantMessage) {
+      const writer = new RunWriter({
+        store: this.store,
+        eventBus: this.eventBus,
+        run: this.store.getRun(run.id) ?? run,
+        assistantMessageId: assistantMessage.id
+      });
+      if (termination === "interrupted") {
+        writer.interrupt(reason);
+      } else {
+        writer.cancel();
+      }
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    const error = termination === "interrupted" ? reason ?? "The daemon stopped before the run reached a terminal state." : null;
+    const status = termination === "interrupted" ? "interrupted" : "cancelled";
+    const result = this.store.finalizeRun({
+      runId: run.id,
+      expectedStatuses: termination === "interrupted" ? ["running", "cancelling"] : ["running", "waiting_permission", "cancelling"],
+      status,
+      error,
+      updatedAt,
+      event: {
+        id: randomUUID(),
+        type: termination === "interrupted" ? "run_interrupted" : "run_cancelled",
+        payload: {
+          ...(error ? { error } : {}),
+          runId: run.id
+        }
+      }
+    });
+    if (result) {
+      this.eventBus.publish(result.event);
+    }
+  }
+
+  private releaseTerminalExecution(execution: RunExecution): void {
+    const run = this.store.getRun(execution.runId);
+    if (run && isTerminalRunStatus(run.status) && this.executions.get(execution.runId) === execution) {
+      this.executions.delete(execution.runId);
+    }
+  }
+
+  private handleQueuedExecutionError(runId: string, execution: RunExecution, error: unknown): void {
+    if (error instanceof KernelError && error.statusCode === 409 && execution.activePromise) {
+      return;
+    }
+    const run = this.store.getRun(runId);
+    if (!run || isTerminalRunStatus(run.status)) {
+      this.releaseTerminalExecution(execution);
+      return;
+    }
+    console.error("Agent run execution failed", { runId, error: toError(error).message });
+    this.finalizeExecutionError(execution, error);
+  }
+
+  private finalizeExecutionError(execution: RunExecution, error: unknown): void {
+    const run = this.store.getRun(execution.runId);
+    if (!run || isTerminalRunStatus(run.status)) {
+      return;
+    }
+    if (execution.controller.signal.aborted || isAbortLike(error)) {
+      if (execution.termination) {
+        this.finalizeRequestedTermination(execution);
+      } else {
+        this.finalizeRunTermination(run, "cancelled");
+      }
+      return;
+    }
+    if (run.status !== "running") {
+      return;
+    }
+
+    const runError = toError(error);
+    const assistantMessage = this.getLatestAssistantMessageForRun(run.id);
+    if (assistantMessage) {
+      new RunWriter({ store: this.store, eventBus: this.eventBus, run, assistantMessageId: assistantMessage.id }).fail(runError);
+      return;
+    }
+    const result = this.store.finalizeRun({
+      runId: run.id,
+      expectedStatuses: ["running"],
+      status: "failed",
+      error: runError.message,
+      updatedAt: new Date().toISOString(),
+      event: {
+        id: randomUUID(),
+        type: "run_failed",
+        payload: { runId: run.id, error: runError.message }
+      }
+    });
+    if (result) {
+      this.eventBus.publish(result.event);
+    }
+  }
+
+  private failResolvedPermissionPreparation(runId: string, error: unknown): void {
+    const execution = this.getOrCreateExecution(runId);
+    this.finalizeExecutionError(execution, error);
+    this.releaseTerminalExecution(execution);
   }
 
   private getToolSettings(): ToolSettings {
@@ -1139,17 +1627,18 @@ export class Kernel {
     run: Run,
     provider: ProviderAdapter,
     input: ProviderRunInput,
-    controller: AbortController,
+    execution: RunExecution,
     writer: RunWriter
   ): Promise<void> {
     let activeWriter = writer;
+    execution.providerId = provider.id;
     try {
-      await this.executeAgentToolLoop(run, provider, input, controller, writer, (nextWriter) => {
+      await this.executeAgentToolLoop(run, provider, input, execution, writer, (nextWriter) => {
         activeWriter = nextWriter;
       });
     } catch (error) {
-      if (controller.signal.aborted || isAbortLike(error)) {
-        activeWriter.cancel();
+      if (execution.controller.signal.aborted || isAbortLike(error)) {
+        this.finishAbortedWriter(execution, activeWriter);
       } else {
         const runError = toError(error);
         console.error("Provider run failed", {
@@ -1159,8 +1648,6 @@ export class Kernel {
         });
         activeWriter.fail(runError);
       }
-    } finally {
-      this.controllers.delete(run.id);
     }
   }
 
@@ -1168,7 +1655,7 @@ export class Kernel {
     run: Run,
     provider: ProviderAdapter,
     input: ProviderRunInput,
-    controller: AbortController,
+    execution: RunExecution,
     writer: RunWriter,
     onActiveWriterChange: (writer: RunWriter) => void,
     startingIteration = numberField(run.metadata, "toolIterations") ?? 0
@@ -1178,13 +1665,15 @@ export class Kernel {
     let currentWriter = writer;
 
     while (true) {
+      execution.phase = "provider";
+      execution.toolId = null;
       const result = await provider.run(providerInput, {
-        signal: controller.signal,
+        signal: execution.controller.signal,
         writer: currentWriter
       });
 
-      if (controller.signal.aborted) {
-        currentWriter.cancel();
+      if (execution.controller.signal.aborted) {
+        this.finishAbortedWriter(execution, currentWriter);
         return;
       }
 
@@ -1211,10 +1700,14 @@ export class Kernel {
       if (step === "waiting_permission") {
         return;
       }
+      if (execution.controller.signal.aborted) {
+        this.finishAbortedWriter(execution, currentWriter);
+        return;
+      }
 
       currentWriter.completeMessage();
       iteration = nextIteration;
-      currentWriter = this.createFollowUpAssistantWriter(run, iteration);
+      currentWriter = this.createFollowUpAssistantWriter(run, iteration, execution);
       onActiveWriterChange(currentWriter);
       providerInput = this.withCurrentToolLoopContext(input, run.id);
     }
@@ -1235,6 +1728,9 @@ export class Kernel {
 
       if (prepared.permission.decision === "allowed") {
         await this.executePreparedToolInvocation(prepared, { state: "executed", finishRun: false });
+        if (prepared.execution.controller.signal.aborted) {
+          return "continue";
+        }
         continue;
       }
 
@@ -1439,7 +1935,8 @@ export class Kernel {
       createdAt: now,
       resumeAgentRun: true,
       toolLoopIteration: iteration,
-      providerToolCallName: providerToolName
+      providerToolCallName: providerToolName,
+      execution: this.getOrCreateExecution(run.id)
     };
   }
 
@@ -1469,9 +1966,16 @@ export class Kernel {
 
   private markRunWaitingForPermission(run: Run, messageId: string, permissionRequestId: string): void {
     const now = new Date().toISOString();
-    this.store.updateRunStatus(run.id, "waiting_permission", null, now);
     this.store.mergeRunMetadata(
       run.id,
+      {
+        toolLoopState: "waiting_permission",
+        pendingPermissionRequestId: permissionRequestId
+      },
+      now
+    );
+    this.store.mergeMessageMetadata(
+      messageId,
       {
         toolLoopState: "waiting_permission",
         pendingPermissionRequestId: permissionRequestId
@@ -1489,21 +1993,19 @@ export class Kernel {
 
   private queueResumeAgentRun(runId: string): void {
     queueMicrotask(() => {
-      void this.resumeAgentRun(runId).catch((error) => {
-        const run = this.store.getRun(runId);
-        const assistantMessage = this.getLatestAssistantMessageForRun(runId);
-        if (!run || !assistantMessage) {
-          console.error("Agent run resume failed", { runId, error: toError(error).message });
-          return;
-        }
-        new RunWriter({ store: this.store, eventBus: this.eventBus, run, assistantMessageId: assistantMessage.id }).fail(toError(error));
-      });
+      if (this.shuttingDown) {
+        return;
+      }
+      const execution = this.getOrCreateExecution(runId);
+      void this.trackExecution(execution, () => this.resumeAgentRun(runId, execution)).catch((error) =>
+        this.handleQueuedExecutionError(runId, execution, error)
+      );
     });
   }
 
-  private async resumeAgentRun(runId: string): Promise<void> {
+  private async resumeAgentRun(runId: string, execution: RunExecution): Promise<void> {
     const run = this.getRun(runId);
-    if (run.status !== "running" && run.status !== "waiting_permission") {
+    if (run.status !== "running") {
       return;
     }
     const assistantMessages = this.listAssistantMessagesForRun(runId);
@@ -1512,13 +2014,11 @@ export class Kernel {
     }
     const { provider, input } = this.buildProviderInputForExistingRun(run);
     this.completeStreamingAssistantMessagesForRun(run);
-    const writer = this.createFollowUpAssistantWriter(run, numberField(run.metadata, "toolIterations") ?? 0);
-    const controller = new AbortController();
-    this.controllers.set(run.id, controller);
-    await this.executeRun(this.store.getRun(run.id) ?? run, provider, input, controller, writer);
+    const writer = this.createFollowUpAssistantWriter(run, numberField(run.metadata, "toolIterations") ?? 0, execution);
+    await this.executeRun(this.store.getRun(run.id) ?? run, provider, input, execution, writer);
   }
 
-  private createFollowUpAssistantWriter(run: Run, iteration: number): RunWriter {
+  private createFollowUpAssistantWriter(run: Run, iteration: number, execution: RunExecution): RunWriter {
     const runSnapshot = this.store.getRun(run.id) ?? run;
     const priorAssistantMessages = this.listAssistantMessagesForRun(run.id);
     const createdAt = timestampAfter(runSnapshot.updatedAt, ...priorAssistantMessages.map((message) => message.updatedAt));
@@ -1543,7 +2043,8 @@ export class Kernel {
       store: this.store,
       eventBus: this.eventBus,
       run: runSnapshot,
-      assistantMessageId: message.id
+      assistantMessageId: message.id,
+      signal: execution.controller.signal
     });
   }
 
@@ -1666,4 +2167,56 @@ function isAbortLike(error: unknown): boolean {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function publicRunOptions(options: RunOptions | null): RunOptions | null {
+  if (!options) {
+    return null;
+  }
+  const output: RunOptions = {};
+  const model = sanitizedPublicString(options.model, 240);
+  if (model) {
+    output.model = model;
+  }
+  const reasoningEffort = sanitizedPublicString(options.reasoningEffort, 64);
+  if (reasoningEffort) {
+    output.reasoningEffort = reasoningEffort;
+  }
+  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
+    output.temperature = options.temperature;
+  }
+  return Object.keys(output).length > 0 ? output : null;
+}
+
+function sanitizedPublicString(value: string | null | undefined, maxLength: number): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const redacted = value
+    .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED]")
+    .replace(/("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi, "$1[REDACTED]$2")
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_API_KEY]");
+  const sanitized = redacted.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLength);
+  return sanitized || null;
+}
+
+async function settleWithin(promises: readonly Promise<unknown>[], timeoutMs: number): Promise<void> {
+  if (promises.length === 0) {
+    return;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      Promise.allSettled(promises).then(() => undefined),
+      new Promise<void>((resolvePromise) => {
+        timeout = setTimeout(resolvePromise, Math.max(0, timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }

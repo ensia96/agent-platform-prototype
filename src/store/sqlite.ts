@@ -8,14 +8,22 @@ import type {
   CreateMessageInput,
   CreateRunInput,
   CreateSessionInput,
+  DaemonLeaseRecord,
+  FinalizeRunInput,
+  FinalizeRunResult,
   ListPermissionRequestsFilter,
+  ListRunsFilter,
+  RunCancellationResult,
+  RequestRunCancellationInput,
   StoreAdapter,
   StoredPermissionRequest,
   UpdateAgentDefinitionInput,
   UpdateMessagePartInput,
   UpsertMessageTextPartInput
 } from "./types";
+import { ActiveRunExistsStoreError } from "./types";
 import type {
+  ActiveRunStatus,
   AgentDefinition,
   JsonObject,
   JsonValue,
@@ -33,9 +41,11 @@ import type {
   RunStatus,
   RunUsage,
   Session,
+  TerminalRunStatus,
   ToolInvocationCaller,
   ToolPermissionDecision
 } from "../shared/types";
+import { canTransitionRunStatus, isActiveRunStatus, isTerminalRunEventType, isTerminalRunStatus } from "../shared/types";
 import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 
@@ -136,6 +146,13 @@ type PermissionRequestRow = {
   resolved_at: string | null;
 };
 
+type DaemonLeaseRow = {
+  owner_id: string;
+  pid: number;
+  acquired_at: string;
+  heartbeat_at: string;
+};
+
 export interface SQLiteStoreOptions {
   dbPath: string;
   defaultWorkingDirectory?: string;
@@ -190,12 +207,31 @@ export class SQLiteStore implements StoreAdapter {
   }
 
   createRun(input: CreateRunInput): Run {
-    this.db
-      .prepare(
-        `INSERT INTO runs (id, session_id, provider, status, created_at, updated_at, error, metadata_json)
-         VALUES (@id, @sessionId, @provider, @status, @createdAt, @updatedAt, @error, @metadataJson)`
-      )
-      .run({ ...input, error: input.error ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
+    if (input.status !== "running") {
+      throw new Error("Runs must be created in the running state.");
+    }
+    const create = this.db.transaction(() => {
+      const activeRow = this.db
+        .prepare(
+          `SELECT id, session_id, provider, status, created_at, updated_at, error, metadata_json
+           FROM runs
+           WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'cancelling')
+           ORDER BY updated_at DESC, created_at DESC, id DESC
+           LIMIT 1`
+        )
+        .get(input.sessionId) as RunRow | undefined;
+      if (activeRow) {
+        throw new ActiveRunExistsStoreError(rowToRun(activeRow));
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO runs (id, session_id, provider, status, created_at, updated_at, error, metadata_json)
+           VALUES (@id, @sessionId, @provider, @status, @createdAt, @updatedAt, @error, @metadataJson)`
+        )
+        .run({ ...input, error: input.error ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
+    });
+    create.immediate();
     return this.getRun(input.id)!;
   }
 
@@ -206,10 +242,166 @@ export class SQLiteStore implements StoreAdapter {
     return row ? rowToRun(row) : null;
   }
 
-  updateRunStatus(id: string, status: RunStatus, error: string | null, updatedAt: string): void {
-    this.db
-      .prepare("UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ?")
-      .run(status, error, updatedAt, id);
+  listRuns(filter: ListRunsFilter = {}): Run[] {
+    const clauses: string[] = [];
+    const params: string[] = [];
+    if (filter.sessionId) {
+      clauses.push("session_id = ?");
+      params.push(filter.sessionId);
+    }
+    if (filter.statuses) {
+      if (filter.statuses.length === 0) {
+        return [];
+      }
+      clauses.push(`status IN (${filter.statuses.map(() => "?").join(", ")})`);
+      params.push(...filter.statuses);
+    }
+
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT id, session_id, provider, status, created_at, updated_at, error, metadata_json
+         FROM runs
+         ${where}
+         ORDER BY created_at ASC, id ASC`
+      )
+      .all(...params) as RunRow[];
+    return rows.map(rowToRun);
+  }
+
+  transitionRunStatus(
+    id: string,
+    expectedStatuses: readonly RunStatus[],
+    status: ActiveRunStatus,
+    error: string | null,
+    updatedAt: string
+  ): Run | null {
+    if (!isActiveRunStatus(status)) {
+      throw new Error(`Terminal run status '${status}' must be written through finalizeRun().`);
+    }
+    assertValidRunTransition(expectedStatuses, status);
+    if (expectedStatuses.length === 0) {
+      return null;
+    }
+
+    const placeholders = expectedStatuses.map(() => "?").join(", ");
+    const result = this.db
+      .prepare(`UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`)
+      .run(status, error, updatedAt, id, ...expectedStatuses);
+    return result.changes === 1 ? this.getRun(id) : null;
+  }
+
+  requestRunCancellation(input: RequestRunCancellationInput): RunCancellationResult | null {
+    const requestCancellation = this.db.transaction((): RunCancellationResult | null => {
+      const current = this.getRun(input.runId);
+      if (!current || isTerminalRunStatus(current.status)) {
+        return null;
+      }
+
+      let event: RunEvent | null = null;
+      if (current.status !== "cancelling") {
+        const transitioned = this.transitionRunStatus(input.runId, [current.status], "cancelling", null, input.updatedAt);
+        if (!transitioned) {
+          return null;
+        }
+        event = this.insertEvent({
+          ...input.event,
+          runId: input.runId,
+          sessionId: current.sessionId,
+          createdAt: input.updatedAt
+        });
+      }
+
+      const expiredPermissionRequests = this.expirePendingPermissionsForRun(input.runId, input.updatedAt);
+      this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(input.updatedAt, current.sessionId);
+
+      return {
+        run: this.getRun(input.runId)!,
+        expiredPermissionRequests,
+        event
+      };
+    });
+
+    return requestCancellation();
+  }
+
+  finalizeRun(input: FinalizeRunInput): FinalizeRunResult | null {
+    assertValidRunTransition(input.expectedStatuses, input.status);
+    assertMatchingTerminalEvent(input.status, input.event.type);
+    if (input.expectedStatuses.length === 0) {
+      return null;
+    }
+
+    const finalize = this.db.transaction((): RunEvent | null => {
+      const placeholders = input.expectedStatuses.map(() => "?").join(", ");
+      const runUpdate = this.db
+        .prepare(`UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`)
+        .run(input.status, input.error, input.updatedAt, input.runId, ...input.expectedStatuses);
+      if (runUpdate.changes !== 1) {
+        return null;
+      }
+
+      const run = this.getRun(input.runId)!;
+      this.expirePendingPermissionsForRun(input.runId, input.updatedAt);
+      this.cancelActiveToolCallPartsForRun(input.runId, input.updatedAt);
+      const messageRows = this.db
+        .prepare(
+          `SELECT id, metadata_json
+           FROM messages
+           WHERE run_id = ? AND role = 'assistant' AND status = 'streaming'
+           ORDER BY created_at ASC, id ASC`
+        )
+        .all(input.runId) as Array<{ id: string; metadata_json: string }>;
+      for (const messageRow of messageRows) {
+        const metadata = parseJsonObject(messageRow.metadata_json);
+        if (input.error) {
+          metadata.error = input.error;
+        } else {
+          delete metadata.error;
+        }
+        this.db
+          .prepare("UPDATE messages SET status = ?, updated_at = ?, metadata_json = ? WHERE id = ? AND status = 'streaming'")
+          .run(input.status, input.updatedAt, JSON.stringify(metadata), messageRow.id);
+      }
+
+      this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(input.updatedAt, run.sessionId);
+      const event = this.insertEvent({
+        ...input.event,
+        runId: run.id,
+        sessionId: run.sessionId,
+        createdAt: input.updatedAt
+      });
+      return event;
+    });
+
+    const result = finalize();
+    if (!result) {
+      return null;
+    }
+    const run = this.getRun(input.runId)!;
+    return {
+      run,
+      event: result
+    };
+  }
+
+  expirePendingPermissionsForTerminalRuns(updatedAt: string): number {
+    const expire = this.db.transaction(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT p.run_id
+           FROM permission_requests p
+           INNER JOIN runs r ON r.id = p.run_id
+           WHERE p.status = 'pending' AND r.status IN ('completed', 'failed', 'cancelled', 'interrupted')`
+        )
+        .all() as Array<{ run_id: string }>;
+      let expiredCount = 0;
+      for (const row of rows) {
+        expiredCount += this.expirePendingPermissionsForRun(row.run_id, updatedAt).length;
+      }
+      return expiredCount;
+    });
+    return expire();
   }
 
   mergeRunMetadata(id: string, metadata: JsonObject, updatedAt: string): void {
@@ -349,7 +541,18 @@ export class SQLiteStore implements StoreAdapter {
     return this.getPartsByMessageIds([current.message_id]).get(current.message_id)?.find((part) => part.id === input.id) ?? null;
   }
 
-  updateMessageStatus(id: string, status: MessageStatus, updatedAt: string, error?: string | null): void {
+  transitionMessageStatus(
+    id: string,
+    expectedStatuses: readonly MessageStatus[],
+    status: MessageStatus,
+    updatedAt: string,
+    error?: string | null
+  ): Message | null {
+    if (expectedStatuses.length === 0) {
+      return null;
+    }
+
+    const placeholders = expectedStatuses.map(() => "?").join(", ");
     if (error !== undefined) {
       const row = this.db.prepare("SELECT metadata_json FROM messages WHERE id = ?").get(id) as { metadata_json: string } | undefined;
       const metadata = parseJsonObject(row?.metadata_json);
@@ -358,13 +561,16 @@ export class SQLiteStore implements StoreAdapter {
       } else {
         delete metadata.error;
       }
-      this.db
-        .prepare("UPDATE messages SET status = ?, updated_at = ?, metadata_json = ? WHERE id = ?")
-        .run(status, updatedAt, JSON.stringify(metadata), id);
-      return;
+      const result = this.db
+        .prepare(`UPDATE messages SET status = ?, updated_at = ?, metadata_json = ? WHERE id = ? AND status IN (${placeholders})`)
+        .run(status, updatedAt, JSON.stringify(metadata), id, ...expectedStatuses);
+      return result.changes === 1 ? this.getMessage(id) : null;
     }
 
-    this.db.prepare("UPDATE messages SET status = ?, updated_at = ? WHERE id = ?").run(status, updatedAt, id);
+    const result = this.db
+      .prepare(`UPDATE messages SET status = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`)
+      .run(status, updatedAt, id, ...expectedStatuses);
+    return result.changes === 1 ? this.getMessage(id) : null;
   }
 
   mergeMessageMetadata(id: string, metadata: JsonObject, updatedAt: string): void {
@@ -375,48 +581,34 @@ export class SQLiteStore implements StoreAdapter {
 
   appendEvent(input: AppendEventInput): RunEvent {
     const append = this.db.transaction(() => {
-      const nextSeqRow = this.db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ?").get(input.runId) as {
-        seq: number;
-      };
-
-      this.db
-        .prepare(
-          `INSERT INTO events (id, run_id, session_id, seq, type, created_at, payload_json)
-           VALUES (@id, @runId, @sessionId, @seq, @type, @createdAt, @payloadJson)`
-        )
-        .run({
-          id: input.id,
-          runId: input.runId,
-          sessionId: input.sessionId,
-          seq: nextSeqRow.seq,
-          type: input.type,
-          createdAt: input.createdAt,
-          payloadJson: JSON.stringify(input.payload ?? {})
-        });
-
-      const row = this.db
-        .prepare(
-          `SELECT id, run_id, session_id, seq, type, created_at, payload_json
-           FROM events
-           WHERE id = ?`
-        )
-        .get(input.id) as EventRow;
-      return rowToEvent(row);
+      if (isTerminalRunEventType(input.type)) {
+        throw new Error(`Terminal event '${input.type}' must be written through finalizeRun().`);
+      }
+      const run = this.getRun(input.runId);
+      if (!run || !isActiveRunStatus(run.status)) {
+        throw new Error(`Cannot append non-terminal event '${input.type}' to inactive run '${input.runId}'.`);
+      }
+      return this.insertEvent(input);
     });
 
     return append();
   }
 
-  listEvents(runId: string): RunEvent[] {
+  listEvents(runId: string, after = 0): RunEvent[] {
     const rows = this.db
       .prepare(
         `SELECT id, run_id, session_id, seq, type, created_at, payload_json
          FROM events
-         WHERE run_id = ?
+         WHERE run_id = ? AND seq > ?
          ORDER BY seq ASC`
       )
-      .all(runId) as EventRow[];
+      .all(runId, after) as EventRow[];
     return rows.map(rowToEvent);
+  }
+
+  getLatestEventSeq(runId: string): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE run_id = ?").get(runId) as { seq: number };
+    return row.seq;
   }
 
   listAgentDefinitions(): AgentDefinition[] {
@@ -493,26 +685,39 @@ export class SQLiteStore implements StoreAdapter {
   }
 
   createPermissionRequest(input: CreatePermissionRequestInput): StoredPermissionRequest {
-    this.db
-      .prepare(
-        `INSERT INTO permission_requests (
-           id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
-           input_summary, public_input_json, execution_input_json, risk_level, reason, status,
-           tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
-         ) VALUES (
-           @id, @sessionId, @runId, @messageId, @invocationId, @toolId, @toolName, @caller, @permissionDecision,
-           @inputSummary, @publicInputJson, @executionInputJson, @riskLevel, @reason, @status,
-           @toolCallPartId, @commandOutputPartId, @metadataJson, @createdAt, @updatedAt, @resolvedAt
-         )`
-      )
-      .run({
-        ...input,
-        publicInputJson: JSON.stringify(input.publicInput),
-        executionInputJson: JSON.stringify(input.executionInput),
-        commandOutputPartId: input.commandOutputPartId ?? null,
-        metadataJson: JSON.stringify(input.metadata ?? {}),
-        resolvedAt: input.resolvedAt ?? null
-      });
+    const create = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO permission_requests (
+             id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
+             input_summary, public_input_json, execution_input_json, risk_level, reason, status,
+             tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
+           ) VALUES (
+             @id, @sessionId, @runId, @messageId, @invocationId, @toolId, @toolName, @caller, @permissionDecision,
+             @inputSummary, @publicInputJson, @executionInputJson, @riskLevel, @reason, @status,
+             @toolCallPartId, @commandOutputPartId, @metadataJson, @createdAt, @updatedAt, @resolvedAt
+           )`
+        )
+        .run({
+          ...input,
+          publicInputJson: JSON.stringify(input.publicInput),
+          executionInputJson: JSON.stringify(input.executionInput),
+          commandOutputPartId: input.commandOutputPartId ?? null,
+          metadataJson: JSON.stringify(input.metadata ?? {}),
+          resolvedAt: input.resolvedAt ?? null
+        });
+
+      if (input.status === "pending") {
+        const runUpdate = this.db
+          .prepare("UPDATE runs SET status = 'waiting_permission', error = NULL, updated_at = ? WHERE id = ? AND status = 'running'")
+          .run(input.updatedAt, input.runId);
+        if (runUpdate.changes !== 1) {
+          throw new Error(`Cannot create pending permission for inactive run '${input.runId}'.`);
+        }
+      }
+    });
+
+    create();
     return this.getPermissionRequest(input.id)!;
   }
 
@@ -541,17 +746,7 @@ export class SQLiteStore implements StoreAdapter {
       params.push(filter.sessionId);
     }
 
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
-    const rows = this.db
-      .prepare(
-        `SELECT id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
-                input_summary, public_input_json, execution_input_json, risk_level, reason, status,
-                tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
-         FROM permission_requests
-         ${where}
-         ORDER BY created_at DESC, id DESC`
-      )
-      .all(...params) as PermissionRequestRow[];
+    const rows = this.permissionRequestRows(clauses.join(" AND "), params);
     return rows.map(rowToPermissionRequest);
   }
 
@@ -560,10 +755,73 @@ export class SQLiteStore implements StoreAdapter {
     status: Exclude<PermissionRequestStatus, "pending">,
     resolvedAt: string
   ): StoredPermissionRequest | null {
-    this.db
-      .prepare("UPDATE permission_requests SET status = ?, resolved_at = ?, updated_at = ? WHERE id = ?")
-      .run(status, resolvedAt, resolvedAt, id);
-    return this.getPermissionRequest(id);
+    const resolveRequest = this.db.transaction((): StoredPermissionRequest | null => {
+      const request = this.getPermissionRequest(id);
+      if (!request || request.status !== "pending") {
+        return null;
+      }
+
+      const runUpdate = this.db
+        .prepare("UPDATE runs SET status = 'running', error = NULL, updated_at = ? WHERE id = ? AND status = 'waiting_permission'")
+        .run(resolvedAt, request.runId);
+      if (runUpdate.changes !== 1) {
+        return null;
+      }
+
+      const requestUpdate = this.db
+        .prepare(
+          `UPDATE permission_requests
+           SET status = ?, resolved_at = ?, updated_at = ?
+           WHERE id = ? AND status = 'pending'`
+        )
+        .run(status, resolvedAt, resolvedAt, id);
+      if (requestUpdate.changes !== 1) {
+        throw new Error(`Permission request '${id}' changed while it was being resolved.`);
+      }
+      return this.getPermissionRequest(id);
+    });
+
+    return resolveRequest();
+  }
+
+  getDaemonLease(): DaemonLeaseRecord | null {
+    const row = this.db
+      .prepare("SELECT owner_id, pid, acquired_at, heartbeat_at FROM daemon_lease WHERE lease_key = 1")
+      .get() as DaemonLeaseRow | undefined;
+    return row ? rowToDaemonLease(row) : null;
+  }
+
+  createDaemonLease(input: DaemonLeaseRecord): boolean {
+    const result = this.db
+      .prepare(
+        `INSERT INTO daemon_lease (lease_key, owner_id, pid, acquired_at, heartbeat_at)
+         VALUES (1, @ownerId, @pid, @acquiredAt, @heartbeatAt)
+         ON CONFLICT(lease_key) DO NOTHING`
+      )
+      .run(input);
+    return result.changes === 1;
+  }
+
+  takeOverDaemonLease(expectedOwnerId: string, expectedHeartbeatAt: string, input: DaemonLeaseRecord): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE daemon_lease
+         SET owner_id = @ownerId, pid = @pid, acquired_at = @acquiredAt, heartbeat_at = @heartbeatAt
+         WHERE lease_key = 1 AND owner_id = @expectedOwnerId AND heartbeat_at = @expectedHeartbeatAt`
+      )
+      .run({ ...input, expectedOwnerId, expectedHeartbeatAt });
+    return result.changes === 1;
+  }
+
+  heartbeatDaemonLease(ownerId: string, pid: number, heartbeatAt: string): boolean {
+    const result = this.db
+      .prepare("UPDATE daemon_lease SET heartbeat_at = ? WHERE lease_key = 1 AND owner_id = ? AND pid = ?")
+      .run(heartbeatAt, ownerId, pid);
+    return result.changes === 1;
+  }
+
+  releaseDaemonLease(ownerId: string): boolean {
+    return this.db.prepare("DELETE FROM daemon_lease WHERE lease_key = 1 AND owner_id = ?").run(ownerId).changes === 1;
   }
 
   listSettings(): JsonObject {
@@ -685,6 +943,14 @@ export class SQLiteStore implements StoreAdapter {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS daemon_lease (
+        lease_key INTEGER PRIMARY KEY CHECK (lease_key = 1),
+        owner_id TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        acquired_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS provider_profiles (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -799,6 +1065,112 @@ export class SQLiteStore implements StoreAdapter {
       .run(defaultToolIdsJson, updatedAt, "main");
   }
 
+  private insertEvent(input: AppendEventInput): RunEvent {
+    const nextSeqRow = this.db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ?").get(input.runId) as {
+      seq: number;
+    };
+
+    this.db
+      .prepare(
+        `INSERT INTO events (id, run_id, session_id, seq, type, created_at, payload_json)
+         VALUES (@id, @runId, @sessionId, @seq, @type, @createdAt, @payloadJson)`
+      )
+      .run({
+        id: input.id,
+        runId: input.runId,
+        sessionId: input.sessionId,
+        seq: nextSeqRow.seq,
+        type: input.type,
+        createdAt: input.createdAt,
+        payloadJson: JSON.stringify(input.payload ?? {})
+      });
+
+    const row = this.db
+      .prepare(
+        `SELECT id, run_id, session_id, seq, type, created_at, payload_json
+         FROM events
+         WHERE id = ?`
+      )
+      .get(input.id) as EventRow;
+    return rowToEvent(row);
+  }
+
+  private permissionRequestRows(condition = "", params: readonly string[] = []): PermissionRequestRow[] {
+    const where = condition ? `WHERE ${condition}` : "";
+    return this.db
+      .prepare(
+        `SELECT id, session_id, run_id, message_id, invocation_id, tool_id, tool_name, caller, permission_decision,
+                input_summary, public_input_json, execution_input_json, risk_level, reason, status,
+                tool_call_part_id, command_output_part_id, metadata_json, created_at, updated_at, resolved_at
+         FROM permission_requests
+         ${where}
+         ORDER BY created_at DESC, id DESC`
+      )
+      .all(...params) as PermissionRequestRow[];
+  }
+
+  private expirePendingPermissionsForRun(runId: string, resolvedAt: string): StoredPermissionRequest[] {
+    const pendingRows = this.permissionRequestRows("run_id = ? AND status = 'pending'", [runId]);
+    if (pendingRows.length === 0) {
+      return [];
+    }
+
+    this.db
+      .prepare(
+        `UPDATE permission_requests
+         SET status = 'expired', resolved_at = ?, updated_at = ?
+         WHERE run_id = ? AND status = 'pending'`
+      )
+      .run(resolvedAt, resolvedAt, runId);
+
+    for (const pendingRow of pendingRows) {
+      const part = this.db
+        .prepare(
+          `SELECT id, message_id, seq, type, text, content_json, metadata_json, created_at, updated_at
+           FROM message_parts
+           WHERE id = ? AND type = 'tool_call'`
+        )
+        .get(pendingRow.tool_call_part_id) as MessagePartRow | undefined;
+      if (!part) {
+        continue;
+      }
+      const content = parseJsonObject(part.content_json);
+      const status = content.status;
+      if (status !== "created" && status !== "pending" && status !== "pending_permission" && status !== "running") {
+        continue;
+      }
+      content.status = "cancelled";
+      this.db
+        .prepare("UPDATE message_parts SET content_json = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(content), resolvedAt, part.id);
+    }
+
+    return pendingRows.map((row) => rowToPermissionRequest({ ...row, status: "expired", resolved_at: resolvedAt, updated_at: resolvedAt }));
+  }
+
+  private cancelActiveToolCallPartsForRun(runId: string, updatedAt: string): void {
+    const rows = this.db
+      .prepare(
+        `SELECT p.id, p.content_json
+         FROM message_parts p
+         INNER JOIN messages m ON m.id = p.message_id
+         WHERE m.run_id = ? AND p.type = 'tool_call'`
+      )
+      .all(runId) as Array<{ id: string; content_json: string }>;
+
+    for (const row of rows) {
+      const content = parseJsonObject(row.content_json);
+      const status = content.status;
+      if (status !== "created" && status !== "pending" && status !== "pending_permission" && status !== "running") {
+        continue;
+      }
+      content.status = "cancelled";
+      this.db
+        .prepare("UPDATE message_parts SET content_json = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(content), updatedAt, row.id);
+    }
+  }
+
   private getPartsByMessageIds(messageIds: string[]): Map<string, MessagePart[]> {
     if (messageIds.length === 0) {
       return new Map();
@@ -837,6 +1209,21 @@ function rowToSession(row: SessionRow, defaultWorkingDirectory: string): Session
 function normalizeStoredWorkingDirectory(value: string | null | undefined, defaultWorkingDirectory: string): string {
   const trimmed = value?.trim();
   return trimmed ? resolve(trimmed) : defaultWorkingDirectory;
+}
+
+function assertValidRunTransition(expectedStatuses: readonly RunStatus[], status: RunStatus): void {
+  for (const expectedStatus of expectedStatuses) {
+    if (!canTransitionRunStatus(expectedStatus, status)) {
+      throw new Error(`Invalid run status transition: ${expectedStatus} -> ${status}`);
+    }
+  }
+}
+
+function assertMatchingTerminalEvent(status: TerminalRunStatus, eventType: RunEventType): void {
+  const expectedEventType = `run_${status}`;
+  if (eventType !== expectedEventType) {
+    throw new Error(`Terminal run status '${status}' requires event '${expectedEventType}', received '${eventType}'.`);
+  }
 }
 
 function rowToRun(row: RunRow): Run {
@@ -945,6 +1332,15 @@ function rowToPermissionRequest(row: PermissionRequestRow): StoredPermissionRequ
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     resolvedAt: row.resolved_at
+  };
+}
+
+function rowToDaemonLease(row: DaemonLeaseRow): DaemonLeaseRecord {
+  return {
+    ownerId: row.owner_id,
+    pid: row.pid,
+    acquiredAt: row.acquired_at,
+    heartbeatAt: row.heartbeat_at
   };
 }
 

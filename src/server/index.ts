@@ -17,6 +17,7 @@ import { normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-se
 import type { DaemonStatus, ToolSettings } from "../shared/types";
 import { SQLiteStore } from "../store/sqlite";
 import { createDefaultToolRegistry } from "../tools/registry";
+import { DatabaseLease } from "./database-lease";
 import { registerApiRoutes } from "./routes";
 
 const defaultPort = 8787;
@@ -37,6 +38,16 @@ const mode = process.env.NODE_ENV || "development";
 const shouldServeDashboard = mode === "production" || process.env.AGENT_PLATFORM_DAEMON === "1";
 
 const store = new SQLiteStore({ dbPath, defaultWorkingDirectory: defaultSessionWorkingDirectory });
+const databaseLease = new DatabaseLease({ store });
+const leaseAcquisition = databaseLease.acquire();
+if (!leaseAcquisition.acquired) {
+  const owner = leaseAcquisition.lease;
+  console.error(
+    `Cannot start agent platform: database is owned by another live daemon${owner ? ` (pid ${owner.pid}, heartbeat ${owner.heartbeatAt})` : ""}.`
+  );
+  console.error(`SQLite database: ${dbPath}`);
+  process.exit(1);
+}
 const eventBus = new RunEventBus();
 const openAIChatGPTCredentials = new OpenAIChatGPTCredentialStore({ runtimeDir });
 const openAIChatGPTAuth = new OpenAIChatGPTAuthService({
@@ -79,42 +90,110 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   if (status >= 500) {
     console.error(error);
   }
+  if (error instanceof KernelError) {
+    res.status(status).json({ error: error.code ?? message, message, ...(error.details ?? {}) });
+    return;
+  }
   res.status(status).json({ error: message });
 });
 
+let serverReady = false;
 const server = app.listen(port, "127.0.0.1", () => {
-  console.log(`Agent platform prototype server listening on http://127.0.0.1:${port}`);
-  console.log(`SQLite database: ${dbPath}`);
+  if (shuttingDown) {
+    return;
+  }
+  try {
+    kernel.reconcileStartupState();
+    databaseLease.startHeartbeat((error) => {
+      console.error("Database lease heartbeat failed; stopping daemon.", error);
+      shutdown("database lease lost", 1);
+    });
+    serverReady = true;
+    console.log(`Agent platform prototype server listening on http://127.0.0.1:${port}`);
+    console.log(`SQLite database: ${dbPath}`);
+  } catch (error) {
+    console.error("Failed to reconcile persisted run state after acquiring the database lease.", error);
+    shutdown("startup reconciliation failure", 1);
+  }
 });
+server.on("error", handleServerError);
 
 let shuttingDown = false;
+let requestedExitCode = 0;
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-function shutdown(signal: NodeJS.Signals): void {
+function shutdown(reason: string, exitCode = 0): void {
+  requestedExitCode = Math.max(requestedExitCode, exitCode);
   if (shuttingDown) {
     return;
   }
 
   shuttingDown = true;
-  console.log(`Received ${signal}; closing HTTP server...`);
+  console.log(`Received ${reason}; closing HTTP server...`);
+
+  void shutdownGracefully();
+}
+
+async function shutdownGracefully(): Promise<void> {
+  let exitCode = requestedExitCode;
 
   const forceExit = setTimeout(() => {
-    console.error("HTTP server did not close within 10s; exiting.");
+    console.error("Daemon did not stop within 10s; exiting.");
     process.exit(1);
   }, 10_000);
   forceExit.unref();
 
-  server.close((error) => {
-    clearTimeout(forceExit);
-    if (error) {
-      console.error("Failed to close HTTP server", error);
-      process.exit(1);
-    }
-    console.log("HTTP server closed.");
-    process.exit(0);
+  const serverClosed = new Promise<Error | null>((resolvePromise) => {
+    server.close((error) => resolvePromise(error ?? null));
   });
+
+  try {
+    await kernel.shutdown(5_000);
+  } catch (error) {
+    exitCode = 1;
+    console.error("Failed to interrupt active runs during shutdown", error);
+  }
+
+  // Waiting-permission SSE streams may otherwise keep server.close() open indefinitely.
+  server.closeAllConnections();
+  const closeError = await serverClosed;
+  if (closeError) {
+    exitCode = 1;
+    console.error("Failed to close HTTP server", closeError);
+  } else {
+    console.log("HTTP server closed.");
+  }
+
+  try {
+    if (!databaseLease.release()) {
+      exitCode = 1;
+      console.error("Database lease was no longer owned during shutdown.");
+    }
+  } catch (error) {
+    exitCode = 1;
+    console.error("Failed to release database lease", error);
+  }
+
+  clearTimeout(forceExit);
+  process.exit(Math.max(exitCode, requestedExitCode));
+}
+
+function handleServerError(error: Error): void {
+  if (serverReady) {
+    console.error("Agent platform HTTP server failed; stopping daemon.", error);
+    shutdown("HTTP server error", 1);
+    return;
+  }
+
+  console.error(`Agent platform server failed to listen on 127.0.0.1:${port}.`, error);
+  try {
+    databaseLease.release();
+  } catch (releaseError) {
+    console.error("Failed to release database lease after listen failure", releaseError);
+  }
+  process.exitCode = 1;
 }
 
 function getDaemonStatus(): DaemonStatus {

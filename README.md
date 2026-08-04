@@ -40,6 +40,7 @@ npm run start      # build dashboard, then start the local daemon in the backgro
 npm run status     # check daemon.pid and GET /api/status
 npm run stop       # send SIGTERM and clean daemon pid/metadata after exit
 npm run typecheck  # TypeScript check
+npm run smoke:interrupt     # run lease/cancel/restart/recovery/SSE/permission/provider/tool interruption fixtures
 npm run smoke:model-catalog # provider model parser/cache/request fixtures (no real provider calls)
 npm run smoke:reasoning     # reasoning payload/stream/persistence fixtures
 ```
@@ -67,7 +68,7 @@ The daemon writes runtime state under `.agent-platform/`:
   logs/daemon.log
 ```
 
-If the pid file is stale, `status` reports it clearly and removes stale pid/metadata when safe. `stop` sends `SIGTERM`, waits for the server to close, and avoids force-killing on timeout.
+If the pid file is stale, `status` reports it clearly and removes stale pid/metadata when safe. `stop` sends `SIGTERM`, waits for the server to close, and avoids force-killing on timeout. Independently of the pid file, the SQLite database contains an exclusive daemon lease: a second process cannot serve or reconcile the same DB while its owner is live. The lease heartbeat is refreshed every five seconds, and takeover requires both a heartbeat older than 15 seconds and a dead recorded local PID.
 
 Useful environment variables:
 
@@ -109,13 +110,18 @@ Useful environment variables:
 - `GET /api/sessions/:id`
 - `PATCH /api/sessions/:id` body `{ "workingDirectory": "/absolute/project/path" }` updates the session cwd after resolving/validating that it exists and is a directory
 - `GET /api/sessions/:id/messages`
-- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` manually invokes the local shell tool. `cwd` is optional; when omitted, the session `workingDirectory` is used. Relative `cwd` values resolve from the session `workingDirectory`; absolute values resolve as-is. `timeoutMs` is optional; when omitted, Tool Settings `shell.defaultTimeoutMs` is used. The response is one of: executed immediately, pending permission, or denied by policy.
-- `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "provider-defined-value", "temperature": 0.2 } }`
-- `GET /api/runs/:id/events` SSE stream
-- `POST /api/runs/:id/cancel`
+- `GET /api/sessions/:id/runs` returns public persisted run summaries; add `?active=1` for `running`, `waiting_permission`, and `cancelling` only
+- `GET /api/sessions/:id/runs/active` is the explicit active-run form of the same public-summary query used by dashboard recovery
+- `POST /api/sessions/:id/tools/shell.exec` body `{ "command": "echo hello", "cwd": "optional", "timeoutMs": 60000 }` preserves the original synchronous contract by default: an allowed invocation waits and returns `200` with its final result, while ask/deny decisions return immediately. Add `?async=1` to opt into cancellable execution; an allowed invocation then returns `202` with `state: "running"`, and the returned public run is followed through SSE and cancelled through the normal run cancel endpoint. The dashboard uses this async form. `cwd` is optional; when omitted, the session `workingDirectory` is used. Relative `cwd` values resolve from the session `workingDirectory`; absolute values resolve as-is. `timeoutMs` is optional; when omitted, Tool Settings `shell.defaultTimeoutMs` is used.
+- `POST /api/sessions/:id/runs` body `{ "text": "...", "agentId": "main", "providerProfileId": "mock" | "openai-compatible" | "openai-chatgpt", "runOptions": { "model": "...", "reasoningEffort": "provider-defined-value", "temperature": 0.2 } }`. A session with existing active work returns `409` with `error=active_run_exists` and its public run summary
+- `GET /api/runs/:id` returns a public run summary
+- `GET /api/runs/:id/events` SSE stream; `?after=<non-negative-seq>` and `Last-Event-ID` resume strictly after a persisted event sequence. On native reconnect, a valid `Last-Event-ID` takes precedence over the original query. An active stream whose initial cursor is ahead of storage emits a named `run_cursor` transport event with the canonical latest `id`; native EventSource remembers that id while the dashboard's run-event reducer ignores the named control event. A terminal run with no later event still returns `204` before SSE headers.
+- `POST /api/runs/:id/cancel` requests cancellation and returns the latest public run summary
 - `POST /api/runs/:id/resume` resumes a run that is waiting for already-resolved tool permission
 
 The OpenAI-compatible profile is env-backed. Only the credential reference (`env:OPENAI_API_KEY`) is surfaced through the API/UI; the API key value is read by the server process at runtime and is not stored in SQLite.
+
+Run lookup/list, start/resume/cancel, manual-tool, permission, and replay responses use explicit public projections. Public run summaries allow only identifiers, provider/status, model/run options, usage, current phase, timestamps, and sanitized error. Public messages retain display content and usage but remove internal message/part metadata; provider resolution omits base URLs and credential references. Raw execution input and internal command metadata/context/credentials are excluded. A sanitized user-visible command may still be shown because permission approval and the tool timeline require it.
 
 If `OPENAI_API_KEY` is missing, the default provider profile is `mock`. If a run explicitly requests `openai-compatible` without a key, the kernel falls back to mock and includes fallback metadata in the run response and `run_started` event. To try an OpenAI-compatible endpoint, set:
 
@@ -136,6 +142,18 @@ The Chat Run Inspector lazily loads models only for the selected provider. Setti
 - `mock`: returns its single built-in mock model without network access.
 
 Successful remote catalogs are cached in memory for five minutes. Concurrent callers share one request; `refresh=1` bypasses a valid cached result. A failed refresh returns the last successful catalog as `stale`, or the configured default model as a `configured-only` fallback when no successful result exists. Cache entries are invalidated after ChatGPT connect/reconnect/logout. Raw provider error bodies, credentials, and unrecognized backend fields are not copied into the canonical API response.
+
+### Run cancellation, daemon shutdown, and restart
+
+Runs use compare-and-set lifecycle transitions. An explicit `POST /api/runs/:id/cancel` moves an active run to `cancelling`, expires any pending permission for that run, and aborts the shared provider/tool signal. The run becomes `cancelled` after active work exits, including when daemon shutdown overlaps an explicit cancel. A shutdown-only interruption becomes `interrupted`. Terminal run state, streaming assistant-message state, pending tool-call cleanup, pending-permission expiry, and the one terminal event are committed together, so a late provider/tool completion cannot overwrite termination or append a second terminal event. Cancelling an already-terminal run is an idempotent no-op.
+
+Closing a browser tab, switching sessions, or losing an SSE connection only removes or pauses that event subscription; it does not cancel daemon work. On load and session selection, the dashboard discovers persisted active runs, rebuilds that run's messages from canonical event sequence zero, and reconnects with sequence cursors thereafter. Waiting-permission and usage changes emit complete assistant-message snapshots, so replay includes pending tool status, command-output placeholders, safe metadata shape, and usage without a separate message fetch. Transient EventSource failures show `reconnecting` while native retry continues. Only the explicit Cancel control calls the cancel API.
+
+New work is limited to one active run per session (`running`, `waiting_permission`, or `cancelling`) inside the SQLite create transaction. If legacy data contains more than one active run, the dashboard clearly warns and tracks the most recently updated run rather than silently choosing an arbitrary row; after it terminates, discovery runs again. Cancel is best-effort and cannot roll back provider, command, filesystem, or network effects that already completed.
+
+On graceful daemon shutdown, running work receives an interruption signal and is given a bounded period to exit. Startup reconciliation runs only after the process has acquired the exclusive DB lease and successfully started listening. Persisted `running` and `cancelling` rows left by an ungraceful stop are then finalized as `interrupted`; pending permissions attached to any already-terminal legacy run are expired. A valid `waiting_permission` run and its pending request remain intact so the user can resolve or cancel them after restart.
+
+Cancellation is cooperative outside the built-in shell executor and cannot undo provider requests, filesystem writes, network calls, or other side effects that already happened. `shell.exec` sends SIGTERM to the spawned POSIX process group, waits briefly, then sends SIGKILL to the group; Windows uses a best-effort child-process fallback. This stops local work but still cannot roll back effects produced before termination.
 
 ### Run options and usage visibility
 
@@ -164,7 +182,7 @@ Messages are no longer limited to a single text projection. `message_parts` keep
 - `command_output`
 - `file_ref`
 
-The run event log remains append-only and now uses/reserves event names for tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, `permission.denied`, and `run_waiting_permission`.
+The run event log remains append-only and now uses/reserves event names for tool and permission runtime flow: `tool_call.created`, `tool_call.updated`, `tool_call.delta`, `tool.started`, `tool.stdout.delta`, `tool.stderr.delta`, `tool.completed`, `tool.failed`, `tool_result.created`, `permission.requested`, `permission.approved`, `permission.denied`, `run_waiting_permission`, `run_cancelling`, and terminal `run_interrupted`.
 
 Structured payloads and metadata must stay sanitized: API keys, OAuth tokens, credential material, and raw chain-of-thought must not be stored in message parts or events.
 
@@ -178,7 +196,7 @@ Input:
 { "command": "echo hello", "cwd": "optional/path", "timeoutMs": 60000 }
 ```
 
-Output records `exitCode`, `stdout`, `stderr`, `durationMs`, `timedOut`, and truncation flags. The executor uses Node `child_process.spawn` with `shell: true`, stores stdout/stderr deltas as tool events, and writes `tool_call`, `command_output`, and `tool_result` message parts to the session. Output is size-limited before persistence.
+Output records `exitCode`, `stdout`, `stderr`, `durationMs`, `timedOut`, and truncation flags. The executor uses Node `child_process.spawn` with `shell: true`, stores stdout/stderr deltas as tool events, and writes `tool_call`, `command_output`, and `tool_result` message parts to the session. Output is size-limited before persistence. Timeout remains a failed tool result with `timedOut: true`; an external run cancellation is recorded as a cancelled tool result.
 
 The current agent tool loop is intentionally minimal and only supports this one provider-facing tool, but the kernel treats tool use as a normal capability of an agent run. If a model emits a `shell_exec` tool call, the kernel maps it back to canonical `shell.exec`, evaluates Tool Settings permission, executes or denies the invocation, injects the resulting tool output back into context, and calls the model again. There is no core tool-iteration cap; long-running loops are controlled through user cancel/interruption and the permission flow rather than by a fixed kernel limit.
 
@@ -288,7 +306,7 @@ To connect:
 5. Click **Poll / Complete** until the status becomes connected.
 6. Select `OpenAI ChatGPT` in the Chat provider selector and run a message.
 
-OAuth access/refresh tokens are written only to `.agent-platform/credentials/openai-chatgpt.json` with `0600` file permissions. The SQLite DB stores no token values; API/UI responses expose only `credentialRef=file:openai-chatgpt` and status such as `needs_auth`, `connected`, `expired`, or `error`. If the access token expires, test/run attempts refresh it with the stored refresh token and rewrites the credential file.
+OAuth access/refresh tokens are written only to `.agent-platform/credentials/openai-chatgpt.json` with `0600` file permissions. The SQLite DB stores no token values; API/UI responses expose only `credentialRef=file:openai-chatgpt` and status such as `needs_auth`, `connected`, `expired`, or `error`. If the access token expires, test/run attempts refresh it with the stored refresh token and rewrite the credential file. Refresh HTTP work has its own bounded timeout; cancelling a run stops that run from waiting for a shared refresh without aborting refresh work that another caller may still need.
 
 If `openai-chatgpt` is selected before connecting, the run fails explicitly with an auth-required error. It does not silently fall back to mock. Failed assistant messages expose the stored run/provider error instead of only showing `failed`.
 
@@ -325,7 +343,8 @@ The React UI has two tabs:
 - `agent_definitions` stores the default `main` agent and future agent rows; it must not contain API keys, OAuth tokens, or credential material.
 - `provider_profiles` exists as a raw SQLite table for future user-managed profiles. Current env secrets and OAuth token values are never written there.
 - `.agent-platform/` contains local runtime pid/metadata/log/credential files and is ignored by git.
-- This is a prototype: no auth, no migration framework, and no multi-process run coordination.
+- One live daemon owns a SQLite DB through the `daemon_lease` row before startup reconciliation. This is local single-owner protection, not distributed or multi-host run coordination.
+- This is a prototype: no auth and no migration framework.
 
 ## Next TODO
 

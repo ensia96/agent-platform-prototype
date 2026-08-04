@@ -1,3 +1,15 @@
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | null,
+    readonly body: Record<string, unknown> | null
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
 export async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) {
@@ -14,7 +26,13 @@ export async function requestJson<T>(url: string, init?: RequestInit): Promise<T
           })
           .join("\n")}`
       : "";
-    throw new Error(`${body?.message || body?.error || `${response.status} ${response.statusText}`}${issueText}`);
+    const message = `${body?.message || body?.error || `${response.status} ${response.statusText}`}${issueText}`;
+    throw new ApiRequestError(
+      message,
+      response.status,
+      typeof body?.error === "string" ? body.error : null,
+      body as Record<string, unknown> | null
+    );
   }
   return (await response.json()) as T;
 }

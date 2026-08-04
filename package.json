@@ -12,6 +12,7 @@
     "stop": "node scripts/daemon.mjs stop",
     "status": "node scripts/daemon.mjs status",
     "smoke:kernel": "tsx scripts/kernel-smoke.ts",
+    "smoke:interrupt": "tsx scripts/interrupt-smoke.ts",
     "smoke:markdown": "tsx scripts/markdown-smoke.ts",
     "smoke:model-catalog": "tsx scripts/model-catalog-smoke.ts",
     "smoke:reasoning": "tsx scripts/reasoning-smoke.ts",

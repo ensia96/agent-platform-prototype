@@ -7,6 +7,16 @@ export class ToolInputError extends Error {
   }
 }
 
+export class ToolExecutionAbortError extends Error {
+  constructor(
+    message = "Tool execution was cancelled.",
+    readonly output: JsonObject = {}
+  ) {
+    super(message);
+    this.name = "AbortError";
+  }
+}
+
 export interface ToolInputValidationContext {
   /** Default execution cwd supplied by the session workingDirectory. */
   cwd: string;

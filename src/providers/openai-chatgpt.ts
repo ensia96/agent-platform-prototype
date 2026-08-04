@@ -77,6 +77,7 @@ interface OpenAIChatGPTProviderOptions {
   endpoint?: string;
   clientId?: string;
   fetch?: typeof fetch;
+  refreshTimeoutMs?: number;
 }
 
 export class OpenAIChatGPTProvider implements ProviderAdapter {
@@ -88,6 +89,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
   private readonly endpoint: string;
   private readonly clientId?: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly refreshTimeoutMs?: number;
   private refreshPromise: Promise<OpenAIChatGPTCredential> | null = null;
 
   constructor(options: OpenAIChatGPTProviderOptions) {
@@ -96,6 +98,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     this.endpoint = options.endpoint?.trim() || defaultOpenAIChatGPTEndpoint;
     this.clientId = options.clientId?.trim() || undefined;
     this.fetchImpl = options.fetch ?? fetch;
+    this.refreshTimeoutMs = options.refreshTimeoutMs;
   }
 
   async test(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderTestResponse> {
@@ -202,6 +205,7 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
   }
 
   async run(input: ProviderRunInput, context: ProviderRunContext): Promise<ProviderRunResult> {
+    throwIfAborted(context.signal);
     if (!input.credential.oauth) {
       if (input.profile.status.state === "error") {
         throw new Error(input.profile.status.message);
@@ -209,7 +213,8 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       throw new Error("OpenAI ChatGPT authentication required. Open Settings → Providers → OpenAI ChatGPT and connect first.");
     }
 
-    const credential = await this.ensureUsableCredential(input.credential.oauth as OpenAIChatGPTCredential);
+    const credential = await this.ensureUsableCredential(input.credential.oauth as OpenAIChatGPTCredential, context.signal);
+    throwIfAborted(context.signal);
     const endpoint = getEndpoint(input.profile);
     const headers = buildCodexHeaders(credential, "text/event-stream", input.session.id);
 
@@ -269,7 +274,10 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     return { toolCalls };
   }
 
-  private async ensureUsableCredential(credential: OpenAIChatGPTCredential): Promise<OpenAIChatGPTCredential> {
+  private async ensureUsableCredential(credential: OpenAIChatGPTCredential, signal?: AbortSignal): Promise<OpenAIChatGPTCredential> {
+    if (signal) {
+      throwIfAborted(signal);
+    }
     if (!isCredentialExpired(credential, Date.now() + refreshSkewMs)) {
       return credential;
     }
@@ -278,7 +286,9 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
       this.refreshPromise = refreshOpenAIChatGPTCredential(credential, {
         issuer: this.issuer,
         clientId: this.clientId,
-        endpoint: this.endpoint
+        endpoint: this.endpoint,
+        fetch: this.fetchImpl,
+        timeoutMs: this.refreshTimeoutMs
       })
         .then(async (refreshed) => {
           await this.credentialStore.write(refreshed);
@@ -289,8 +299,46 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
         });
     }
 
-    return this.refreshPromise;
+    return signal ? awaitWithAbort(this.refreshPromise, signal) : this.refreshPromise;
   }
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) {
+    return;
+  }
+  if (signal.reason instanceof Error) {
+    throw signal.reason;
+  }
+  const error = new Error("OpenAI ChatGPT run was aborted.");
+  error.name = "AbortError";
+  throw error;
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  throwIfAborted(signal);
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      try {
+        throwIfAborted(signal);
+      } catch (error) {
+        rejectPromise(error);
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolvePromise(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        rejectPromise(error);
+      }
+    );
+  });
 }
 
 export function buildOpenAIChatGPTModelsEndpoint(responsesEndpoint: string): string {

@@ -1,7 +1,20 @@
 import { randomUUID } from "node:crypto";
 import type { RunEventBus } from "./event-bus";
 import type { StoreAdapter } from "../store/types";
-import type { JsonObject, Message, MessagePart, MessagePartType, Run, RunEvent, RunEventType, RunUsage } from "../shared/types";
+import type {
+  JsonObject,
+  Message,
+  MessagePart,
+  MessagePartType,
+  Run,
+  RunEvent,
+  RunEventType,
+  RunStatus,
+  RunUsage,
+  TerminalRunEventType,
+  TerminalRunStatus
+} from "../shared/types";
+import { isTerminalRunStatus } from "../shared/types";
 import type {
   ProviderMessagePartInput,
   ProviderReasoningDetailRecord,
@@ -19,6 +32,7 @@ export interface RunWriterOptions {
   eventBus: RunEventBus;
   run: Run;
   assistantMessageId: string;
+  signal?: AbortSignal;
 }
 
 export class RunWriter implements ProviderRunWriter {
@@ -26,9 +40,9 @@ export class RunWriter implements ProviderRunWriter {
   private readonly eventBus: RunEventBus;
   private readonly run: Run;
   private readonly assistantMessageId: string;
+  private readonly signal?: AbortSignal;
   private text = "";
   private terminal = false;
-  private metadata: JsonObject;
   private readonly priorUsage: RunUsage | null;
   private turnUsage: RunUsage | null = null;
   private usage: RunUsage | null;
@@ -39,9 +53,10 @@ export class RunWriter implements ProviderRunWriter {
     this.eventBus = options.eventBus;
     this.run = options.run;
     this.assistantMessageId = options.assistantMessageId;
+    this.signal = options.signal;
+    this.terminal = isTerminalRunStatus(options.run.status);
     const assistantMessage = options.store.getMessage(options.assistantMessageId);
     this.text = assistantMessage?.parts.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
-    this.metadata = { ...options.run.metadata };
     this.priorUsage = options.run.usage ? { ...options.run.usage } : null;
     this.usage = this.priorUsage;
     this.reasoningPartIds = {
@@ -55,7 +70,7 @@ export class RunWriter implements ProviderRunWriter {
   }
 
   writeDelta(delta: string): void {
-    if (this.terminal || delta.length === 0) {
+    if (!this.isWritable() || delta.length === 0) {
       return;
     }
 
@@ -75,7 +90,7 @@ export class RunWriter implements ProviderRunWriter {
   }
 
   writeUsage(usage: RunUsage): void {
-    if (this.terminal) {
+    if (!this.isWritable()) {
       return;
     }
 
@@ -85,15 +100,18 @@ export class RunWriter implements ProviderRunWriter {
   }
 
   writeMetadata(metadata: JsonObject): void {
-    if (this.terminal || Object.keys(metadata).length === 0) {
+    if (!this.isWritable() || Object.keys(metadata).length === 0) {
       return;
     }
 
     const now = new Date().toISOString();
-    this.metadata = { ...this.metadata, ...metadata };
     this.store.mergeRunMetadata(this.run.id, metadata, now);
     this.store.mergeMessageMetadata(this.assistantMessageId, metadata, now);
     this.store.touchSession(this.run.sessionId, now);
+    const message = this.store.getMessage(this.assistantMessageId);
+    if (message) {
+      this.emit("assistant_message_updated", { message });
+    }
   }
 
   appendMessagePart(input: ProviderMessagePartInput): MessagePart {
@@ -121,7 +139,7 @@ export class RunWriter implements ProviderRunWriter {
     provenance: ProviderReasoningProvenance
   ): MessagePart | null {
     const text = value?.trim();
-    if (!text || this.terminal) {
+    if (!text || !this.isWritable()) {
       return null;
     }
 
@@ -200,7 +218,7 @@ export class RunWriter implements ProviderRunWriter {
     return part;
   }
 
-  recordToolResult(input: ProviderToolResultRecord): MessagePart {
+  recordToolResult(input: ProviderToolResultRecord, options: { allowWhileTerminating?: boolean } = {}): MessagePart {
     const status = input.status ?? (input.error ? "failed" : "completed");
     const content: JsonObject = {
       callId: input.callId,
@@ -222,12 +240,15 @@ export class RunWriter implements ProviderRunWriter {
       content.error = input.error.trim();
     }
 
-    const part = this.appendStructuredPart({
-      type: "tool_result",
-      text: input.outputSummary?.trim() || input.output || input.error || `Tool result: ${status}`,
-      content,
-      metadata: input.metadata
-    });
+    const part = this.appendStructuredPart(
+      {
+        type: "tool_result",
+        text: input.outputSummary?.trim() || input.output || input.error || `Tool result: ${status}`,
+        content,
+        metadata: input.metadata
+      },
+      options
+    );
     this.emit("tool_result.created", {
       messageId: this.assistantMessageId,
       partId: part.id,
@@ -281,47 +302,63 @@ export class RunWriter implements ProviderRunWriter {
   }
 
   complete(): void {
-    this.finish("completed", "run_completed", terminalPayload(this.assistantMessageId, this.metadata, this.usage));
+    this.finish("completed", "run_completed", terminalPayload(this.assistantMessageId, this.usage));
   }
 
   completeMessage(): Message | null {
-    if (this.terminal) {
+    if (!this.isWritable()) {
       return this.store.getMessage(this.assistantMessageId);
     }
 
     this.terminal = true;
     const now = new Date().toISOString();
-    this.store.updateMessageStatus(this.assistantMessageId, "completed", now, null);
-    this.store.touchSession(this.run.sessionId, now);
-    const message = this.store.getMessage(this.assistantMessageId);
+    const message = this.store.transitionMessageStatus(this.assistantMessageId, ["streaming"], "completed", now, null);
     if (message) {
+      this.store.touchSession(this.run.sessionId, now);
       this.emit("assistant_message_updated", { message });
     }
-    return message;
+    return message ?? this.store.getMessage(this.assistantMessageId);
   }
 
   cancel(): void {
-    this.finish("cancelled", "run_cancelled", { messageId: this.assistantMessageId });
+    this.finish("cancelled", "run_cancelled", terminalPayload(this.assistantMessageId, this.usage));
   }
 
   fail(error: Error): void {
-    const payload = terminalPayload(this.assistantMessageId, this.metadata, this.usage);
+    const payload = terminalPayload(this.assistantMessageId, this.usage);
     payload.error = error.message;
     this.finish("failed", "run_failed", payload);
   }
 
-  private finish(status: "completed" | "cancelled" | "failed", eventType: RunEventType, payload: unknown): void {
-    if (this.terminal) {
+  interrupt(reason = "The daemon stopped before the run reached a terminal state."): void {
+    const payload = terminalPayload(this.assistantMessageId, this.usage);
+    payload.error = reason;
+    this.finish("interrupted", "run_interrupted", payload);
+  }
+
+  private finish(status: TerminalRunStatus, eventType: TerminalRunEventType, payload: unknown): void {
+    if (this.isFinished()) {
       return;
     }
 
     this.terminal = true;
     const now = new Date().toISOString();
-    const error = status === "failed" && isErrorPayload(payload) ? payload.error : null;
-    this.store.updateMessageStatus(this.assistantMessageId, status, now, error);
-    this.store.updateRunStatus(this.run.id, status, error, now);
-    this.store.touchSession(this.run.sessionId, now);
-    this.emit(eventType, payload);
+    const error = (status === "failed" || status === "interrupted") && isErrorPayload(payload) ? payload.error : null;
+    const result = this.store.finalizeRun({
+      runId: this.run.id,
+      expectedStatuses: expectedRunStatuses(status),
+      status,
+      error,
+      updatedAt: now,
+      event: {
+        id: randomUUID(),
+        type: eventType,
+        payload
+      }
+    });
+    if (result) {
+      this.eventBus.publish(result.event);
+    }
   }
 
   private appendStructuredPart(input: {
@@ -329,9 +366,10 @@ export class RunWriter implements ProviderRunWriter {
     text?: string;
     content?: JsonObject;
     metadata?: JsonObject;
-  }): MessagePart {
-    if (this.terminal) {
-      throw new Error("Cannot append a message part after the run has finished.");
+  }, options: { allowWhileTerminating?: boolean } = {}): MessagePart {
+    const writable = options.allowWhileTerminating ? !this.isFinished() : this.isWritable();
+    if (!writable) {
+      throw new Error("Cannot append a message part while the run is not writable.");
     }
 
     const now = new Date().toISOString();
@@ -349,6 +387,32 @@ export class RunWriter implements ProviderRunWriter {
     });
     this.store.touchSession(this.run.sessionId, now);
     return part;
+  }
+
+  private isFinished(): boolean {
+    if (this.terminal) {
+      return true;
+    }
+    const run = this.store.getRun(this.run.id);
+    if (!run || isTerminalRunStatus(run.status)) {
+      this.terminal = true;
+      return true;
+    }
+    return false;
+  }
+
+  private isWritable(): boolean {
+    if (this.terminal || this.signal?.aborted) {
+      return false;
+    }
+    const run = this.store.getRun(this.run.id);
+    if (!run || run.status !== "running") {
+      if (!run || isTerminalRunStatus(run.status)) {
+        this.terminal = true;
+      }
+      return false;
+    }
+    return true;
   }
 
   private nextStructuredPartSeq(): number {
@@ -370,15 +434,22 @@ export class RunWriter implements ProviderRunWriter {
   }
 }
 
-function terminalPayload(messageId: string, metadata: JsonObject, usage: RunUsage | null): JsonObject {
-  const payload: JsonObject = {
-    messageId,
-    metadata
-  };
+function terminalPayload(messageId: string, usage: RunUsage | null): JsonObject {
+  const payload: JsonObject = { messageId };
   if (usage) {
     payload.usage = runUsageToJsonObject(usage);
   }
   return payload;
+}
+
+function expectedRunStatuses(status: TerminalRunStatus): readonly RunStatus[] {
+  if (status === "cancelled") {
+    return ["running", "waiting_permission", "cancelling"];
+  }
+  if (status === "interrupted") {
+    return ["running", "cancelling"];
+  }
+  return ["running"];
 }
 
 function structuredPartFallbackText(type: MessagePartType, content: JsonObject): string {

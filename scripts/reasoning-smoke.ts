@@ -500,7 +500,7 @@ function verifyRunWriterPersistenceAndEvents(): void {
     secondWriter.writeUsage({ inputTokens: 7, outputTokens: 3, reasoningTokens: 1, totalTokens: 10 });
     assert.deepEqual(store.getRun(run.id)?.usage, { inputTokens: 17, outputTokens: 8, reasoningTokens: 3, totalTokens: 25 });
 
-    store.updateMessageStatus(message.id, "completed", new Date().toISOString(), null);
+    store.transitionMessageStatus(message.id, ["streaming"], "completed", new Date().toISOString(), null);
     const reloadedStore = new SQLiteStore({ dbPath, defaultWorkingDirectory: directory });
     assert.equal(reloadedStore.getRun(run.id)?.runOptions?.reasoningEffort, "future-tier");
     const reloadedMessage = reloadedStore.getMessage(message.id)!;

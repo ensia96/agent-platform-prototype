@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { defaultShellToolSettings, normalizeShellToolSettings } from "../shared/tool-settings";
 import type { JsonObject, ShellExecOutput, ShellToolSettings } from "../shared/types";
 import type { RegisteredTool, ToolExecutionContext, ToolInputValidationContext } from "./types";
-import { ToolInputError } from "./types";
+import { ToolExecutionAbortError, ToolInputError } from "./types";
 
 export const shellExecToolId = "shell.exec";
 const maxEventDeltaChars = 8_000;
@@ -12,6 +12,7 @@ const maxEventDeltaChars = 8_000;
 export interface ShellExecToolOptions {
   env?: NodeJS.ProcessEnv;
   getShellSettings?: () => ShellToolSettings;
+  spawn?: typeof spawn;
 }
 
 interface NormalizedShellExecInput {
@@ -27,6 +28,7 @@ type TextRedactor = (text: string) => string;
 export function createShellExecTool(optionsOrEnv?: ShellExecToolOptions | NodeJS.ProcessEnv): RegisteredTool {
   const options = optionsOrEnv === undefined ? {} : isShellExecToolOptions(optionsOrEnv) ? optionsOrEnv : { env: optionsOrEnv };
   const env = options.env ?? process.env;
+  const spawnImpl = options.spawn ?? spawn;
   const getShellSettings = () => normalizeShellToolSettings(options.getShellSettings?.() ?? defaultShellToolSettings);
   const redact = createSensitiveTextRedactor(env);
   return {
@@ -57,14 +59,14 @@ export function createShellExecTool(optionsOrEnv?: ShellExecToolOptions | NodeJS
       execute(input, context) {
         const shellSettings = getShellSettings();
         const normalized = validateShellExecInput(input, context, shellSettings);
-        return executeShellExec(normalized, context, redact, shellSettings.maxOutputChars);
+        return executeShellExec(normalized, context, redact, shellSettings.maxOutputChars, env, spawnImpl);
       }
     }
   };
 }
 
 function isShellExecToolOptions(value: ShellExecToolOptions | NodeJS.ProcessEnv): value is ShellExecToolOptions {
-  return "env" in value || "getShellSettings" in value;
+  return "env" in value || "getShellSettings" in value || "spawn" in value;
 }
 
 function validateShellExecInput(
@@ -133,41 +135,52 @@ async function executeShellExec(
   input: NormalizedShellExecInput,
   context: ToolExecutionContext,
   redact: TextRedactor,
-  maxOutputChars: number
+  maxOutputChars: number,
+  env: NodeJS.ProcessEnv,
+  spawnImpl: typeof spawn
 ): Promise<JsonObject> {
+  if (context.signal.aborted) {
+    throw new ToolExecutionAbortError();
+  }
+
   const startedAtMs = Date.now();
   const stdout = createOutputLimiter("stdout", maxOutputChars, redact);
   const stderr = createOutputLimiter("stderr", maxOutputChars, redact);
-  let timedOut = false;
   let closed = false;
   let exitCode: number | null = null;
+  let terminationReason: "abort" | "timeout" | null = null;
+  let forceKillTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  const child = spawn(input.command, {
+  const child = spawnImpl(input.command, {
     cwd: input.cwd,
     shell: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: process.env,
+    env,
+    detached: process.platform !== "win32",
     windowsHide: true
   });
 
-  const abort = () => {
-    if (!closed) {
-      child.kill("SIGTERM");
+  const terminate = (reason: "abort" | "timeout"): void => {
+    if (closed || terminationReason) {
+      return;
     }
-  };
-  context.signal.addEventListener("abort", abort, { once: true });
-
-  let forceKillTimeout: ReturnType<typeof setTimeout> | null = null;
-
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    abort();
+    terminationReason = reason;
+    signalChildProcessTree(child, "SIGTERM");
     forceKillTimeout = setTimeout(() => {
       if (!closed) {
-        child.kill("SIGKILL");
+        signalChildProcessTree(child, "SIGKILL");
       }
+      forceKillTimeout = null;
     }, 1_000);
-    forceKillTimeout.unref();
+  };
+  const abort = () => terminate("abort");
+  context.signal.addEventListener("abort", abort, { once: true });
+  if (context.signal.aborted) {
+    abort();
+  }
+
+  const timeout = setTimeout(() => {
+    terminate("timeout");
   }, input.timeoutMs);
   timeout.unref();
 
@@ -198,7 +211,10 @@ async function executeShellExec(
 
   try {
     await new Promise<void>((resolvePromise, rejectPromise) => {
-      child.once("error", rejectPromise);
+      child.once("error", (error) => {
+        closed = true;
+        rejectPromise(error);
+      });
       child.once("close", (code) => {
         closed = true;
         exitCode = code;
@@ -209,6 +225,7 @@ async function executeShellExec(
     clearTimeout(timeout);
     if (forceKillTimeout) {
       clearTimeout(forceKillTimeout);
+      forceKillTimeout = null;
     }
     context.signal.removeEventListener("abort", abort);
   }
@@ -221,11 +238,41 @@ async function executeShellExec(
     stdout: stdout.text,
     stderr: stderr.text,
     durationMs,
-    timedOut,
+    timedOut: terminationReason === "timeout",
     stdoutTruncated: stdout.truncated,
     stderrTruncated: stderr.truncated
   };
+  if (terminationReason === "abort") {
+    throw new ToolExecutionAbortError("Tool execution was cancelled.", output);
+  }
   return output;
+}
+
+function signalChildProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (!child.pid) {
+    return;
+  }
+
+  try {
+    if (process.platform === "win32") {
+      child.kill(signal);
+    } else {
+      process.kill(-child.pid, signal);
+    }
+  } catch (error) {
+    if (isNoSuchProcessError(error)) {
+      return;
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      // Best effort: the process may already have exited or Windows may not support the signal.
+    }
+  }
+}
+
+function isNoSuchProcessError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ESRCH";
 }
 
 function shellExecInputToJson(input: NormalizedShellExecInput): JsonObject {

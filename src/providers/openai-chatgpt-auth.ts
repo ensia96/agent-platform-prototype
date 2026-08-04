@@ -12,6 +12,7 @@ const defaultClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
 const defaultAttemptTtlMs = 10 * 60 * 1000;
 const defaultPollIntervalSeconds = 5;
 const pollingSafetyMarginMs = 3_000;
+export const defaultOpenAIChatGPTRefreshTimeoutMs = 15_000;
 
 interface DeviceAuthAttempt {
   attemptId: string;
@@ -194,6 +195,8 @@ export interface RefreshOpenAIChatGPTCredentialOptions {
   issuer?: string;
   clientId?: string;
   endpoint?: string;
+  fetch?: typeof fetch;
+  timeoutMs?: number;
 }
 
 export async function refreshOpenAIChatGPTCredential(
@@ -202,27 +205,54 @@ export async function refreshOpenAIChatGPTCredential(
 ): Promise<OpenAIChatGPTCredential> {
   const issuer = stripTrailingSlash(options.issuer?.trim() || credential.issuer || defaultOpenAIChatGPTIssuer);
   const clientId = options.clientId?.trim() || defaultClientId;
-  const response = await fetch(`${issuer}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: credential.refresh,
-      client_id: clientId
-    }).toString()
+  const fetchImpl = options.fetch ?? fetch;
+  const timeoutMs = positiveInteger(options.timeoutMs, defaultOpenAIChatGPTRefreshTimeoutMs);
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_resolvePromise, rejectPromise) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      rejectPromise(new Error(`OpenAI ChatGPT token refresh timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
   });
+  const refreshPromise = (async () => {
+    const response = await fetchImpl(`${issuer}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: credential.refresh,
+        client_id: clientId
+      }).toString(),
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
-    throw new Error(`OpenAI ChatGPT token refresh failed (${response.status}): ${await responseText(response)}`);
+    if (!response.ok) {
+      throw new Error(`OpenAI ChatGPT token refresh failed (${response.status}): ${await responseText(response)}`);
+    }
+
+    const tokens = (await response.json()) as OpenAIChatGPTTokenResponse;
+    return credentialFromTokenResponse(tokens, {
+      issuer,
+      endpoint: options.endpoint?.trim() || credential.endpoint,
+      fallbackRefresh: credential.refresh,
+      fallbackAccountId: credential.accountId
+    });
+  })();
+  try {
+    return await Promise.race([refreshPromise, timeoutPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`OpenAI ChatGPT token refresh timed out after ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
   }
-
-  const tokens = (await response.json()) as OpenAIChatGPTTokenResponse;
-  return credentialFromTokenResponse(tokens, {
-    issuer,
-    endpoint: options.endpoint?.trim() || credential.endpoint,
-    fallbackRefresh: credential.refresh,
-    fallbackAccountId: credential.accountId
-  });
 }
 
 async function exchangeAuthorizationCode(input: {

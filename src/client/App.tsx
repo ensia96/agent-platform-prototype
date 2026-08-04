@@ -6,13 +6,13 @@ import type {
   CreateRunResponse,
   InvokeToolResponse,
   Message,
-  MessagePart,
   PermissionListResponse,
   PermissionRequest,
+  PublicProviderResolution,
+  PublicRunSummary,
   ProviderListResponse,
   ProviderModelCatalog,
   ProviderProfile,
-  ProviderResolution,
   ReasoningEffort,
   RunEvent,
   RunOptions,
@@ -21,11 +21,30 @@ import type {
   ToolDefinition,
   ToolListResponse
 } from "../shared/types";
-import { requestJson, toErrorMessage } from "./api";
+import { isActiveRunStatus, isTerminalRunStatus } from "../shared/types";
+import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 import { ChatHeader } from "./ChatHeader";
-import { compareParts, MessageBody, partText } from "./MessageBody";
+import { MessageBody } from "./MessageBody";
 import { reconcileModelOverride, reconcileReasoningEffort, type ModelCatalogLoadState } from "./model-catalog";
 import { RunInspector } from "./RunInspector";
+import { RunActionButton } from "./RunActionButton";
+import {
+  applyRunEventToMessages,
+  isCurrentSessionOperation as isCurrentSessionOperationRequest,
+  isCurrentSessionRequest,
+  isCurrentTrackedRunRequest,
+  isMatchingPermissionResponse,
+  mergeSnapshotWithTrackedRun,
+  prepareMessagesForRunReplay,
+  runDisplayStatus,
+  selectRecoveredRun,
+  shouldApplyRunEvent,
+  terminalNoticeFromEvent,
+  terminalNoticeFromMessages,
+  updateRunFromEvent,
+  type RunConnectionState,
+  type RunTerminalNotice
+} from "./run-recovery";
 import { SettingsPanel } from "./SettingsPanel";
 import { shellToolStateFromResponse, type ShellToolState } from "./ToolPanels";
 
@@ -53,7 +72,7 @@ export function App() {
   const [modelCatalog, setModelCatalog] = useState<ProviderModelCatalog | null>(null);
   const [modelCatalogState, setModelCatalogState] = useState<ModelCatalogLoadState>("idle");
   const [modelCatalogError, setModelCatalogError] = useState<string | null>(null);
-  const [lastProviderResolution, setLastProviderResolution] = useState<ProviderResolution | null>(null);
+  const [lastProviderResolution, setLastProviderResolution] = useState<PublicProviderResolution | null>(null);
   const [lastRunOptions, setLastRunOptions] = useState<RunOptions | null>(null);
   const [lastRunUsage, setLastRunUsage] = useState<RunUsage | null>(null);
   const [lastUnsupportedRunOptions, setLastUnsupportedRunOptions] = useState<string[]>([]);
@@ -70,7 +89,13 @@ export function App() {
   const [lastShellResponse, setLastShellResponse] = useState<InvokeToolResponse | null>(null);
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [permissionActionId, setPermissionActionId] = useState<string | null>(null);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [activeRun, setActiveRun] = useState<PublicRunSummary | null>(null);
+  const [runConnectionState, setRunConnectionState] = useState<RunConnectionState>("idle");
+  const [runTerminalNotice, setRunTerminalNotice] = useState<RunTerminalNotice | null>(null);
+  const [runRecoveryWarning, setRunRecoveryWarning] = useState<string | null>(null);
+  const [runDiscoveryPending, setRunDiscoveryPending] = useState(false);
+  const [runStartPending, setRunStartPending] = useState(false);
+  const [cancelPending, setCancelPending] = useState(false);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("chat");
@@ -79,6 +104,18 @@ export function App() {
   );
   const inspectorModal = useMediaQuery(INSPECTOR_OVERLAY_QUERY);
   const eventsRef = useRef<EventSource | null>(null);
+  const trackedRunIdRef = useRef<string | null>(null);
+  const runEventCursorRef = useRef(0);
+  const sessionRecoveryIdRef = useRef(0);
+  const sessionGenerationRef = useRef(0);
+  const cancelRequestRunIdRef = useRef<string | null>(null);
+  const pendingPermissionsLoadIdRef = useRef(0);
+  const shellRequestIdRef = useRef(0);
+  const shellRunIdRef = useRef<string | null>(null);
+  const permissionActionTokenRef = useRef(0);
+  const workingDirectoryRequestIdRef = useRef(0);
+  const runStartRequestIdRef = useRef(0);
+  const contextPreviewRequestIdRef = useRef(0);
   const inspectorToggleRef = useRef<HTMLButtonElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const messagesShouldFollowRef = useRef(true);
@@ -94,9 +131,11 @@ export function App() {
   selectedSessionIdRef.current = selectedSessionId;
   providerProfileIdRef.current = providerProfileId;
   modelOverrideRef.current = modelOverride;
+  const activeRunId = activeRun?.id ?? null;
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const selectedProvider = providers.find((profile) => profile.id === providerProfileId) ?? null;
   const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
+  const selectedPendingPermissions = pendingPermissions.filter((permission) => permission.sessionId === selectedSessionId);
 
   useEffect(() => {
     void loadSessions();
@@ -104,17 +143,39 @@ export function App() {
     void loadAgents();
     void loadTools();
     void loadPendingPermissions();
-    return () => eventsRef.current?.close();
+    return () => detachRunEvents();
   }, []);
 
   useEffect(() => {
     messagesShouldFollowRef.current = true;
+    const recoveryId = sessionRecoveryIdRef.current + 1;
+    sessionRecoveryIdRef.current = recoveryId;
+    messagesLoadIdRef.current += 1;
+    detachRunEvents();
+    setActiveRun(null);
+    setRunConnectionState("idle");
+    setRunTerminalNotice(null);
+    setRunRecoveryWarning(null);
+    setRunDiscoveryPending(Boolean(selectedSessionId));
+    setCancelPending(false);
+    cancelRequestRunIdRef.current = null;
+    shellRunIdRef.current = null;
+    setShellToolState("idle");
+    setLastShellResponse(null);
+    setContextPreview(null);
+    setContextPreviewState("idle");
+    setMessages([]);
+    void loadPendingPermissions();
     if (!selectedSessionId) {
-      messagesLoadIdRef.current += 1;
-      setMessages([]);
-      return;
+      return undefined;
     }
-    void loadMessages(selectedSessionId, true);
+    void restoreSessionState(selectedSessionId, recoveryId);
+    return () => {
+      if (sessionRecoveryIdRef.current === recoveryId) {
+        sessionRecoveryIdRef.current += 1;
+        detachRunEvents();
+      }
+    };
   }, [selectedSessionId]);
 
   useEffect(() => {
@@ -138,10 +199,10 @@ export function App() {
   }, [activeTab]);
 
   useEffect(() => {
-    if (activeTab === "chat" && pendingPermissions.length > 0) {
+    if (activeTab === "chat" && selectedPendingPermissions.length > 0) {
       setInspectorOpen(true);
     }
-  }, [activeTab, pendingPermissions.length]);
+  }, [activeTab, selectedPendingPermissions.length]);
 
   useEffect(() => {
     modelCatalogAbortRef.current?.abort();
@@ -194,11 +255,79 @@ export function App() {
     try {
       const nextSessions = await requestJson<Session[]>("/api/sessions");
       setSessions(nextSessions);
-      setSelectedSessionId((current) => current ?? nextSessions[0]?.id ?? null);
+      if (!selectedSessionIdRef.current && nextSessions[0]) {
+        selectSession(nextSessions[0].id);
+      }
       setLoadState("idle");
     } catch (requestError) {
       setLoadState("error");
       setError(toErrorMessage(requestError));
+    }
+  }
+
+  async function restoreSessionState(sessionId: string, recoveryId: number) {
+    setError(null);
+    try {
+      const activeRuns = await requestJson<PublicRunSummary[]>(`/api/sessions/${sessionId}/runs/active`);
+      if (recoveryId !== sessionRecoveryIdRef.current || sessionId !== selectedSessionIdRef.current) {
+        return;
+      }
+      const selection = selectRecoveredRun(activeRuns);
+      let nextMessages: Message[];
+      try {
+        nextMessages = await requestJson<Message[]>(`/api/sessions/${sessionId}/messages`);
+      } catch (requestError) {
+        if (selection.run && recoveryId === sessionRecoveryIdRef.current && sessionId === selectedSessionIdRef.current) {
+          setRunRecoveryWarning(selection.warning);
+          setLastRunOptions(selection.run.runOptions);
+          setLastRunUsage(selection.run.usage);
+          if (selection.run.status === "waiting_permission") {
+            setInspectorOpen(true);
+            void loadPendingPermissions();
+          }
+          beginRunTracking(selection.run, false);
+          setError(`Message snapshot failed; rebuilding the active run from its event log. ${toErrorMessage(requestError)}`);
+          return;
+        }
+        throw requestError;
+      }
+      if (recoveryId !== sessionRecoveryIdRef.current || sessionId !== selectedSessionIdRef.current) {
+        return;
+      }
+
+      messagesShouldFollowRef.current = true;
+      setRunRecoveryWarning(selection.warning);
+      if (selection.warning) {
+        setInspectorOpen(true);
+      }
+      if (!selection.run) {
+        const trackedRunId = trackedRunIdRef.current;
+        if (trackedRunId) {
+          setMessages((current) => mergeSnapshotWithTrackedRun(nextMessages, current, trackedRunId));
+          return;
+        }
+        trackedRunIdRef.current = null;
+        setMessages(nextMessages);
+        setRunTerminalNotice(terminalNoticeFromMessages(nextMessages));
+        return;
+      }
+
+      setMessages(prepareMessagesForRunReplay(nextMessages, selection.run.id));
+      setLastRunOptions(selection.run.runOptions);
+      setLastRunUsage(selection.run.usage);
+      if (selection.run.status === "waiting_permission") {
+        setInspectorOpen(true);
+        void loadPendingPermissions();
+      }
+      beginRunTracking(selection.run, false);
+    } catch (requestError) {
+      if (recoveryId === sessionRecoveryIdRef.current && sessionId === selectedSessionIdRef.current) {
+        setError(toErrorMessage(requestError));
+      }
+    } finally {
+      if (recoveryId === sessionRecoveryIdRef.current && sessionId === selectedSessionIdRef.current) {
+        setRunDiscoveryPending(false);
+      }
     }
   }
 
@@ -217,7 +346,10 @@ export function App() {
       if (followAfterLoad) {
         messagesShouldFollowRef.current = true;
       }
-      setMessages(nextMessages);
+      const trackedRunId = trackedRunIdRef.current;
+      setMessages((current) =>
+        trackedRunId ? mergeSnapshotWithTrackedRun(nextMessages, current, trackedRunId) : nextMessages
+      );
     } catch (requestError) {
       if (loadId === messagesLoadIdRef.current && sessionId === selectedSessionIdRef.current) {
         setError(toErrorMessage(requestError));
@@ -289,12 +421,65 @@ export function App() {
   }
 
   async function loadPendingPermissions() {
+    const loadId = pendingPermissionsLoadIdRef.current + 1;
+    const generation = sessionGenerationRef.current;
+    pendingPermissionsLoadIdRef.current = loadId;
     try {
       const response = await requestJson<PermissionListResponse>("/api/permissions?status=pending");
+      if (loadId !== pendingPermissionsLoadIdRef.current || generation !== sessionGenerationRef.current) {
+        return;
+      }
       setPendingPermissions(response.permissions);
     } catch (requestError) {
-      setError(toErrorMessage(requestError));
+      if (loadId === pendingPermissionsLoadIdRef.current && generation === sessionGenerationRef.current) {
+        setError(toErrorMessage(requestError));
+      }
     }
+  }
+
+  function selectSession(sessionId: string | null) {
+    if (sessionId !== selectedSessionIdRef.current) {
+      sessionGenerationRef.current += 1;
+      workingDirectoryRequestIdRef.current += 1;
+      runStartRequestIdRef.current += 1;
+      contextPreviewRequestIdRef.current += 1;
+      permissionActionTokenRef.current += 1;
+      selectedSessionIdRef.current = sessionId;
+      setRunStartPending(false);
+      setPermissionActionId(null);
+    }
+    setSelectedSessionId(sessionId);
+  }
+
+  function isCurrentSessionGeneration(sessionId: string, generation: number): boolean {
+    return isCurrentSessionRequest(selectedSessionIdRef.current, sessionGenerationRef.current, sessionId, generation);
+  }
+
+  function isCurrentSessionOperation(
+    sessionId: string | null,
+    generation: number,
+    requestId: number,
+    currentRequestId: number
+  ): boolean {
+    return isCurrentSessionOperationRequest(
+      selectedSessionIdRef.current,
+      sessionGenerationRef.current,
+      currentRequestId,
+      sessionId,
+      generation,
+      requestId
+    );
+  }
+
+  function isCurrentCancelRequest(sessionId: string, generation: number, runId: string): boolean {
+    return isCurrentTrackedRunRequest(
+      selectedSessionIdRef.current,
+      sessionGenerationRef.current,
+      trackedRunIdRef.current,
+      sessionId,
+      generation,
+      runId
+    );
   }
 
   async function createSession() {
@@ -302,14 +487,15 @@ export function App() {
     try {
       const session = await requestJson<Session>("/api/sessions", { method: "POST" });
       setSessions((current) => [session, ...current]);
-      setSelectedSessionId(session.id);
+      selectSession(session.id);
     } catch (requestError) {
       setError(toErrorMessage(requestError));
     }
   }
 
   async function saveSessionWorkingDirectory() {
-    if (!selectedSessionId) {
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
       setWorkingDirectoryError("Select or create a session before changing its working directory.");
       return;
     }
@@ -319,39 +505,61 @@ export function App() {
       return;
     }
 
+    const generation = sessionGenerationRef.current;
+    const requestId = workingDirectoryRequestIdRef.current + 1;
+    workingDirectoryRequestIdRef.current = requestId;
     setWorkingDirectorySaveState("saving");
     setWorkingDirectoryError(null);
     try {
-      const session = await requestJson<Session>(`/api/sessions/${selectedSessionId}`, {
+      const session = await requestJson<Session>(`/api/sessions/${sessionId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ workingDirectory })
       });
+      if (
+        session.id !== sessionId ||
+        !isCurrentSessionOperation(sessionId, generation, requestId, workingDirectoryRequestIdRef.current)
+      ) {
+        return;
+      }
       setSessions((current) => current.map((item) => (item.id === session.id ? session : item)));
       setWorkingDirectoryDraft(session.workingDirectory);
       setWorkingDirectorySaveState("saved");
     } catch (requestError) {
-      setWorkingDirectorySaveState("idle");
-      setWorkingDirectoryError(toErrorMessage(requestError));
+      if (isCurrentSessionOperation(sessionId, generation, requestId, workingDirectoryRequestIdRef.current)) {
+        setWorkingDirectorySaveState("idle");
+        setWorkingDirectoryError(toErrorMessage(requestError));
+      }
     }
   }
 
   async function startRun() {
     const text = input.trim();
-    if (!text || activeRunId) {
+    if (!text || activeRun || runStartPending) {
       return;
     }
 
+    let sessionId = selectedSessionIdRef.current;
+    let generation = sessionGenerationRef.current;
+    let requestId = runStartRequestIdRef.current + 1;
+    runStartRequestIdRef.current = requestId;
+    setRunStartPending(true);
     setError(null);
-    let sessionId = selectedSessionId;
     try {
       const runOptions = buildRunOptionsFromForm(modelOverride, reasoningEffort, temperature);
       followLatestMessages();
       if (!sessionId) {
         const session = await requestJson<Session>("/api/sessions", { method: "POST" });
+        if (!isCurrentSessionOperation(null, generation, requestId, runStartRequestIdRef.current)) {
+          return;
+        }
         setSessions((current) => [session, ...current]);
-        setSelectedSessionId(session.id);
+        selectSession(session.id);
         sessionId = session.id;
+        generation = sessionGenerationRef.current;
+        requestId = runStartRequestIdRef.current + 1;
+        runStartRequestIdRef.current = requestId;
+        setRunStartPending(true);
       }
 
       setInput("");
@@ -366,44 +574,92 @@ export function App() {
           runOptions: hasRunOptions(runOptions) ? runOptions : undefined
         })
       });
+      if (
+        response.run.sessionId !== sessionId ||
+        !isCurrentSessionOperation(sessionId, generation, requestId, runStartRequestIdRef.current)
+      ) {
+        return;
+      }
       setLastProviderResolution(response.providerResolution);
       setLastRunOptions(response.runOptions);
       setLastRunUsage(response.usage);
       setLastUnsupportedRunOptions(response.unsupportedRunOptions);
       setProviderNotice(providerResolutionNotice(response.providerResolution));
-      setActiveRunId(response.run.id);
-      openRunEvents(response.run.id);
+      setRunRecoveryWarning(null);
+      beginRunTracking(response.run, true);
       void loadSessions();
     } catch (requestError) {
-      setError(toErrorMessage(requestError));
+      if (!isCurrentSessionOperation(sessionId, generation, requestId, runStartRequestIdRef.current)) {
+        return;
+      }
+      const existingRun = activeRunFromError(requestError);
+      if (existingRun && existingRun.sessionId === sessionId) {
+        setRunRecoveryWarning("Another interface already has active work in this session. Reconnected to that run instead.");
+        beginRunTracking(existingRun, true);
+      } else {
+        setError(toErrorMessage(requestError));
+      }
       setInput(text);
+    } finally {
+      if (isCurrentSessionOperation(sessionId, generation, requestId, runStartRequestIdRef.current)) {
+        setRunStartPending(false);
+      }
     }
   }
 
   async function cancelRun() {
-    if (!activeRunId) {
+    if (!activeRun || cancelRequestRunIdRef.current) {
       return;
     }
 
+    const run = activeRun;
+    const generation = sessionGenerationRef.current;
+    cancelRequestRunIdRef.current = run.id;
+    setCancelPending(true);
+    setActiveRun((current) =>
+      current?.id === run.id ? { ...current, status: "cancelling", currentPhase: "cancelling" } : current
+    );
     setError(null);
     try {
-      await requestJson(`/api/runs/${activeRunId}/cancel`, { method: "POST" });
+      const snapshot = await requestJson<PublicRunSummary>(`/api/runs/${run.id}/cancel`, { method: "POST" });
+      if (isCurrentCancelRequest(run.sessionId, generation, run.id)) {
+        applyRunSnapshot(snapshot);
+      }
     } catch (requestError) {
-      setError(toErrorMessage(requestError));
+      try {
+        const snapshot = await requestJson<PublicRunSummary>(`/api/runs/${run.id}`);
+        if (isCurrentCancelRequest(run.sessionId, generation, run.id)) {
+          applyRunSnapshot(snapshot);
+        }
+      } catch {
+        if (isCurrentCancelRequest(run.sessionId, generation, run.id)) {
+          setActiveRun((current) => (current?.id === run.id ? run : current));
+          setError(toErrorMessage(requestError));
+        }
+      }
+    } finally {
+      if (cancelRequestRunIdRef.current === run.id) {
+        cancelRequestRunIdRef.current = null;
+        setCancelPending(false);
+      }
     }
   }
 
   async function previewContext() {
-    if (!selectedSessionId) {
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
       setError("Create or select a session before previewing context.");
       return;
     }
 
+    const generation = sessionGenerationRef.current;
+    const requestId = contextPreviewRequestIdRef.current + 1;
+    contextPreviewRequestIdRef.current = requestId;
     setContextPreviewState("loading");
     setError(null);
     try {
       const runOptions = buildRunOptionsFromForm(modelOverride, reasoningEffort, temperature);
-      const response = await requestJson<ContextPreviewResponse>(`/api/sessions/${selectedSessionId}/context/preview`, {
+      const response = await requestJson<ContextPreviewResponse>(`/api/sessions/${sessionId}/context/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -413,11 +669,16 @@ export function App() {
           text: input.trim() || undefined
         })
       });
+      if (!isCurrentSessionOperation(sessionId, generation, requestId, contextPreviewRequestIdRef.current)) {
+        return;
+      }
       setContextPreview(response);
       setContextPreviewState("idle");
     } catch (requestError) {
-      setContextPreviewState("error");
-      setError(toErrorMessage(requestError));
+      if (isCurrentSessionOperation(sessionId, generation, requestId, contextPreviewRequestIdRef.current)) {
+        setContextPreviewState("error");
+        setError(toErrorMessage(requestError));
+      }
     }
   }
 
@@ -431,16 +692,20 @@ export function App() {
     setLastShellResponse(null);
     setShellToolState("running");
     let sessionId = selectedSessionId;
+    const requestId = shellRequestIdRef.current + 1;
+    shellRequestIdRef.current = requestId;
+    let generation = sessionGenerationRef.current;
     try {
       if (!sessionId) {
         const session = await requestJson<Session>("/api/sessions", { method: "POST" });
         setSessions((current) => [session, ...current]);
-        setSelectedSessionId(session.id);
+        selectSession(session.id);
         sessionId = session.id;
       }
+      generation = sessionGenerationRef.current;
 
       const timeoutMs = parseShellTimeout(shellTimeoutMs);
-      const response = await requestJson<InvokeToolResponse>(`/api/sessions/${sessionId}/tools/shell.exec`, {
+      const response = await requestJson<InvokeToolResponse>(`/api/sessions/${sessionId}/tools/shell.exec?async=1`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -449,150 +714,252 @@ export function App() {
           timeoutMs
         })
       });
+      if (requestId !== shellRequestIdRef.current || !isCurrentSessionGeneration(sessionId, generation)) {
+        return;
+      }
+      shellRunIdRef.current = response.run.id;
       setLastShellResponse(response);
       setShellToolState(shellToolStateFromResponse(response));
       upsertMessage(response.message);
-      void loadMessages(sessionId);
+      if (isTerminalRunStatus(response.run.status)) {
+        void loadMessages(sessionId);
+      } else {
+        beginRunTracking(response.run, true);
+      }
       void loadSessions();
       void loadPendingPermissions();
     } catch (requestError) {
-      setShellToolState("failed");
-      setError(toErrorMessage(requestError));
+      if (requestId === shellRequestIdRef.current && sessionId && isCurrentSessionGeneration(sessionId, generation)) {
+        setShellToolState("failed");
+        setError(toErrorMessage(requestError));
+      }
     }
   }
 
   async function approvePermission(requestId: string) {
+    const permissionRequest = pendingPermissions.find((permission) => permission.id === requestId);
+    const requestSessionId = permissionRequest?.sessionId;
+    const generation = sessionGenerationRef.current;
+    const actionToken = permissionActionTokenRef.current + 1;
+    permissionActionTokenRef.current = actionToken;
     setPermissionActionId(requestId);
     setError(null);
     try {
       const response = await requestJson<InvokeToolResponse>(`/api/permissions/${requestId}/approve`, { method: "POST" });
-      setLastShellResponse(response);
-      setShellToolState(shellToolStateFromResponse(response));
+      if (
+        permissionActionTokenRef.current !== actionToken ||
+        !permissionRequest ||
+        !requestSessionId ||
+        !isCurrentSessionGeneration(requestSessionId, generation) ||
+        !isMatchingPermissionResponse(
+          permissionRequest,
+          response,
+          trackedRunIdRef.current,
+          response.invocation.caller === "manual" ? shellRunIdRef.current : null
+        )
+      ) {
+        return;
+      }
+      if (response.invocation.caller === "manual") {
+        shellRunIdRef.current = response.run.id;
+        setLastShellResponse(response);
+        setShellToolState(shellToolStateFromResponse(response));
+      }
       upsertMessage(response.message);
-      openRunEventsIfAgentResume(response);
-      if (response.message.sessionId === selectedSessionId) {
+      const resumedAgentRun = openRunEventsIfAgentResume(response);
+      if (!resumedAgentRun && response.message.sessionId === selectedSessionId) {
         void loadMessages(response.message.sessionId);
       }
       void loadSessions();
       await loadPendingPermissions();
     } catch (requestError) {
-      setError(toErrorMessage(requestError));
+      if (
+        permissionActionTokenRef.current === actionToken &&
+        requestSessionId &&
+        isCurrentSessionGeneration(requestSessionId, generation)
+      ) {
+        setError(toErrorMessage(requestError));
+      }
     } finally {
-      setPermissionActionId(null);
+      if (permissionActionTokenRef.current === actionToken) {
+        setPermissionActionId(null);
+      }
     }
   }
 
   async function denyPermission(requestId: string) {
+    const permissionRequest = pendingPermissions.find((permission) => permission.id === requestId);
+    const requestSessionId = permissionRequest?.sessionId;
+    const generation = sessionGenerationRef.current;
+    const actionToken = permissionActionTokenRef.current + 1;
+    permissionActionTokenRef.current = actionToken;
     setPermissionActionId(requestId);
     setError(null);
     try {
       const response = await requestJson<InvokeToolResponse>(`/api/permissions/${requestId}/deny`, { method: "POST" });
-      setLastShellResponse(response);
-      setShellToolState(shellToolStateFromResponse(response));
+      if (
+        permissionActionTokenRef.current !== actionToken ||
+        !permissionRequest ||
+        !requestSessionId ||
+        !isCurrentSessionGeneration(requestSessionId, generation) ||
+        !isMatchingPermissionResponse(
+          permissionRequest,
+          response,
+          trackedRunIdRef.current,
+          response.invocation.caller === "manual" ? shellRunIdRef.current : null
+        )
+      ) {
+        return;
+      }
+      if (response.invocation.caller === "manual") {
+        shellRunIdRef.current = response.run.id;
+        setLastShellResponse(response);
+        setShellToolState(shellToolStateFromResponse(response));
+      }
       upsertMessage(response.message);
-      openRunEventsIfAgentResume(response);
-      if (response.message.sessionId === selectedSessionId) {
+      const resumedAgentRun = openRunEventsIfAgentResume(response);
+      if (!resumedAgentRun && response.message.sessionId === selectedSessionId) {
         void loadMessages(response.message.sessionId);
       }
       void loadSessions();
       await loadPendingPermissions();
     } catch (requestError) {
-      setError(toErrorMessage(requestError));
+      if (
+        permissionActionTokenRef.current === actionToken &&
+        requestSessionId &&
+        isCurrentSessionGeneration(requestSessionId, generation)
+      ) {
+        setError(toErrorMessage(requestError));
+      }
     } finally {
-      setPermissionActionId(null);
+      if (permissionActionTokenRef.current === actionToken) {
+        setPermissionActionId(null);
+      }
     }
   }
 
+  function beginRunTracking(run: PublicRunSummary, resetMessages: boolean) {
+    if (run.sessionId !== selectedSessionIdRef.current || isTerminalRunStatus(run.status)) {
+      return;
+    }
+    detachRunEvents();
+    trackedRunIdRef.current = run.id;
+    runEventCursorRef.current = 0;
+    setActiveRun(run);
+    setRunTerminalNotice(null);
+    setRunConnectionState("connecting");
+    if (resetMessages) {
+      setMessages((current) => prepareMessagesForRunReplay(current, run.id));
+    }
+    openRunEvents(run.id);
+  }
+
   function openRunEvents(runId: string) {
-    eventsRef.current?.close();
-    const source = new EventSource(`/api/runs/${runId}/events`);
+    let source: EventSource;
+    try {
+      source = new EventSource(`/api/runs/${runId}/events?after=${runEventCursorRef.current}`);
+    } catch (streamError) {
+      setRunConnectionState("reconnecting");
+      setError(toErrorMessage(streamError));
+      return;
+    }
     eventsRef.current = source;
 
-    source.onmessage = (event) => {
-      const runEvent = JSON.parse(event.data) as RunEvent;
-      applyRunEvent(runEvent);
-      if (isTerminalEvent(runEvent.type)) {
-        source.close();
-        if (eventsRef.current === source) {
-          eventsRef.current = null;
-        }
-        setActiveRunId(null);
-        void loadSessions();
+    source.onopen = () => {
+      if (eventsRef.current === source && trackedRunIdRef.current === runId) {
+        setRunConnectionState("connected");
       }
     };
-
-    source.onerror = () => {
-      setError("SSE connection failed or closed unexpectedly.");
-      source.close();
-      if (eventsRef.current === source) {
-        eventsRef.current = null;
+    source.onmessage = (messageEvent) => {
+      if (eventsRef.current !== source || trackedRunIdRef.current !== runId) {
+        return;
       }
-      setActiveRunId(null);
+      try {
+        const runEvent = JSON.parse(messageEvent.data) as RunEvent;
+        if (runEvent.sessionId !== selectedSessionIdRef.current) {
+          return;
+        }
+        if (!shouldApplyRunEvent(runEventCursorRef.current, runId, runEvent)) {
+          return;
+        }
+        runEventCursorRef.current = runEvent.seq;
+        applyRunEvent(runEvent);
+      } catch (streamError) {
+        setError(`Run event could not be applied: ${toErrorMessage(streamError)}`);
+      }
+    };
+    source.onerror = () => {
+      if (eventsRef.current === source && trackedRunIdRef.current === runId) {
+        setRunConnectionState("reconnecting");
+      }
     };
   }
 
+  function detachRunEvents() {
+    eventsRef.current?.close();
+    eventsRef.current = null;
+    trackedRunIdRef.current = null;
+    runEventCursorRef.current = 0;
+  }
+
   function applyRunEvent(event: RunEvent) {
+    setMessages((current) => applyRunEventToMessages(current, event));
+    setActiveRun((current) => (current?.id === event.runId ? updateRunFromEvent(current, event) : current));
+
     if (event.type === "run_started") {
       const payload = event.payload as {
-        providerResolution?: ProviderResolution;
+        providerResolution?: PublicProviderResolution;
         runOptions?: RunOptions;
         unsupportedRunOptions?: string[];
+        usage?: RunUsage;
       };
       if (payload.providerResolution) {
         setLastProviderResolution(payload.providerResolution);
         setProviderNotice(providerResolutionNotice(payload.providerResolution));
       }
       setLastRunOptions(payload.runOptions ?? null);
-      setLastRunUsage(null);
+      setLastRunUsage((current) => payload.usage ?? current);
       setLastUnsupportedRunOptions(payload.unsupportedRunOptions ?? []);
       return;
     }
 
     if (event.type === "user_message_created" || event.type === "assistant_message_created" || event.type === "assistant_message_updated") {
-      const payload = event.payload as { message?: Message };
-      if (payload.message) {
-        upsertMessage(payload.message);
+      if (event.type === "assistant_message_updated") {
+        const message = (event.payload as { message?: Message }).message;
+        if (message?.usage) {
+          setLastRunUsage(message.usage);
+        }
+        if (message && shellRunIdRef.current === event.runId) {
+          setLastShellResponse((current) => (current?.run.id === event.runId ? { ...current, message } : current));
+        }
       }
       return;
     }
 
     if (event.type === "delta") {
-      const payload = event.payload as { messageId?: string; text?: string };
-      if (payload.messageId && payload.text) {
-        appendDelta(payload.messageId, payload.text);
-      }
       return;
     }
 
     if (event.type === "tool_call.created" || event.type === "tool_result.created") {
-      const payload = event.payload as { messageId?: string; part?: MessagePart };
-      if (payload.messageId && payload.part) {
-        upsertMessagePart(payload.messageId, payload.part);
-      }
       return;
     }
 
     if (event.type === "tool.started" || event.type === "tool.completed" || event.type === "tool.failed") {
-      const payload = event.payload as { messageId?: string; part?: MessagePart; outputPart?: MessagePart; error?: string };
-      if (payload.messageId && payload.part) {
-        upsertMessagePart(payload.messageId, payload.part);
+      const payload = event.payload as { error?: string; status?: string };
+      if (shellRunIdRef.current === event.runId) {
+        if (event.type === "tool.completed") {
+          setShellToolState("completed");
+        } else if (event.type === "tool.failed") {
+          setShellToolState(payload.status === "cancelled" ? "cancelled" : "failed");
+        }
       }
-      if (payload.messageId && payload.outputPart) {
-        upsertMessagePart(payload.messageId, payload.outputPart);
-      }
-      if (payload.error) {
+      if (payload.error && payload.status !== "cancelled") {
         setError(payload.error);
       }
       return;
     }
 
     if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
-      const payload = event.payload as { messageId?: string; partId?: string; part?: MessagePart; text?: string };
-      if (payload.messageId && payload.part) {
-        upsertMessagePart(payload.messageId, payload.part);
-      } else if (payload.messageId && payload.partId && payload.text) {
-        appendPartDelta(payload.messageId, payload.partId, payload.text);
-      }
       return;
     }
 
@@ -602,38 +969,69 @@ export function App() {
     }
 
     if (event.type === "run_waiting_permission") {
-      const payload = event.payload as { runId?: string };
-      if (payload.runId) {
-        setActiveRunId(payload.runId);
-      }
+      setInspectorOpen(true);
       void loadPendingPermissions();
       return;
     }
 
-    if (event.type === "run_completed" || event.type === "run_cancelled" || event.type === "run_failed") {
+    if (event.type === "run_cancelling") {
+      setCancelPending(true);
+      return;
+    }
+
+    const terminalNotice = terminalNoticeFromEvent(event);
+    if (terminalNotice) {
       const payload = event.payload as { messageId?: string; error?: string; metadata?: Message["metadata"]; usage?: RunUsage };
       if (payload.usage) {
         setLastRunUsage(payload.usage);
       }
-      if (payload.messageId) {
-        setMessages((current) =>
-          current.map((message) =>
-            message.id === payload.messageId
-              ? {
-                  ...message,
-                  status:
-                    event.type === "run_completed" ? "completed" : event.type === "run_cancelled" ? "cancelled" : "failed",
-                  error: event.type === "run_failed" ? payload.error ?? message.error ?? "Run failed without an error message." : null,
-                  metadata: payload.metadata ? { ...message.metadata, ...payload.metadata } : message.metadata,
-                  usage: payload.usage ?? message.usage ?? null
-                }
-              : message
-          )
-        );
-      }
-      if (payload.error) {
+      if (terminalNotice.status === "failed" && payload.error) {
         setError(payload.error);
       }
+      if (shellRunIdRef.current === event.runId) {
+        setShellToolState(
+          terminalNotice.status === "completed"
+            ? "completed"
+            : terminalNotice.status === "cancelled"
+              ? "cancelled"
+              : "failed"
+        );
+      }
+      finishTrackedRun(terminalNotice, event.sessionId);
+    }
+  }
+
+  function applyRunSnapshot(snapshot: PublicRunSummary) {
+    if (snapshot.sessionId !== selectedSessionIdRef.current) {
+      return;
+    }
+    setLastRunOptions(snapshot.runOptions);
+    setLastRunUsage(snapshot.usage);
+    if (isTerminalRunStatus(snapshot.status)) {
+      finishTrackedRun({ status: snapshot.status, error: snapshot.error }, snapshot.sessionId);
+      return;
+    }
+    setActiveRun(snapshot);
+    if (snapshot.status === "waiting_permission") {
+      setInspectorOpen(true);
+      void loadPendingPermissions();
+    }
+  }
+
+  function finishTrackedRun(notice: RunTerminalNotice, sessionId: string) {
+    detachRunEvents();
+    setActiveRun(null);
+    setRunConnectionState("idle");
+    setRunTerminalNotice(notice);
+    setCancelPending(false);
+    cancelRequestRunIdRef.current = null;
+    void loadSessions();
+    void loadPendingPermissions();
+    if (sessionId === selectedSessionIdRef.current) {
+      const recoveryId = sessionRecoveryIdRef.current + 1;
+      sessionRecoveryIdRef.current = recoveryId;
+      setRunDiscoveryPending(true);
+      void restoreSessionState(sessionId, recoveryId);
     }
   }
 
@@ -643,82 +1041,6 @@ export function App() {
       const next = exists ? current.map((item) => (item.id === message.id ? message : item)) : [...current, message];
       return next.sort(compareMessages);
     });
-  }
-
-  function appendDelta(messageId: string, delta: string) {
-    setMessages((current) =>
-      current.map((message) => {
-        if (message.id !== messageId) {
-          return message;
-        }
-
-        const textPart = message.parts.find((part) => part.type === "text");
-        const nextPart = textPart
-          ? {
-              ...textPart,
-              text: textPart.text + delta,
-              content: { ...textPart.content, text: textPart.text + delta },
-              updatedAt: new Date().toISOString()
-            }
-          : {
-              id: `${messageId}:local-text`,
-              messageId,
-              seq: 0,
-              type: "text" as const,
-              text: delta,
-              content: { text: delta },
-              metadata: {},
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString()
-            };
-
-        const nextParts = textPart
-          ? message.parts.map((part) => (part.id === textPart.id ? nextPart : part))
-          : [nextPart, ...message.parts];
-
-        return {
-          ...message,
-          status: "streaming",
-          parts: nextParts.sort(compareParts)
-        };
-      })
-    );
-  }
-
-  function upsertMessagePart(messageId: string, part: MessagePart) {
-    setMessages((current) =>
-      current.map((message) => {
-        if (message.id !== messageId) {
-          return message;
-        }
-        const exists = message.parts.some((item) => item.id === part.id);
-        const parts = exists ? message.parts.map((item) => (item.id === part.id ? part : item)) : [...message.parts, part];
-        return { ...message, parts: parts.sort(compareParts) };
-      })
-    );
-  }
-
-  function appendPartDelta(messageId: string, partId: string, delta: string) {
-    setMessages((current) =>
-      current.map((message) => {
-        if (message.id !== messageId) {
-          return message;
-        }
-        return {
-          ...message,
-          parts: message.parts.map((part) =>
-            part.id === partId
-              ? {
-                  ...part,
-                  text: part.text + delta,
-                  content: { ...part.content, text: `${partText(part)}${delta}` },
-                  updatedAt: new Date().toISOString()
-                }
-              : part
-          )
-        };
-      })
-    );
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -774,20 +1096,22 @@ export function App() {
     });
   }
 
-  function openRunEventsIfAgentResume(response: InvokeToolResponse) {
+  function openRunEventsIfAgentResume(response: InvokeToolResponse): boolean {
     if (response.run.provider.startsWith("tool:")) {
-      return;
+      return false;
     }
-    if (response.run.status === "running" || response.run.status === "waiting_permission") {
-      setActiveRunId(response.run.id);
-      openRunEvents(response.run.id);
+    if (response.run.status === "running" || response.run.status === "waiting_permission" || response.run.status === "cancelling") {
+      beginRunTracking(response.run, true);
+      return true;
     }
+    return false;
   }
 
   const shellTool = tools.find((tool) => tool.id === "shell.exec") ?? null;
-  const waitingForApproval = Boolean(
-    activeRunId && pendingPermissions.some((permission) => !permission.runId || permission.runId === activeRunId)
-  );
+  const displayedRunStatus = runDiscoveryPending
+    ? { label: "checking active runs", tone: "reconnecting" as const }
+    : runDisplayStatus(activeRun, runConnectionState, runTerminalNotice, Boolean(selectedSession));
+  const runControlsDisabled = Boolean(activeRun) || runDiscoveryPending || runStartPending;
 
   return (
     <main
@@ -823,7 +1147,7 @@ export function App() {
                 <button
                   className={session.id === selectedSessionId ? "session active" : "session"}
                   key={session.id}
-                  onClick={() => setSelectedSessionId(session.id)}
+                  onClick={() => selectSession(session.id)}
                   aria-current={session.id === selectedSessionId ? "page" : undefined}
                 >
                   <strong className="sessionTitle">{session.title}</strong>
@@ -849,12 +1173,13 @@ export function App() {
               provider={selectedProvider}
               modelOverride={modelOverride}
               activeRunId={activeRunId}
-              waitingForApproval={waitingForApproval}
+              statusLabel={displayedRunStatus.label}
+              statusTone={displayedRunStatus.tone}
               lastProviderResolution={lastProviderResolution}
               lastUnsupportedRunOptions={lastUnsupportedRunOptions}
               inspectorOpen={inspectorOpen}
               inspectorModal={inspectorModal}
-              pendingPermissionCount={pendingPermissions.length}
+              pendingPermissionCount={selectedPendingPermissions.length}
               inspectorToggleRef={inspectorToggleRef}
               onToggleInspector={() => setInspectorOpen((current) => !current)}
             />
@@ -862,6 +1187,11 @@ export function App() {
             {error && (
               <div className="chatAlertArea">
                 <div className="error">{error}</div>
+              </div>
+            )}
+            {runRecoveryWarning && (
+              <div className="chatAlertArea">
+                <div className="runRecoveryWarning">{runRecoveryWarning}</div>
               </div>
             )}
 
@@ -899,7 +1229,7 @@ export function App() {
                     composerIsComposingRef.current = false;
                   }}
                   onKeyDown={handleComposerKeyDown}
-                  disabled={Boolean(activeRunId)}
+                  disabled={runControlsDisabled}
                   rows={3}
                 />
                 <div className="composerActions">
@@ -915,15 +1245,13 @@ export function App() {
                   <span className="composerKeyboardHint" id="composer-keyboard-hint">
                     {sendOnEnter ? "Shift+Enter 줄바꿈" : "Ctrl/⌘+Enter 전송"}
                   </span>
-                  {activeRunId ? (
-                    <button type="button" onClick={cancelRun}>
-                      Cancel
-                    </button>
-                  ) : (
-                    <button type="submit" disabled={!input.trim()}>
-                      Run
-                    </button>
-                  )}
+                  <RunActionButton
+                    activeRun={activeRun}
+                    cancelPending={cancelPending}
+                    runDisabled={!input.trim() || runDiscoveryPending || runStartPending}
+                    onCancel={() => void cancelRun()}
+                  />
+                  {activeRun && <span className="cancelHint">Cancellation is best-effort; completed side effects remain.</span>}
                 </div>
               </div>
             </form>
@@ -946,7 +1274,7 @@ export function App() {
                   modelOverride,
                   reasoningEffort,
                   temperature,
-                  disabled: Boolean(activeRunId),
+                  disabled: runControlsDisabled,
                   modelCatalog,
                   modelCatalogState,
                   modelCatalogError,
@@ -978,7 +1306,7 @@ export function App() {
                   workingDirectoryDraft,
                   saveState: workingDirectorySaveState,
                   error: workingDirectoryError,
-                  disabled: Boolean(activeRunId),
+                  disabled: runControlsDisabled,
                   onWorkingDirectoryChange: (value) => {
                     setWorkingDirectoryDraft(value);
                     setWorkingDirectorySaveState("idle");
@@ -987,8 +1315,14 @@ export function App() {
                   onSaveWorkingDirectory: () => void saveSessionWorkingDirectory()
                 }}
                 runStatus={{
-                  activeRunId,
-                  waitingForApproval,
+                  activeRun,
+                  statusLabel: displayedRunStatus.label,
+                  statusTone: displayedRunStatus.tone,
+                  connectionState: runConnectionState,
+                  terminalNotice: runTerminalNotice,
+                  recoveryWarning: runRecoveryWarning,
+                  cancelPending,
+                  onCancel: () => void cancelRun(),
                   providerNotice,
                   lastProviderResolution,
                   lastRunOptions,
@@ -996,7 +1330,7 @@ export function App() {
                   lastUnsupportedRunOptions
                 }}
                 permissions={{
-                  items: pendingPermissions,
+                  items: selectedPendingPermissions,
                   busyRequestId: permissionActionId,
                   onRefresh: () => void loadPendingPermissions(),
                   onApprove: (requestId) => void approvePermission(requestId),
@@ -1013,7 +1347,7 @@ export function App() {
                   shellTimeoutMs,
                   shellToolState,
                   lastShellResponse,
-                  shellDisabled: Boolean(activeRunId),
+                  shellDisabled: runControlsDisabled,
                   onShellCommandChange: setShellCommand,
                   onShellCwdChange: setShellCwd,
                   onShellTimeoutChange: setShellTimeoutMs,
@@ -1102,7 +1436,7 @@ function hasRunOptions(options: RunOptions): boolean {
   return Boolean(options.model || options.reasoningEffort || options.temperature !== undefined);
 }
 
-function providerResolutionNotice(resolution: ProviderResolution): string | null {
+function providerResolutionNotice(resolution: PublicProviderResolution): string | null {
   if (!resolution.fallback) {
     return null;
   }
@@ -1123,6 +1457,16 @@ function roleRank(role: Message["role"]): number {
   return 2;
 }
 
-function isTerminalEvent(type: RunEvent["type"]): boolean {
-  return type === "run_completed" || type === "run_cancelled" || type === "run_failed";
+function activeRunFromError(error: unknown): PublicRunSummary | null {
+  if (!(error instanceof ApiRequestError) || error.code !== "active_run_exists") {
+    return null;
+  }
+  const value = error.body?.run;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const run = value as Partial<PublicRunSummary>;
+  return typeof run.id === "string" && typeof run.sessionId === "string" && run.status && isActiveRunStatus(run.status)
+    ? (run as PublicRunSummary)
+    : null;
 }

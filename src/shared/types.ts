@@ -13,8 +13,35 @@ export type MessagePartType =
   | "tool_result"
   | "command_output"
   | "file_ref";
-export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed";
-export type RunStatus = "running" | "waiting_permission" | "completed" | "cancelled" | "failed";
+export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed" | "interrupted";
+export type RunStatus = "running" | "waiting_permission" | "cancelling" | "completed" | "cancelled" | "failed" | "interrupted";
+export type ActiveRunStatus = Extract<RunStatus, "running" | "waiting_permission" | "cancelling">;
+export type TerminalRunStatus = Extract<RunStatus, "completed" | "cancelled" | "failed" | "interrupted">;
+
+export const ACTIVE_RUN_STATUSES: readonly ActiveRunStatus[] = ["running", "waiting_permission", "cancelling"];
+export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = ["completed", "cancelled", "failed", "interrupted"];
+
+export function isActiveRunStatus(status: RunStatus): status is ActiveRunStatus {
+  return (ACTIVE_RUN_STATUSES as readonly RunStatus[]).includes(status);
+}
+
+export function isTerminalRunStatus(status: RunStatus): status is TerminalRunStatus {
+  return (TERMINAL_RUN_STATUSES as readonly RunStatus[]).includes(status);
+}
+
+export function canTransitionRunStatus(from: RunStatus, to: RunStatus): boolean {
+  if (isTerminalRunStatus(from) || from === to) {
+    return false;
+  }
+  if (from === "running") {
+    return to === "waiting_permission" || to === "cancelling" || isTerminalRunStatus(to);
+  }
+  if (from === "waiting_permission") {
+    return to === "running" || to === "cancelling" || to === "failed" || to === "cancelled" || to === "interrupted";
+  }
+  return from === "cancelling" && (to === "cancelled" || to === "interrupted");
+}
+
 /** Provider-defined opaque value, validated at runtime before persistence or use. */
 export type ReasoningEffort = string;
 export type ProviderProfileType = "openai-compatible" | "openai-chatgpt" | "mock";
@@ -208,6 +235,9 @@ export interface ToolExecutionResult {
   metadata: JsonObject;
 }
 
+export type PublicToolInvocation = Omit<ToolInvocation, "input" | "metadata">;
+export type PublicToolExecutionResult = Omit<ToolExecutionResult, "metadata">;
+
 export interface ProviderRunOptionSupport {
   model: RunOptionSupport;
   reasoningEffort: RunOptionSupport;
@@ -368,6 +398,22 @@ export interface Run {
   error: string | null;
 }
 
+export type PublicRunPhase = "running" | "provider" | "tool" | "waiting_permission" | "cancelling";
+
+export interface PublicRunSummary {
+  id: string;
+  sessionId: string;
+  provider: string;
+  status: RunStatus;
+  model: string | null;
+  runOptions: RunOptions | null;
+  usage: RunUsage | null;
+  currentPhase: PublicRunPhase | null;
+  createdAt: ISODateString;
+  updatedAt: ISODateString;
+  error: string | null;
+}
+
 export const CORE_RUN_EVENT_TYPES = [
   "run_started",
   "user_message_created",
@@ -375,9 +421,11 @@ export const CORE_RUN_EVENT_TYPES = [
   "assistant_message_updated",
   "delta",
   "run_waiting_permission",
+  "run_cancelling",
   "run_completed",
   "run_cancelled",
-  "run_failed"
+  "run_failed",
+  "run_interrupted"
 ] as const;
 
 export const TOOL_RUN_EVENT_TYPES = [
@@ -400,6 +448,7 @@ export type CoreRunEventType = (typeof CORE_RUN_EVENT_TYPES)[number];
 export type ToolRunEventType = (typeof TOOL_RUN_EVENT_TYPES)[number];
 export type PermissionRunEventType = (typeof PERMISSION_RUN_EVENT_TYPES)[number];
 export type RunEventType = (typeof RUN_EVENT_TYPES)[number];
+export type TerminalRunEventType = Extract<RunEventType, "run_completed" | "run_cancelled" | "run_failed" | "run_interrupted">;
 
 export function isRunEventType(type: string): type is RunEventType {
   return (RUN_EVENT_TYPES as readonly string[]).includes(type);
@@ -413,8 +462,8 @@ export function isPermissionRunEventType(type: string): type is PermissionRunEve
   return (PERMISSION_RUN_EVENT_TYPES as readonly string[]).includes(type);
 }
 
-export function isTerminalRunEventType(type: string): type is "run_completed" | "run_cancelled" | "run_failed" {
-  return type === "run_completed" || type === "run_cancelled" || type === "run_failed";
+export function isTerminalRunEventType(type: string): type is TerminalRunEventType {
+  return type === "run_completed" || type === "run_cancelled" || type === "run_failed" || type === "run_interrupted";
 }
 
 export type ToolRunEventPayload = JsonObject & {
@@ -519,13 +568,15 @@ export interface ProviderResolution {
   fallback: ProviderFallbackInfo | null;
 }
 
+export type PublicProviderResolution = Omit<ProviderResolution, "baseUrl" | "credentialRef">;
+
 export interface CreateRunResponse {
-  run: Run;
+  run: PublicRunSummary;
   agentId: string;
   agentName: string;
   provider: string;
   providerProfileId: string;
-  providerResolution: ProviderResolution;
+  providerResolution: PublicProviderResolution;
   model: string | null;
   runOptions: RunOptions;
   requestedRunOptions: RunOptions;
@@ -534,14 +585,14 @@ export interface CreateRunResponse {
   assistantMessageId: string;
 }
 
-export type InvokeToolResponseState = "executed" | "pending_permission" | "denied";
+export type InvokeToolResponseState = "running" | "executed" | "pending_permission" | "denied";
 
 export interface InvokeToolResponse {
   state: InvokeToolResponseState;
-  invocation: ToolInvocation;
-  result?: ToolExecutionResult;
+  invocation: PublicToolInvocation;
+  result?: PublicToolExecutionResult;
   permissionRequest?: PermissionRequest;
-  run: Run;
+  run: PublicRunSummary;
   message: Message;
   toolCallPartId: string;
   commandOutputPartId?: string;
@@ -553,7 +604,7 @@ export interface PermissionListResponse {
 }
 
 export interface ContextPreviewResponse extends ContextBuildResult {
-  providerResolution: ProviderResolution;
+  providerResolution: PublicProviderResolution;
   requestedRunOptions: RunOptions;
   unsupportedRunOptions: string[];
 }

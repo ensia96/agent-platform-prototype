@@ -19,6 +19,7 @@ import type {
   ToolSettings,
   ToolSettingsResponse
 } from "../shared/types";
+import { isTerminalRunEventType, isTerminalRunStatus } from "../shared/types";
 import {
   extractSettingsPatch,
   normalizeSettingsPatch,
@@ -33,6 +34,7 @@ import {
   requestBodyObject,
   toolSettingsToJson
 } from "./request-parsers";
+import { OrderedRunEventReplay, planRunEventCursor, resolveRunEventCursor, runEventCursorControl } from "./run-event-replay";
 
 export interface ApiRouteDependencies {
   dbPath: string;
@@ -247,6 +249,7 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   });
 
   app.get("/api/permissions", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       const status = parsePermissionStatus(req.query.status);
       const response: PermissionListResponse = { permissions: kernel.listPermissionRequests(status) };
@@ -257,6 +260,7 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   });
 
   app.post("/api/permissions/:id/approve", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       res.json(await kernel.approvePermissionRequest(req.params.id));
     } catch (error) {
@@ -265,6 +269,7 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   });
 
   app.post("/api/permissions/:id/deny", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       res.json(kernel.denyPermissionRequest(req.params.id));
     } catch (error) {
@@ -317,16 +322,41 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
     }
   });
 
+  app.get("/api/sessions/:id/runs", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.listPublicRuns(req.params.id, req.query.active === "1"));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/sessions/:id/runs/active", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.listPublicRuns(req.params.id, true));
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/sessions/:id/tools/shell.exec", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       const input = parseShellExecRequest(requestBodyObject(req.body));
-      res.json(await kernel.invokeTool(req.params.id, "shell.exec", input, { caller: "manual" }));
+      if (req.query.async === "1") {
+        const response = kernel.startToolInvocation(req.params.id, "shell.exec", input, { caller: "manual" });
+        res.status(response.state === "running" ? 202 : 200).json(response);
+        return;
+      }
+      res.status(200).json(await kernel.invokeTool(req.params.id, "shell.exec", input, { caller: "manual" }));
     } catch (error) {
       next(error);
     }
   });
 
   app.post("/api/sessions/:id/runs", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       const body = req.body as Record<string, unknown> | undefined;
       const text = typeof body?.text === "string" ? body.text : "";
@@ -344,58 +374,106 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
 function registerRunRoutes(app: Express, dependencies: ApiRouteDependencies): void {
   const { kernel } = dependencies;
 
+  app.get("/api/runs/:id", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.getPublicRun(req.params.id));
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.get("/api/runs/:id/events", (req, res, next) => {
     try {
       const runId = req.params.id;
-      kernel.getRun(runId);
+      const run = kernel.getRun(runId);
+      let requestedAfter: number;
+      try {
+        requestedAfter = resolveRunEventCursor(req.query.after, req.get("Last-Event-ID"));
+      } catch (error) {
+        throw new KernelError(error instanceof Error ? error.message : "Invalid event cursor.", 400);
+      }
+      const cursorPlan = planRunEventCursor(requestedAfter, kernel.getLatestRunEventSeq(runId), isTerminalRunStatus(run.status));
+      if (cursorPlan.noContent) {
+        res.setHeader("Cache-Control", "no-store");
+        res.status(204).end();
+        return;
+      }
 
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders?.();
       res.write("retry: 1000\n\n");
-
-      const seenEventIds = new Set<string>();
-      const send = (event: RunEvent): void => {
-        if (seenEventIds.has(event.id) || res.writableEnded) {
-          return;
-        }
-        seenEventIds.add(event.id);
-        res.write(`id: ${event.seq}\n`);
-        res.write(`data: ${JSON.stringify(event)}\n\n`);
-      };
-
-      const unsubscribe = kernel.subscribeRunEvents(runId, send);
-      for (const event of kernel.listRunEvents(runId)) {
-        send(event);
+      if (cursorPlan.canonicalized) {
+        // Named SSE events update EventSource's Last-Event-ID without entering the client's onmessage run-event reducer.
+        res.write(runEventCursorControl(cursorPlan.after));
       }
 
-      const ping = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(": ping\n\n");
+      let closed = false;
+      let ping: ReturnType<typeof setInterval> | null = null;
+      let unsubscribe: () => void = () => undefined;
+      const close = (endResponse: boolean): void => {
+        if (closed) {
+          return;
         }
-      }, 15_000);
-
-      req.on("close", () => {
-        clearInterval(ping);
+        closed = true;
+        if (ping) {
+          clearInterval(ping);
+          ping = null;
+        }
         unsubscribe();
-      });
+        if (endResponse && !res.writableEnded) {
+          res.end();
+        }
+      };
+      const send = (event: RunEvent): void => {
+        if (closed || res.writableEnded) {
+          return;
+        }
+        res.write(`id: ${event.seq}\n`);
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+        if (isTerminalRunEventType(event.type)) {
+          close(true);
+        }
+      };
+
+      const replay = new OrderedRunEventReplay(runId, cursorPlan.after, send);
+      unsubscribe = kernel.subscribeRunEvents(runId, (event) => replay.pushLive(event));
+      req.once("close", () => close(false));
+      replay.replay(kernel.listRunEvents(runId, cursorPlan.after));
+
+      if (!closed && isTerminalRunStatus(kernel.getRun(runId).status)) {
+        close(true);
+      }
+
+      if (!closed) {
+        ping = setInterval(() => {
+          if (!res.writableEnded) {
+            res.write(": ping\n\n");
+          }
+        }, 15_000);
+      }
     } catch (error) {
       next(error);
     }
   });
 
   app.post("/api/runs/:id/cancel", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
-      res.json(kernel.cancelRun(req.params.id));
+      kernel.cancelRun(req.params.id);
+      res.json(kernel.getPublicRun(req.params.id));
     } catch (error) {
       next(error);
     }
   });
 
   app.post("/api/runs/:id/resume", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
-      res.json(kernel.resumeRun(req.params.id));
+      kernel.resumeRun(req.params.id);
+      res.json(kernel.getPublicRun(req.params.id));
     } catch (error) {
       next(error);
     }

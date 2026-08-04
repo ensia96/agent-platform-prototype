@@ -1,4 +1,5 @@
 import type {
+  ActiveRunStatus,
   AgentDefinition,
   JsonObject,
   JsonValue,
@@ -17,6 +18,8 @@ import type {
   RunOptions,
   RunStatus,
   Session,
+  TerminalRunEventType,
+  TerminalRunStatus,
   ToolInvocationCaller,
   ToolPermissionDecision
 } from "../shared/types";
@@ -33,11 +36,18 @@ export interface CreateRunInput {
   id: string;
   sessionId: string;
   provider: string;
-  status: RunStatus;
+  status: "running";
   createdAt: ISODateString;
   updatedAt: ISODateString;
   error?: string | null;
   metadata?: JsonObject;
+}
+
+export class ActiveRunExistsStoreError extends Error {
+  constructor(readonly activeRun: Run) {
+    super(`Session '${activeRun.sessionId}' already has active run '${activeRun.id}'.`);
+    this.name = "ActiveRunExistsStoreError";
+  }
 }
 
 export interface CreateMessageInput {
@@ -144,6 +154,44 @@ export interface ListPermissionRequestsFilter {
   sessionId?: string;
 }
 
+export interface ListRunsFilter {
+  sessionId?: string;
+  statuses?: readonly RunStatus[];
+}
+
+export interface DaemonLeaseRecord {
+  ownerId: string;
+  pid: number;
+  acquiredAt: ISODateString;
+  heartbeatAt: ISODateString;
+}
+
+export interface RunCancellationResult {
+  run: Run;
+  expiredPermissionRequests: StoredPermissionRequest[];
+  event: RunEvent | null;
+}
+
+export interface RequestRunCancellationInput {
+  runId: string;
+  updatedAt: ISODateString;
+  event: Pick<AppendEventInput, "id" | "payload"> & { type: "run_cancelling" };
+}
+
+export interface FinalizeRunInput {
+  runId: string;
+  expectedStatuses: readonly RunStatus[];
+  status: TerminalRunStatus;
+  error: string | null;
+  updatedAt: ISODateString;
+  event: Pick<AppendEventInput, "id" | "payload"> & { type: TerminalRunEventType };
+}
+
+export interface FinalizeRunResult {
+  run: Run;
+  event: RunEvent;
+}
+
 export interface StoreAdapter {
   listSessions(): Session[];
   getSession(id: string): Session | null;
@@ -153,7 +201,17 @@ export interface StoreAdapter {
 
   createRun(input: CreateRunInput): Run;
   getRun(id: string): Run | null;
-  updateRunStatus(id: string, status: RunStatus, error: string | null, updatedAt: ISODateString): void;
+  listRuns(filter?: ListRunsFilter): Run[];
+  transitionRunStatus(
+    id: string,
+    expectedStatuses: readonly RunStatus[],
+    status: ActiveRunStatus,
+    error: string | null,
+    updatedAt: ISODateString
+  ): Run | null;
+  requestRunCancellation(input: RequestRunCancellationInput): RunCancellationResult | null;
+  finalizeRun(input: FinalizeRunInput): FinalizeRunResult | null;
+  expirePendingPermissionsForTerminalRuns(updatedAt: ISODateString): number;
   mergeRunMetadata(id: string, metadata: JsonObject, updatedAt: ISODateString): void;
 
   listMessages(sessionId: string): Message[];
@@ -163,11 +221,18 @@ export interface StoreAdapter {
   addMessagePart(input: AddMessagePartInput): MessagePart;
   upsertMessageTextPart(input: UpsertMessageTextPartInput): void;
   updateMessagePart(input: UpdateMessagePartInput): MessagePart | null;
-  updateMessageStatus(id: string, status: MessageStatus, updatedAt: ISODateString, error?: string | null): void;
+  transitionMessageStatus(
+    id: string,
+    expectedStatuses: readonly MessageStatus[],
+    status: MessageStatus,
+    updatedAt: ISODateString,
+    error?: string | null
+  ): Message | null;
   mergeMessageMetadata(id: string, metadata: JsonObject, updatedAt: ISODateString): void;
 
   appendEvent(input: AppendEventInput): RunEvent;
-  listEvents(runId: string): RunEvent[];
+  listEvents(runId: string, after?: number): RunEvent[];
+  getLatestEventSeq(runId: string): number;
 
   listAgentDefinitions(): AgentDefinition[];
   getAgentDefinition(id: string): AgentDefinition | null;
@@ -176,7 +241,14 @@ export interface StoreAdapter {
   createPermissionRequest(input: CreatePermissionRequestInput): StoredPermissionRequest;
   getPermissionRequest(id: string): StoredPermissionRequest | null;
   listPermissionRequests(filter?: ListPermissionRequestsFilter): StoredPermissionRequest[];
+  /** Resolves only a pending request whose run is waiting, and atomically resumes that run. */
   resolvePermissionRequest(id: string, status: Exclude<PermissionRequestStatus, "pending">, resolvedAt: ISODateString): StoredPermissionRequest | null;
+
+  getDaemonLease(): DaemonLeaseRecord | null;
+  createDaemonLease(input: DaemonLeaseRecord): boolean;
+  takeOverDaemonLease(expectedOwnerId: string, expectedHeartbeatAt: ISODateString, input: DaemonLeaseRecord): boolean;
+  heartbeatDaemonLease(ownerId: string, pid: number, heartbeatAt: ISODateString): boolean;
+  releaseDaemonLease(ownerId: string): boolean;
 
   listSettings(): JsonObject;
   setSetting(key: string, value: JsonValue, updatedAt: ISODateString): void;

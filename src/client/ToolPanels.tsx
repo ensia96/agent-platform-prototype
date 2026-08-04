@@ -1,6 +1,6 @@
 import type { InvokeToolResponse, PermissionRequest, ToolDefinition } from "../shared/types";
 
-export type ShellToolState = "idle" | "running" | "pending_permission" | "completed" | "failed" | "denied";
+export type ShellToolState = "idle" | "running" | "pending_permission" | "completed" | "failed" | "cancelled" | "denied";
 
 export function PendingPermissionsPanel({
   permissions,
@@ -150,18 +150,30 @@ export function ShellToolPanel({
           {result.error && <pre>{result.error}</pre>}
         </div>
       )}
+      {!result && (state === "completed" || state === "failed" || state === "cancelled") && (
+        <div className={state === "completed" ? "shellToolResult success" : "shellToolResult failure"}>
+          <strong>{state}</strong>
+          <span>The asynchronous result and command output are recorded in the conversation timeline.</span>
+        </div>
+      )}
     </details>
   );
 }
 
 export function shellToolStateFromResponse(response: InvokeToolResponse): ShellToolState {
+  if (response.state === "running") {
+    return "running";
+  }
   if (response.state === "pending_permission") {
     return "pending_permission";
   }
   if (response.state === "denied") {
     return "denied";
   }
-  return response.result?.status === "completed" ? "completed" : "failed";
+  if (response.result?.status === "completed") {
+    return "completed";
+  }
+  return response.result?.status === "cancelled" ? "cancelled" : "failed";
 }
 
 function summarizeShellResponse(response: InvokeToolResponse | null): string {

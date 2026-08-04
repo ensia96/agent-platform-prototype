@@ -4,9 +4,10 @@ import type {
   ContextPreviewResponse,
   InvokeToolResponse,
   PermissionRequest,
+  PublicRunSummary,
   ProviderModelCatalog,
   ProviderProfile,
-  ProviderResolution,
+  PublicProviderResolution,
   ReasoningEffort,
   RunOptions,
   RunUsage,
@@ -17,6 +18,7 @@ import { formatUsage } from "./MessageBody";
 import { advertisedReasoningEfforts, effectiveRunModelId, type ModelCatalogLoadState } from "./model-catalog";
 import { agentToolIds, formatRunOptions } from "./SettingsPanel";
 import { PendingPermissionsPanel, ShellToolPanel, type ShellToolState } from "./ToolPanels";
+import type { RunConnectionState, RunStatusTone, RunTerminalNotice } from "./run-recovery";
 
 type LoadState = "idle" | "loading" | "error";
 type SaveState = "idle" | "saving" | "saved";
@@ -54,10 +56,16 @@ export interface RunInspectorProps {
     onSaveWorkingDirectory: () => void;
   };
   runStatus: {
-    activeRunId: string | null;
-    waitingForApproval: boolean;
+    activeRun: PublicRunSummary | null;
+    statusLabel: string;
+    statusTone: RunStatusTone;
+    connectionState: RunConnectionState;
+    terminalNotice: RunTerminalNotice | null;
+    recoveryWarning: string | null;
+    cancelPending: boolean;
+    onCancel: () => void;
     providerNotice: string | null;
-    lastProviderResolution: ProviderResolution | null;
+    lastProviderResolution: PublicProviderResolution | null;
     lastRunOptions: RunOptions | null;
     lastRunUsage: RunUsage | null;
     lastUnsupportedRunOptions: string[];
@@ -98,14 +106,6 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
   const reasoningEfforts = advertisedReasoningEfforts(setup.modelCatalog, selectedProvider, selectedAgent, setup.modelOverride);
   const selectedCatalogModel = setup.modelCatalog?.models.find((model) => model.id === effectiveModelId) ?? null;
   const catalogHasFixedChoices = setup.modelCatalog !== null && !setup.modelCatalog.customModelAllowed;
-  const runState = runStatus.waitingForApproval
-    ? "waiting for approval"
-    : runStatus.activeRunId
-      ? "running"
-      : runStatus.lastProviderResolution
-        ? "last run"
-        : "idle";
-  const runStateTone = runStatus.waitingForApproval ? "waiting" : runStatus.activeRunId ? "running" : "idle";
 
   useEffect(() => {
     if (!modal) {
@@ -323,10 +323,32 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
           <summary>Run status & usage</summary>
           <div className="inspectorSectionBody">
             <div className="runStateRow">
-              <span className={`workspaceStatus ${runStateTone}`}>{runState}</span>
-              {runStatus.activeRunId && <span className="monospace inspectorRunId">{runStatus.activeRunId}</span>}
+              <span className={`workspaceStatus ${runStatus.statusTone}`}>{runStatus.statusLabel}</span>
+              {runStatus.activeRun && <span className="monospace inspectorRunId">{runStatus.activeRun.id}</span>}
             </div>
+            {runStatus.recoveryWarning && <div className="runRecoveryWarning">{runStatus.recoveryWarning}</div>}
+            {runStatus.terminalNotice?.error && <p className="inspectorHint">{runStatus.terminalNotice.error}</p>}
             {runStatus.providerNotice && <div className="providerNotice">{runStatus.providerNotice}</div>}
+            {runStatus.activeRun && (
+              <>
+                <dl className="inspectorDetails compactRunDetails">
+                  <dt>Connection</dt>
+                  <dd>{runStatus.connectionState}</dd>
+                  <dt>Phase</dt>
+                  <dd>{runStatus.activeRun.currentPhase ?? runStatus.activeRun.status}</dd>
+                </dl>
+                <div className="inspectorCancelRow">
+                  <span className="inspectorHint">Best-effort; completed side effects remain.</span>
+                  <button
+                    type="button"
+                    onClick={runStatus.onCancel}
+                    disabled={runStatus.cancelPending || runStatus.activeRun.status === "cancelling"}
+                  >
+                    {runStatus.cancelPending || runStatus.activeRun.status === "cancelling" ? "Cancelling…" : "Cancel run"}
+                  </button>
+                </div>
+              </>
+            )}
             {runStatus.lastProviderResolution ? (
               <dl className="inspectorDetails">
                 <dt>Provider</dt>

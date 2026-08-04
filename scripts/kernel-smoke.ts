@@ -19,7 +19,8 @@ async function runScenario(scenario: Scenario): Promise<string> {
     const store = new SQLiteStore({ dbPath: ":memory:", defaultWorkingDirectory: workingDirectory });
     const eventBus = new RunEventBus();
     const executedCwds: string[] = [];
-    const tools = createFakeToolRegistry(executedCwds);
+    const executedSignals: AbortSignal[] = [];
+    const tools = createFakeToolRegistry(executedCwds, executedSignals);
     const provider = new ScriptedToolProvider(scenario, workingDirectory);
     const kernel = new Kernel({
       store,
@@ -75,6 +76,11 @@ async function runScenario(scenario: Scenario): Promise<string> {
     assert.equal(assistantMessages.length, 2, `${scenario}: follow-up assistant message missing`);
     assert.match(assistantMessages[1].parts.map((part) => part.text).join(""), new RegExp(`follow-up:${scenario}`));
     assert.equal(provider.turns, 2, `${scenario}: provider follow-up turn missing`);
+    assert.equal(provider.signals.length, 2, `${scenario}: provider signal fixture missing`);
+    assert.equal(provider.signals[0], provider.signals[1], `${scenario}: resumed provider turn did not reuse the run signal`);
+    if (scenario !== "deny") {
+      assert.equal(executedSignals[0], provider.signals[0], `${scenario}: tool execution did not reuse the provider run signal`);
+    }
     return `${scenario}(${events.length} events)`;
   } finally {
     rmSync(workingDirectory, { recursive: true, force: true });
@@ -85,6 +91,7 @@ class ScriptedToolProvider implements ProviderAdapter {
   readonly id = "fake-tool-provider";
   readonly label = "Fake tool-loop provider";
   turns = 0;
+  readonly signals: AbortSignal[] = [];
 
   constructor(
     private readonly scenario: Scenario,
@@ -104,6 +111,7 @@ class ScriptedToolProvider implements ProviderAdapter {
 
   async run(input: ProviderRunInput, context: ProviderRunContext) {
     this.turns += 1;
+    this.signals.push(context.signal);
     assert.equal(input.context.workingDirectory, this.expectedWorkingDirectory);
     const usage: RunUsage =
       this.turns === 1
@@ -174,7 +182,7 @@ function createFakeProviderRegistry(adapter: ProviderAdapter): ProviderRegistry 
   } as unknown as ProviderRegistry;
 }
 
-function createFakeToolRegistry(executedCwds: string[]): ToolRegistry {
+function createFakeToolRegistry(executedCwds: string[], executedSignals: AbortSignal[]): ToolRegistry {
   const registry = new ToolRegistry();
   registry.register({
     definition: {
@@ -199,6 +207,7 @@ function createFakeToolRegistry(executedCwds: string[]): ToolRegistry {
       async execute(input, context) {
         const cwd = String(input.cwd);
         executedCwds.push(cwd);
+        executedSignals.push(context.signal);
         await context.emit({
           invocationId: context.invocation.id,
           toolId: context.invocation.toolId,
