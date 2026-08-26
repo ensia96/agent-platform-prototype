@@ -28,7 +28,14 @@ export interface CreateSessionInput {
   id: string;
   title: string;
   workingDirectory: string;
+  agentId?: string;
   createdAt: ISODateString;
+  updatedAt: ISODateString;
+}
+
+export interface UpdateSessionInput {
+  workingDirectory?: string;
+  agentId?: string;
   updatedAt: ISODateString;
 }
 
@@ -99,6 +106,7 @@ export interface AppendEventInput {
 
 export interface UpdateAgentDefinitionInput {
   id: string;
+  expectedRevision: number;
   name?: string;
   description?: string | null;
   systemPrompt?: string;
@@ -109,6 +117,41 @@ export interface UpdateAgentDefinitionInput {
   metadata?: JsonObject;
   updatedAt: ISODateString;
 }
+
+export type UpdateAgentDefinitionResult =
+  | { status: "updated" | "unchanged"; agent: AgentDefinition }
+  | { status: "revision_conflict"; agent: AgentDefinition }
+  | { status: "not_found" };
+
+export type DeleteAgentDefinitionResult =
+  | { status: "deleted" }
+  | { status: "in_use"; agent: AgentDefinition; sessions: Session[] }
+  | { status: "revision_conflict"; agent: AgentDefinition }
+  | { status: "not_found" };
+
+export interface CreateAgentDefinitionInput {
+  id: string;
+  name: string;
+  description: string | null;
+  systemPrompt: string;
+  modelProfileId: string | null;
+  defaultRunOptions: RunOptions | null;
+  skillIds: string[];
+  toolIds: string[];
+  metadata?: JsonObject;
+  createdAt: ISODateString;
+  updatedAt: ISODateString;
+}
+
+export interface CloneAgentDefinitionInput extends CreateAgentDefinitionInput {
+  sourceId: string;
+  expectedSourceRevision: number;
+}
+
+export type CloneAgentDefinitionResult =
+  | { status: "created"; agent: AgentDefinition }
+  | { status: "revision_conflict"; agent: AgentDefinition }
+  | { status: "not_found" };
 
 export interface CreatePermissionRequestInput {
   id: string;
@@ -196,7 +239,9 @@ export interface StoreAdapter {
   listSessions(): Session[];
   getSession(id: string): Session | null;
   createSession(input: CreateSessionInput): Session;
+  updateSession(id: string, input: UpdateSessionInput): Session | null;
   updateSessionWorkingDirectory(id: string, workingDirectory: string, updatedAt: ISODateString): Session | null;
+  listSessionsByAgentId(agentId: string): Session[];
   touchSession(id: string, updatedAt: ISODateString): void;
 
   createRun(input: CreateRunInput): Run;
@@ -236,7 +281,10 @@ export interface StoreAdapter {
 
   listAgentDefinitions(): AgentDefinition[];
   getAgentDefinition(id: string): AgentDefinition | null;
-  updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition | null;
+  createAgentDefinition(input: CreateAgentDefinitionInput): AgentDefinition;
+  cloneAgentDefinition(input: CloneAgentDefinitionInput): CloneAgentDefinitionResult;
+  updateAgentDefinition(input: UpdateAgentDefinitionInput): UpdateAgentDefinitionResult;
+  deleteAgentDefinitionIfUnused(id: string, expectedRevision: number): DeleteAgentDefinitionResult;
 
   createPermissionRequest(input: CreatePermissionRequestInput): StoredPermissionRequest;
   getPermissionRequest(id: string): StoredPermissionRequest | null;

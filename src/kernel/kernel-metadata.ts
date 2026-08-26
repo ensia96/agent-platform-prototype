@@ -1,4 +1,3 @@
-import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 import type { ProviderMessage } from "../providers/types";
 import type {
@@ -10,11 +9,17 @@ import type {
   ProviderResolution,
   RunOptions
 } from "../shared/types";
-import { defaultAgentId } from "./context-builder";
 
 export interface RunOptionPlan {
   requestedRunOptions: RunOptions;
   runOptions: RunOptions;
+  unsupportedRunOptions: string[];
+}
+
+export interface RunExecutionSnapshot {
+  providerProfileId: string;
+  runOptions: RunOptions;
+  requestedRunOptions: RunOptions;
   unsupportedRunOptions: string[];
 }
 
@@ -116,12 +121,22 @@ export function buildRunMetadata(
   providerResolution: ProviderResolution,
   optionPlan: RunOptionPlan,
   agent: AgentDefinition,
-  userRunOptions: RunOptions
+  userRunOptions: RunOptions,
+  snapshotAt: string
 ): JsonObject {
   const metadata: JsonObject = {
     agentId: agent.id,
     agentName: agent.name,
     agent: agentToJson(agent),
+    agentSnapshot: agentRunSnapshotToJson(agent, snapshotAt),
+    executionSnapshot: {
+      schemaVersion: 1,
+      snapshotAt,
+      providerProfileId: providerResolution.providerProfileId,
+      runOptions: runOptionsToJson(optionPlan.runOptions),
+      requestedRunOptions: runOptionsToJson(optionPlan.requestedRunOptions),
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions
+    },
     providerProfileId: providerResolution.providerProfileId,
     providerProfileName: providerResolution.providerProfileName,
     providerType: providerResolution.providerType,
@@ -142,6 +157,89 @@ export function buildRunMetadata(
     metadata.optionSupportNote = "Unsupported run options are recorded as metadata only and are not sent to the provider.";
   }
   return metadata;
+}
+
+export function agentRunSnapshotToJson(agent: AgentDefinition, snapshotAt: string): JsonObject {
+  return {
+    schemaVersion: 1,
+    snapshotAt,
+    id: agent.id,
+    revision: agent.revision,
+    name: agent.name,
+    description: agent.description,
+    systemPrompt: agent.systemPrompt,
+    modelProfileId: agent.modelProfileId,
+    defaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
+    skillIds: uniqueStrings(agent.skillIds),
+    toolIds: uniqueStrings(agent.toolIds),
+    createdAt: agent.createdAt,
+    updatedAt: agent.updatedAt
+  };
+}
+
+export function agentFromRunMetadata(metadata: JsonObject): AgentDefinition | null {
+  const value = metadata.agentSnapshot;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const snapshot = value as JsonObject;
+  const schemaVersion = numberField(snapshot, "schemaVersion");
+  const snapshotAt = stringField(snapshot, "snapshotAt");
+  const id = stringField(snapshot, "id").trim();
+  const name = stringField(snapshot, "name").trim();
+  const systemPrompt = stringField(snapshot, "systemPrompt");
+  const revision = numberField(snapshot, "revision");
+  const createdAt = stringField(snapshot, "createdAt");
+  const updatedAt = stringField(snapshot, "updatedAt");
+  if (
+    schemaVersion !== 1 ||
+    !snapshotAt ||
+    !id ||
+    !name ||
+    !systemPrompt.trim() ||
+    revision === null ||
+    revision < 1 ||
+    !Number.isInteger(revision) ||
+    !createdAt ||
+    !updatedAt
+  ) {
+    return null;
+  }
+  return {
+    id,
+    revision,
+    name,
+    description: typeof snapshot.description === "string" ? snapshot.description : null,
+    systemPrompt,
+    modelProfileId: typeof snapshot.modelProfileId === "string" && snapshot.modelProfileId.trim() ? snapshot.modelProfileId : null,
+    defaultRunOptions: nonEmptyRunOptions(runOptionsFromJson(snapshot.defaultRunOptions)),
+    skillIds: stringArray(snapshot.skillIds),
+    toolIds: stringArray(snapshot.toolIds),
+    metadata: {},
+    createdAt,
+    updatedAt
+  };
+}
+
+export function executionSnapshotFromRunMetadata(metadata: JsonObject): RunExecutionSnapshot | null {
+  const value = metadata.executionSnapshot;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const snapshot = value as JsonObject;
+  if (numberField(snapshot, "schemaVersion") !== 1 || !stringField(snapshot, "snapshotAt")) {
+    return null;
+  }
+  const providerProfileId = stringField(snapshot, "providerProfileId").trim();
+  const runOptions = runOptionsFromJson(snapshot.runOptions);
+  const requestedRunOptions = runOptionsFromJson(snapshot.requestedRunOptions);
+  const unsupportedRunOptions = Array.isArray(snapshot.unsupportedRunOptions)
+    ? snapshot.unsupportedRunOptions.filter((value): value is string => typeof value === "string")
+    : null;
+  if (!providerProfileId || !runOptions || !requestedRunOptions || !unsupportedRunOptions) {
+    return null;
+  }
+  return { providerProfileId, runOptions, requestedRunOptions, unsupportedRunOptions };
 }
 
 function providerResolutionToJson(resolution: ProviderResolution): JsonObject {
@@ -282,6 +380,7 @@ function contextMessageToJson(message: BuiltContext["messages"][number]): JsonOb
 export function agentToJson(agent: AgentDefinition): JsonObject {
   const output: JsonObject = {
     id: agent.id,
+    revision: agent.revision,
     name: agent.name,
     description: agent.description,
     modelProfileId: agent.modelProfileId,
@@ -296,11 +395,28 @@ export function agentToJson(agent: AgentDefinition): JsonObject {
 }
 
 export function effectiveAgentToolIds(agent: AgentDefinition): string[] {
-  const explicit = uniqueStrings(agent.toolIds);
-  if (explicit.length > 0) {
-    return explicit;
+  return uniqueStrings(agent.toolIds);
+}
+
+export function runOptionsFromJson(value: unknown): RunOptions | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
   }
-  return agent.id === defaultAgentId ? defaultMainAgentToolIds : [];
+  const object = value as JsonObject;
+  const options = cleanRunOptions({
+    model: stringField(object, "model") || undefined,
+    reasoningEffort: stringField(object, "reasoningEffort") || undefined,
+    temperature: numberField(object, "temperature") ?? undefined
+  });
+  return options;
+}
+
+function nonEmptyRunOptions(options: RunOptions | null): RunOptions | null {
+  return options && Object.keys(options).length > 0 ? options : null;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? uniqueStrings(value.filter((item): item is string => typeof item === "string")) : [];
 }
 
 function uniqueStrings(values: string[]): string[] {

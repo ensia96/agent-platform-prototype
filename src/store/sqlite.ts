@@ -1,9 +1,13 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type {
   AddMessagePartInput,
   AppendEventInput,
+  CloneAgentDefinitionInput,
+  CloneAgentDefinitionResult,
+  CreateAgentDefinitionInput,
   CreatePermissionRequestInput,
   CreateMessageInput,
   CreateRunInput,
@@ -17,7 +21,10 @@ import type {
   RequestRunCancellationInput,
   StoreAdapter,
   StoredPermissionRequest,
+  DeleteAgentDefinitionResult,
   UpdateAgentDefinitionInput,
+  UpdateAgentDefinitionResult,
+  UpdateSessionInput,
   UpdateMessagePartInput,
   UpsertMessageTextPartInput
 } from "./types";
@@ -53,6 +60,7 @@ type SessionRow = {
   id: string;
   title: string;
   working_directory: string | null;
+  agent_id: string;
   created_at: string;
   updated_at: string;
 };
@@ -110,6 +118,7 @@ type SettingRow = {
 
 type AgentDefinitionRow = {
   id: string;
+  revision: number;
   name: string;
   description: string | null;
   system_prompt: string;
@@ -173,14 +182,14 @@ export class SQLiteStore implements StoreAdapter {
 
   listSessions(): Session[] {
     const rows = this.db
-      .prepare("SELECT id, title, working_directory, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
+      .prepare("SELECT id, title, working_directory, agent_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
       .all() as SessionRow[];
     return rows.map((row) => rowToSession(row, this.defaultWorkingDirectory));
   }
 
   getSession(id: string): Session | null {
     const row = this.db
-      .prepare("SELECT id, title, working_directory, created_at, updated_at FROM sessions WHERE id = ?")
+      .prepare("SELECT id, title, working_directory, agent_id, created_at, updated_at FROM sessions WHERE id = ?")
       .get(id) as SessionRow | undefined;
     return row ? rowToSession(row, this.defaultWorkingDirectory) : null;
   }
@@ -188,18 +197,47 @@ export class SQLiteStore implements StoreAdapter {
   createSession(input: CreateSessionInput): Session {
     this.db
       .prepare(
-        `INSERT INTO sessions (id, title, working_directory, created_at, updated_at, metadata_json)
-         VALUES (@id, @title, @workingDirectory, @createdAt, @updatedAt, '{}')`
+        `INSERT INTO sessions (id, title, working_directory, agent_id, created_at, updated_at, metadata_json)
+         VALUES (@id, @title, @workingDirectory, @agentId, @createdAt, @updatedAt, '{}')`
       )
-      .run(input);
+      .run({ ...input, agentId: input.agentId ?? "main" });
     return this.getSession(input.id)!;
   }
 
-  updateSessionWorkingDirectory(id: string, workingDirectory: string, updatedAt: string): Session | null {
-    this.db
-      .prepare("UPDATE sessions SET working_directory = ?, updated_at = ? WHERE id = ?")
-      .run(workingDirectory, updatedAt, id);
+  updateSession(id: string, input: UpdateSessionInput): Session | null {
+    if (input.workingDirectory === undefined && input.agentId === undefined) {
+      return this.getSession(id);
+    }
+    if (input.workingDirectory !== undefined && input.agentId !== undefined) {
+      this.db
+        .prepare("UPDATE sessions SET working_directory = ?, agent_id = ?, updated_at = MAX(updated_at, ?) WHERE id = ?")
+        .run(input.workingDirectory, input.agentId, input.updatedAt, id);
+    } else if (input.workingDirectory !== undefined) {
+      this.db
+        .prepare("UPDATE sessions SET working_directory = ?, updated_at = MAX(updated_at, ?) WHERE id = ?")
+        .run(input.workingDirectory, input.updatedAt, id);
+    } else {
+      this.db
+        .prepare("UPDATE sessions SET agent_id = ?, updated_at = MAX(updated_at, ?) WHERE id = ?")
+        .run(input.agentId, input.updatedAt, id);
+    }
     return this.getSession(id);
+  }
+
+  updateSessionWorkingDirectory(id: string, workingDirectory: string, updatedAt: string): Session | null {
+    return this.updateSession(id, { workingDirectory, updatedAt });
+  }
+
+  listSessionsByAgentId(agentId: string): Session[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, title, working_directory, agent_id, created_at, updated_at
+         FROM sessions
+         WHERE agent_id = ?
+         ORDER BY updated_at DESC, created_at DESC, id ASC`
+      )
+      .all(agentId) as SessionRow[];
+    return rows.map((row) => rowToSession(row, this.defaultWorkingDirectory));
   }
 
   touchSession(id: string, updatedAt: string): void {
@@ -614,7 +652,7 @@ export class SQLiteStore implements StoreAdapter {
   listAgentDefinitions(): AgentDefinition[] {
     const rows = this.db
       .prepare(
-        `SELECT id, name, description, system_prompt, model_profile_id, default_run_options_json,
+        `SELECT id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
                 skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          FROM agent_definitions
          ORDER BY CASE id WHEN 'main' THEN 0 ELSE 1 END, name ASC, id ASC`
@@ -626,7 +664,7 @@ export class SQLiteStore implements StoreAdapter {
   getAgentDefinition(id: string): AgentDefinition | null {
     const row = this.db
       .prepare(
-        `SELECT id, name, description, system_prompt, model_profile_id, default_run_options_json,
+        `SELECT id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
                 skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          FROM agent_definitions
          WHERE id = ?`
@@ -635,53 +673,128 @@ export class SQLiteStore implements StoreAdapter {
     return row ? rowToAgentDefinition(row) : null;
   }
 
-  updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition | null {
-    const current = this.getAgentDefinition(input.id);
-    if (!current) {
-      return null;
-    }
-
-    const next: AgentDefinition = {
-      ...current,
-      name: input.name ?? current.name,
-      description: input.description !== undefined ? input.description : current.description,
-      systemPrompt: input.systemPrompt ?? current.systemPrompt,
-      modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
-      defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
-      skillIds: input.skillIds ?? current.skillIds,
-      toolIds: input.toolIds ?? current.toolIds,
-      metadata: input.metadata ?? current.metadata,
-      updatedAt: input.updatedAt
-    };
-
+  createAgentDefinition(input: CreateAgentDefinitionInput): AgentDefinition {
     this.db
       .prepare(
-        `UPDATE agent_definitions
-         SET name = @name,
-             description = @description,
-             system_prompt = @systemPrompt,
-             model_profile_id = @modelProfileId,
-             default_run_options_json = @defaultRunOptionsJson,
-             skill_ids_json = @skillIdsJson,
-             tool_ids_json = @toolIdsJson,
-             metadata_json = @metadataJson,
-             updated_at = @updatedAt
-         WHERE id = @id`
+        `INSERT INTO agent_definitions (
+           id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
+           skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
+         ) VALUES (
+           @id, 1, @name, @description, @systemPrompt, @modelProfileId, @defaultRunOptionsJson,
+           @skillIdsJson, @toolIdsJson, @metadataJson, @createdAt, @updatedAt
+         )`
       )
       .run({
-        id: next.id,
-        name: next.name,
-        description: next.description,
-        systemPrompt: next.systemPrompt,
-        modelProfileId: next.modelProfileId,
-        defaultRunOptionsJson: JSON.stringify(runOptionsToJsonObject(next.defaultRunOptions ?? {})),
-        skillIdsJson: JSON.stringify(next.skillIds),
-        toolIdsJson: JSON.stringify(next.toolIds),
-        metadataJson: JSON.stringify(next.metadata),
-        updatedAt: next.updatedAt
+        ...input,
+        defaultRunOptionsJson: JSON.stringify(runOptionsToJsonObject(input.defaultRunOptions ?? {})),
+        skillIdsJson: JSON.stringify(input.skillIds),
+        toolIdsJson: JSON.stringify(input.toolIds),
+        metadataJson: JSON.stringify(input.metadata ?? {})
       });
+    return this.getAgentDefinition(input.id)!;
+  }
 
-    return this.getAgentDefinition(input.id);
+  cloneAgentDefinition(input: CloneAgentDefinitionInput): CloneAgentDefinitionResult {
+    const clone = this.db.transaction((): CloneAgentDefinitionResult => {
+      const source = this.getAgentDefinition(input.sourceId);
+      if (!source) {
+        return { status: "not_found" };
+      }
+      if (source.revision !== input.expectedSourceRevision) {
+        return { status: "revision_conflict", agent: source };
+      }
+      const { sourceId: _sourceId, expectedSourceRevision: _expectedSourceRevision, ...createInput } = input;
+      return { status: "created", agent: this.createAgentDefinition(createInput) };
+    });
+    return clone.immediate();
+  }
+
+  updateAgentDefinition(input: UpdateAgentDefinitionInput): UpdateAgentDefinitionResult {
+    const update = this.db.transaction((): UpdateAgentDefinitionResult => {
+      const current = this.getAgentDefinition(input.id);
+      if (!current) {
+        return { status: "not_found" };
+      }
+      if (current.revision !== input.expectedRevision) {
+        return { status: "revision_conflict", agent: current };
+      }
+
+      const next: AgentDefinition = {
+        ...current,
+        name: input.name ?? current.name,
+        description: input.description !== undefined ? input.description : current.description,
+        systemPrompt: input.systemPrompt ?? current.systemPrompt,
+        modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
+        defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
+        skillIds: input.skillIds ?? current.skillIds,
+        toolIds: input.toolIds ?? current.toolIds,
+        metadata: input.metadata ?? current.metadata,
+        revision: current.revision + 1,
+        updatedAt: input.updatedAt
+      };
+      if (sameMutableAgentDefinition(current, next)) {
+        return { status: "unchanged", agent: current };
+      }
+
+      const result = this.db
+        .prepare(
+          `UPDATE agent_definitions
+           SET name = @name,
+               revision = @revision,
+               description = @description,
+               system_prompt = @systemPrompt,
+               model_profile_id = @modelProfileId,
+               default_run_options_json = @defaultRunOptionsJson,
+               skill_ids_json = @skillIdsJson,
+               tool_ids_json = @toolIdsJson,
+               metadata_json = @metadataJson,
+               updated_at = @updatedAt
+           WHERE id = @id AND revision = @expectedRevision`
+        )
+        .run({
+          id: next.id,
+          expectedRevision: input.expectedRevision,
+          revision: next.revision,
+          name: next.name,
+          description: next.description,
+          systemPrompt: next.systemPrompt,
+          modelProfileId: next.modelProfileId,
+          defaultRunOptionsJson: JSON.stringify(runOptionsToJsonObject(next.defaultRunOptions ?? {})),
+          skillIdsJson: JSON.stringify(next.skillIds),
+          toolIdsJson: JSON.stringify(next.toolIds),
+          metadataJson: JSON.stringify(next.metadata),
+          updatedAt: next.updatedAt
+        });
+      if (result.changes !== 1) {
+        const latest = this.getAgentDefinition(input.id);
+        return latest ? { status: "revision_conflict", agent: latest } : { status: "not_found" };
+      }
+      return { status: "updated", agent: this.getAgentDefinition(input.id)! };
+    });
+    return update.immediate();
+  }
+
+  deleteAgentDefinitionIfUnused(id: string, expectedRevision: number): DeleteAgentDefinitionResult {
+    const remove = this.db.transaction((): DeleteAgentDefinitionResult => {
+      const agent = this.getAgentDefinition(id);
+      if (!agent) {
+        return { status: "not_found" };
+      }
+      if (agent.revision !== expectedRevision) {
+        return { status: "revision_conflict", agent };
+      }
+      const sessions = this.listSessionsByAgentId(id);
+      if (sessions.length > 0) {
+        return { status: "in_use", agent, sessions };
+      }
+      const result = this.db.prepare("DELETE FROM agent_definitions WHERE id = ? AND revision = ?").run(id, expectedRevision);
+      if (result.changes !== 1) {
+        const latest = this.getAgentDefinition(id);
+        return latest ? { status: "revision_conflict", agent: latest } : { status: "not_found" };
+      }
+      return { status: "deleted" };
+    });
+    return remove.immediate();
   }
 
   createPermissionRequest(input: CreatePermissionRequestInput): StoredPermissionRequest {
@@ -853,6 +966,7 @@ export class SQLiteStore implements StoreAdapter {
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
         working_directory TEXT,
+        agent_id TEXT NOT NULL DEFAULT 'main',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -973,6 +1087,7 @@ export class SQLiteStore implements StoreAdapter {
 
       CREATE TABLE IF NOT EXISTS agent_definitions (
         id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL DEFAULT 1,
         name TEXT NOT NULL,
         description TEXT,
         system_prompt TEXT NOT NULL,
@@ -983,6 +1098,11 @@ export class SQLiteStore implements StoreAdapter {
         metadata_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
@@ -998,8 +1118,23 @@ export class SQLiteStore implements StoreAdapter {
       CREATE INDEX IF NOT EXISTS idx_agent_definitions_updated_at ON agent_definitions(updated_at);
     `);
     this.ensureSessionWorkingDirectoryColumn();
+    this.ensureSessionAgentIdColumn();
     this.ensureMessagePartStructuredColumns();
+    this.ensureAgentRevisionColumn();
     this.seedDefaultAgents();
+    this.migrateMainAgentExplicitToolAllowlist();
+    this.ensureAgentReferenceTriggers();
+  }
+
+  private ensureSessionAgentIdColumn(): void {
+    const columns = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!columns.has("agent_id")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'main'");
+    }
+    this.db
+      .prepare("UPDATE sessions SET agent_id = CASE WHEN agent_id IS NULL OR trim(agent_id) = '' THEN 'main' ELSE trim(agent_id) END")
+      .run();
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, updated_at)");
   }
 
   private ensureSessionWorkingDirectoryColumn(): void {
@@ -1027,16 +1162,26 @@ export class SQLiteStore implements StoreAdapter {
     }
   }
 
+  private ensureAgentRevisionColumn(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(agent_definitions)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!columns.has("revision")) {
+      this.db.exec("ALTER TABLE agent_definitions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+    }
+    this.db.prepare("UPDATE agent_definitions SET revision = 1 WHERE revision IS NULL OR revision < 1").run();
+  }
+
   private seedDefaultAgents(): void {
     const now = new Date().toISOString();
     const defaultMainAgentToolIdsJson = JSON.stringify(defaultMainAgentToolIds);
     this.db
       .prepare(
         `INSERT INTO agent_definitions (
-           id, name, description, system_prompt, model_profile_id, default_run_options_json,
+           id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
            skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          )
-          VALUES (@id, @name, @description, @systemPrompt, NULL, '{}', '[]', @toolIdsJson, @metadataJson, @createdAt, @updatedAt)
+          VALUES (@id, 1, @name, @description, @systemPrompt, NULL, '{}', '[]', @toolIdsJson, @metadataJson, @createdAt, @updatedAt)
           ON CONFLICT(id) DO NOTHING`
       )
       .run({
@@ -1049,20 +1194,75 @@ export class SQLiteStore implements StoreAdapter {
         createdAt: now,
         updatedAt: now
       });
-    this.ensureDefaultMainAgentTools(defaultMainAgentToolIdsJson, now);
   }
 
-  private ensureDefaultMainAgentTools(defaultToolIdsJson: string, updatedAt: string): void {
-    const row = this.db.prepare("SELECT tool_ids_json FROM agent_definitions WHERE id = ?").get("main") as
-      | Pick<AgentDefinitionRow, "tool_ids_json">
-      | undefined;
-    if (!row || parseStringArray(row.tool_ids_json).length > 0) {
-      return;
-    }
+  private migrateMainAgentExplicitToolAllowlist(): void {
+    const migrationName = "agent_main_explicit_tool_allowlist_v1";
+    const migrate = this.db.transaction(() => {
+      const applied = this.db.prepare("SELECT 1 FROM schema_migrations WHERE name = ?").get(migrationName);
+      if (applied) {
+        return;
+      }
+      const row = this.db.prepare("SELECT revision, tool_ids_json, metadata_json FROM agent_definitions WHERE id = ?").get("main") as
+        | Pick<AgentDefinitionRow, "revision" | "tool_ids_json" | "metadata_json">
+        | undefined;
+      const appliedAt = new Date().toISOString();
+      if (row) {
+        const metadata = parseJsonObject(row.metadata_json);
+        const legacyMetadataMarkerWasApplied = metadata.explicitToolAllowlistVersion === 1;
+        delete metadata.explicitToolAllowlistVersion;
+        this.db
+          .prepare("UPDATE agent_definitions SET tool_ids_json = ?, metadata_json = ? WHERE id = ?")
+          .run(
+            legacyMetadataMarkerWasApplied || row.revision > 1 || parseStringArray(row.tool_ids_json).length > 0
+              ? row.tool_ids_json
+              : JSON.stringify(defaultMainAgentToolIds),
+            JSON.stringify(metadata),
+            "main"
+          );
+      }
+      this.db.prepare("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(migrationName, appliedAt);
+    });
+    migrate.immediate();
+  }
 
+  private ensureAgentReferenceTriggers(): void {
     this.db
-      .prepare("UPDATE agent_definitions SET tool_ids_json = ?, updated_at = ? WHERE id = ?")
-      .run(defaultToolIdsJson, updatedAt, "main");
+      .prepare(
+        `UPDATE sessions
+         SET agent_id = 'main'
+         WHERE NOT EXISTS (SELECT 1 FROM agent_definitions WHERE agent_definitions.id = sessions.agent_id)`
+      )
+      .run();
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS sessions_agent_insert_guard
+      BEFORE INSERT ON sessions
+      WHEN NOT EXISTS (SELECT 1 FROM agent_definitions WHERE id = NEW.agent_id)
+      BEGIN
+        SELECT RAISE(ABORT, 'session_agent_not_found');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS sessions_agent_update_guard
+      BEFORE UPDATE OF agent_id ON sessions
+      WHEN NOT EXISTS (SELECT 1 FROM agent_definitions WHERE id = NEW.agent_id)
+      BEGIN
+        SELECT RAISE(ABORT, 'session_agent_not_found');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS agent_session_delete_guard
+      BEFORE DELETE ON agent_definitions
+      WHEN EXISTS (SELECT 1 FROM sessions WHERE agent_id = OLD.id)
+      BEGIN
+        SELECT RAISE(ABORT, 'agent_in_use');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS main_agent_delete_guard
+      BEFORE DELETE ON agent_definitions
+      WHEN OLD.id = 'main'
+      BEGIN
+        SELECT RAISE(ABORT, 'main_agent_protected');
+      END;
+    `);
   }
 
   private insertEvent(input: AppendEventInput): RunEvent {
@@ -1201,6 +1401,7 @@ function rowToSession(row: SessionRow, defaultWorkingDirectory: string): Session
     id: row.id,
     title: row.title,
     workingDirectory: normalizeStoredWorkingDirectory(row.working_directory, defaultWorkingDirectory),
+    agentId: row.agent_id || "main",
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -1294,6 +1495,7 @@ function rowToEvent(row: EventRow): RunEvent {
 function rowToAgentDefinition(row: AgentDefinitionRow): AgentDefinition {
   return {
     id: row.id,
+    revision: row.revision,
     name: row.name,
     description: row.description,
     systemPrompt: row.system_prompt,
@@ -1305,6 +1507,19 @@ function rowToAgentDefinition(row: AgentDefinitionRow): AgentDefinition {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function sameMutableAgentDefinition(left: AgentDefinition, right: AgentDefinition): boolean {
+  return (
+    left.name === right.name &&
+    left.description === right.description &&
+    left.systemPrompt === right.systemPrompt &&
+    left.modelProfileId === right.modelProfileId &&
+    isDeepStrictEqual(left.defaultRunOptions, right.defaultRunOptions) &&
+    isDeepStrictEqual(left.skillIds, right.skillIds) &&
+    isDeepStrictEqual(left.toolIds, right.toolIds) &&
+    isDeepStrictEqual(left.metadata, right.metadata)
+  );
 }
 
 function rowToPermissionRequest(row: PermissionRequestRow): StoredPermissionRequest {

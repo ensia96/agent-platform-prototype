@@ -96,6 +96,7 @@ export interface RunOptions {
 
 export interface AgentDefinition {
   id: string;
+  revision: number;
   name: string;
   description: string | null;
   systemPrompt: string;
@@ -284,6 +285,7 @@ export interface Session {
   id: string;
   title: string;
   workingDirectory: string;
+  agentId: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
@@ -291,10 +293,12 @@ export interface Session {
 export interface CreateSessionRequest {
   title?: string;
   workingDirectory?: string;
+  agentId?: string;
 }
 
 export interface UpdateSessionRequest {
-  workingDirectory: string;
+  workingDirectory?: string;
+  agentId?: string;
 }
 
 export interface MessagePart {
@@ -533,6 +537,22 @@ export type ShellExecOutput = JsonObject & {
 export interface AgentListResponse {
   agents: AgentDefinition[];
   defaultAgentId: string;
+}
+
+export interface CreateAgentDefinitionRequest {
+  name: string;
+  description?: string | null;
+  systemPrompt: string;
+  modelProfileId?: string | null;
+  defaultRunOptions?: RunOptions | null;
+  skillIds?: string[];
+  toolIds?: string[];
+  metadata?: JsonObject;
+}
+
+export interface AgentDefinitionUsage {
+  sessionCount: number;
+  sessions: Array<Pick<Session, "id" | "title">>;
 }
 
 export interface ToolListResponse {

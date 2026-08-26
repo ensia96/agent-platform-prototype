@@ -24,6 +24,8 @@ import {
   extractSettingsPatch,
   normalizeSettingsPatch,
   optionalString,
+  parseCreateAgentDefinition,
+  parseExpectedAgentRevision,
   parseAgentDefinitionPatch,
   parseCreateSessionRequest,
   parsePermissionStatus,
@@ -124,6 +126,7 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
   const { kernel, openAIChatGPTAuth, providers } = dependencies;
 
   app.get("/api/agents", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
     const response: AgentListResponse = {
       agents: kernel.listAgentDefinitions(),
       defaultAgentId
@@ -132,6 +135,7 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
   });
 
   app.get("/api/agents/:id", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       res.json(kernel.getAgentDefinition(req.params.id));
     } catch (error) {
@@ -140,12 +144,18 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
   });
 
   app.patch("/api/agents/:id", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       const patch = parseAgentDefinitionPatch(req.body);
+      if (patch.expectedRevision === undefined) {
+        throw new KernelError("Agent patch requires expectedRevision.", 400);
+      }
+      const { expectedRevision, ...fields } = patch;
       res.json(
         kernel.updateAgentDefinition({
           id: req.params.id,
-          ...patch,
+          expectedRevision,
+          ...fields,
           updatedAt: new Date().toISOString()
         })
       );
@@ -154,7 +164,36 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
     }
   });
 
+  app.post("/api/agents", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.status(201).json(kernel.createAgentDefinition(parseCreateAgentDefinition(req.body)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/agents/:id/clone", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.status(201).json(kernel.cloneAgentDefinition(req.params.id, parseExpectedAgentRevision(req.body)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.delete("/api/agents/:id", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      kernel.deleteAgentDefinition(req.params.id, parseExpectedAgentRevision(req.body));
+      res.status(204).end();
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.post("/api/context/preview", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       const body = requestBodyObject(req.body);
       const sessionId = optionalString(body.sessionId);
@@ -278,10 +317,12 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   });
 
   app.get("/api/sessions", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
     res.json(kernel.listSessions());
   });
 
   app.post("/api/sessions", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       res.status(201).json(kernel.createSession(parseCreateSessionRequest(requestBodyObject(req.body))));
     } catch (error) {
@@ -290,6 +331,7 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   });
 
   app.get("/api/sessions/:id", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       res.json(kernel.getSession(req.params.id));
     } catch (error) {
@@ -298,15 +340,17 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   });
 
   app.patch("/api/sessions/:id", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       const patch = parseSessionPatch(req.body);
-      res.json(kernel.updateSessionWorkingDirectory(req.params.id, patch.workingDirectory));
+      res.json(kernel.updateSession(req.params.id, patch));
     } catch (error) {
       next(error);
     }
   });
 
   app.post("/api/sessions/:id/context/preview", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
     try {
       res.json(buildContextPreview(kernel, req.params.id, requestBodyObject(req.body)));
     } catch (error) {

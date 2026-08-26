@@ -14,27 +14,53 @@ import type {
   ProviderProfile,
   ProviderTestResponse,
   RunOptions,
+  ToolDefinition,
+  ToolListResponse,
   ToolSettings,
   ToolSettingsResponse
 } from "../shared/types";
-import { requestJson, toErrorMessage } from "./api";
+import { ApiRequestError, requestJson, toErrorMessage } from "./api";
+import { catalogSelectionWarnings } from "./model-catalog";
 
 type LoadState = "idle" | "loading" | "error";
 type SettingsSection = "providers" | "agent" | "tools" | "system" | "advanced";
 
+export interface AgentProfileDraft {
+  name: string;
+  description: string;
+  systemPrompt: string;
+  modelProfileId: string;
+  model: string;
+  reasoningEffort: string;
+  temperature: string;
+  toolIds: string[];
+}
+
+export interface SettingsEditorState {
+  dirty: boolean;
+  busy: boolean;
+}
+
 const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
   { id: "providers", label: "Providers & Models", description: "Provider profiles, runtime status, authentication, and model defaults." },
-  { id: "agent", label: "Agent", description: "Main agent identity, system prompt, and model tool access." },
+  { id: "agent", label: "Agent Profiles", description: "Reusable agent defaults, prompts, providers, models, and model-tool access." },
   { id: "tools", label: "Tools & Permissions", description: "shell.exec policy, approval rules, timeout, and output limits." },
   { id: "system", label: "System", description: "Daemon health and persisted application settings." },
   { id: "advanced", label: "Advanced", description: "Adapter registry and future runtime integration points." }
 ];
 
-export function SettingsPanel() {
+export function SettingsPanel({
+  onAgentsChanged,
+  onEditorStateChange
+}: {
+  onAgentsChanged?: (agents: AgentDefinition[]) => void;
+  onEditorStateChange?: (state: SettingsEditorState) => void;
+}) {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [settingsData, setSettingsData] = useState<AppSettingsResponse | null>(null);
   const [providersData, setProvidersData] = useState<ProviderListResponse | null>(null);
   const [agentsData, setAgentsData] = useState<AgentListResponse | null>(null);
+  const [availableTools, setAvailableTools] = useState<ToolDefinition[]>([]);
   const [providerTests, setProviderTests] = useState<Record<string, ProviderTestResponse>>({});
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [providerModelCatalogs, setProviderModelCatalogs] = useState<Record<string, ProviderModelCatalog>>({});
@@ -50,44 +76,64 @@ export function SettingsPanel() {
   const [toolSettings, setToolSettings] = useState<ToolSettings>(defaultToolSettings);
   const [toolSettingsSaveState, setToolSettingsSaveState] = useState<LoadState>("idle");
   const [toolSettingsError, setToolSettingsError] = useState<string | null>(null);
-  const [mainAgentName, setMainAgentName] = useState("");
-  const [mainAgentSystemPrompt, setMainAgentSystemPrompt] = useState("");
+  const [selectedAgentId, setSelectedAgentId] = useState("main");
+  const [agentDraft, setAgentDraft] = useState<AgentProfileDraft>(emptyAgentDraft());
+  const [agentDraftBase, setAgentDraftBase] = useState<AgentDefinition | null>(null);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [saveState, setSaveState] = useState<LoadState>("idle");
   const [agentSaveState, setAgentSaveState] = useState<LoadState>("idle");
+  const [agentError, setAgentError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeSection, setActiveSection] = useState<SettingsSection>("providers");
+  const dashboardLoadRequestIdRef = useRef(0);
+  const agentMutationRequestIdRef = useRef(0);
+  const agentDraftDirtyRef = useRef(false);
 
   useEffect(() => {
     void loadDashboardSettings();
     return () => {
+      dashboardLoadRequestIdRef.current += 1;
+      agentMutationRequestIdRef.current += 1;
       for (const controller of providerModelCatalogAbortControllers.current.values()) {
         controller.abort();
       }
     };
   }, []);
 
-  async function loadDashboardSettings() {
+  async function loadDashboardSettings(options: { preserveAgentDraft?: boolean } = {}) {
+    const requestId = dashboardLoadRequestIdRef.current + 1;
+    dashboardLoadRequestIdRef.current = requestId;
     setLoadState("loading");
     setError(null);
     try {
-      const [nextStatus, nextSettings, nextToolSettings, nextProviders, nextAgents] = await Promise.all([
+      const [nextStatus, nextSettings, nextToolSettings, nextProviders, nextAgents, nextTools] = await Promise.all([
         requestJson<DaemonStatus>("/api/status"),
         requestJson<AppSettingsResponse>("/api/settings"),
         requestJson<ToolSettingsResponse>("/api/tool-settings"),
         requestJson<ProviderListResponse>("/api/providers"),
-        requestJson<AgentListResponse>("/api/agents")
+        requestJson<AgentListResponse>("/api/agents"),
+        requestJson<ToolListResponse>("/api/tools")
       ]);
+      if (requestId !== dashboardLoadRequestIdRef.current) {
+        return;
+      }
       setStatus(nextStatus);
       setSettingsData(nextSettings);
       setToolSettings(nextToolSettings.settings);
       setToolSettingsError(null);
       setProvidersData(nextProviders);
       setAgentsData(nextAgents);
+      setAvailableTools(nextTools.tools);
+      onAgentsChanged?.(nextAgents.agents);
       setInstanceLabel(settingValueAsString(nextSettings.settings.instanceLabel));
-      applyMainAgentDraft(nextAgents.agents.find((agent) => agent.id === nextAgents.defaultAgentId) ?? nextAgents.agents[0] ?? null);
+      if (!options.preserveAgentDraft) {
+        applyAgentDraft(nextAgents.agents.find((agent) => agent.id === nextAgents.defaultAgentId) ?? nextAgents.agents[0] ?? null);
+      }
       setLoadState("idle");
     } catch (requestError) {
+      if (requestId !== dashboardLoadRequestIdRef.current) {
+        return;
+      }
       setLoadState("error");
       setError(toErrorMessage(requestError));
     }
@@ -159,38 +205,188 @@ export function SettingsPanel() {
     }
   }
 
-  function applyMainAgentDraft(agent: AgentDefinition | null) {
-    setMainAgentName(agent?.name ?? "Mango");
-    setMainAgentSystemPrompt(agent?.systemPrompt ?? "");
+  function applyAgentDraft(agent: AgentDefinition | null) {
+    setSelectedAgentId(agent?.id ?? "");
+    setAgentDraftBase(agent);
+    setAgentDraft(agent ? agentDraftFromDefinition(agent) : emptyAgentDraft());
+    setAgentError(null);
+    setAgentSaveState("idle");
   }
 
-  async function saveMainAgent() {
+  function updateAgentDraft(patch: Partial<AgentProfileDraft>) {
+    setAgentDraft((current) => ({ ...current, ...patch }));
+    setAgentError(null);
+    setAgentSaveState((current) => (current === "loading" ? current : "idle"));
+  }
+
+  function publishAgents(agents: AgentDefinition[], selectedId: string) {
+    setAgentsData({ agents, defaultAgentId: "main" });
+    onAgentsChanged?.(agents);
+    applyAgentDraft(agents.find((agent) => agent.id === selectedId) ?? agents[0] ?? null);
+  }
+
+  function confirmDiscardAgentDraft(action: string): boolean {
+    if (!agentDraftDirty) {
+      return true;
+    }
+    return window.confirm(`Discard unsaved changes to '${agentDraftBase?.name ?? "this profile"}' and ${action}?`);
+  }
+
+  function selectAgentProfile(agent: AgentDefinition) {
+    if (!agentMutationBusy && confirmDiscardAgentDraft("switch profiles")) {
+      applyAgentDraft(agent);
+    }
+  }
+
+  function refreshDashboardSettings() {
+    if (!agentMutationBusy && confirmDiscardAgentDraft("refresh Settings")) {
+      void loadDashboardSettings();
+    }
+  }
+
+  function beginAgentMutation(): number | null {
+    if (agentMutationBusy) {
+      return null;
+    }
+    const requestId = agentMutationRequestIdRef.current + 1;
+    agentMutationRequestIdRef.current = requestId;
     setAgentSaveState("loading");
+    setAgentError(null);
+    return requestId;
+  }
+
+  function isCurrentAgentMutation(requestId: number): boolean {
+    return isCurrentAgentProfileMutation(requestId, agentMutationRequestIdRef.current);
+  }
+
+  async function createAgentProfile() {
+    if (!confirmDiscardAgentDraft("create a profile")) {
+      return;
+    }
+    const requestId = beginAgentMutation();
+    if (requestId === null) {
+      return;
+    }
+    try {
+      const existingNames = new Set((agentsData?.agents ?? []).map((agent) => agent.name.toLocaleLowerCase()));
+      let name = "New Agent";
+      for (let suffix = 2; existingNames.has(name.toLocaleLowerCase()); suffix += 1) {
+        name = `New Agent ${suffix}`;
+      }
+      const agent = await requestJson<AgentDefinition>("/api/agents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          systemPrompt: "You are a helpful local assistant.",
+          toolIds: [],
+          skillIds: []
+        })
+      });
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      publishAgents([...(agentsData?.agents ?? []), agent].sort(compareAgentProfiles), agent.id);
+    } catch (requestError) {
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      setAgentSaveState("error");
+      setAgentError(formatAgentProfileError(requestError));
+    }
+  }
+
+  async function cloneAgentProfile() {
+    if (!selectedAgentId || !agentDraftBase || !confirmDiscardAgentDraft("clone the saved profile")) {
+      return;
+    }
+    const requestId = beginAgentMutation();
+    if (requestId === null) {
+      return;
+    }
+    try {
+      const agent = await requestJson<AgentDefinition>(`/api/agents/${encodeURIComponent(selectedAgentId)}/clone`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedRevision: agentDraftBase.revision })
+      });
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      publishAgents([...(agentsData?.agents ?? []), agent].sort(compareAgentProfiles), agent.id);
+    } catch (requestError) {
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      setAgentSaveState("error");
+      setAgentError(formatAgentProfileError(requestError));
+    }
+  }
+
+  async function saveAgentProfile() {
+    if (!selectedAgentId || !agentDraftBase) {
+      return;
+    }
+    const requestId = beginAgentMutation();
+    if (requestId === null) {
+      return;
+    }
     setError(null);
     try {
-      const agent = await requestJson<AgentDefinition>("/api/agents/main", {
+      const agent = await requestJson<AgentDefinition>(`/api/agents/${encodeURIComponent(selectedAgentId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: mainAgentName.trim() || "Mango",
-          systemPrompt: mainAgentSystemPrompt
+          expectedRevision: agentDraftBase.revision,
+          name: agentDraft.name,
+          description: agentDraft.description || null,
+          systemPrompt: agentDraft.systemPrompt,
+          modelProfileId: agentDraft.modelProfileId || null,
+          defaultRunOptions: runOptionsFromAgentDraft(agentDraft),
+          toolIds: agentDraft.toolIds
         })
       });
-      setAgentsData((current) =>
-        current
-          ? {
-              ...current,
-              agents: current.agents.some((item) => item.id === agent.id)
-                ? current.agents.map((item) => (item.id === agent.id ? agent : item))
-                : [agent, ...current.agents]
-            }
-          : { agents: [agent], defaultAgentId: agent.id }
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      publishAgents(
+        (agentsData?.agents ?? []).map((item) => (item.id === agent.id ? agent : item)).sort(compareAgentProfiles),
+        agent.id
       );
-      applyMainAgentDraft(agent);
-      setAgentSaveState("idle");
     } catch (requestError) {
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
       setAgentSaveState("error");
-      setError(toErrorMessage(requestError));
+      setAgentError(formatAgentProfileError(requestError));
+    }
+  }
+
+  async function deleteAgentProfile() {
+    if (!selectedAgentId || selectedAgentId === "main" || !agentDraftBase || !confirmDiscardAgentDraft("delete this profile")) {
+      return;
+    }
+    const requestId = beginAgentMutation();
+    if (requestId === null) {
+      return;
+    }
+    try {
+      await requestJson<void>(`/api/agents/${encodeURIComponent(selectedAgentId)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedRevision: agentDraftBase.revision })
+      });
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      const agents = (agentsData?.agents ?? []).filter((agent) => agent.id !== selectedAgentId);
+      publishAgents(agents, "main");
+    } catch (requestError) {
+      if (!isCurrentAgentMutation(requestId)) {
+        return;
+      }
+      setAgentSaveState("error");
+      setAgentError(formatAgentProfileError(requestError));
     }
   }
 
@@ -284,7 +480,7 @@ export function SettingsPanel() {
       if (result.status === "connected") {
         clearProviderModelCatalog("openai-chatgpt");
         setChatGPTAuthStart(null);
-        await loadDashboardSettings();
+        await loadDashboardSettings({ preserveAgentDraft: agentDraftDirtyRef.current });
       }
     } catch (requestError) {
       setError(toErrorMessage(requestError));
@@ -301,7 +497,7 @@ export function SettingsPanel() {
       setChatGPTAuthStart(null);
       setChatGPTAuthPoll(null);
       clearProviderModelCatalog("openai-chatgpt");
-      await loadDashboardSettings();
+      await loadDashboardSettings({ preserveAgentDraft: agentDraftDirtyRef.current });
     } catch (requestError) {
       setError(toErrorMessage(requestError));
     } finally {
@@ -323,6 +519,30 @@ export function SettingsPanel() {
   }
 
   const activeSectionDefinition = settingsSections.find((section) => section.id === activeSection)!;
+  const agentMutationBusy = agentSaveState === "loading";
+  const agentDraftDirty = isAgentProfileDraftDirty(agentDraftBase, agentDraft);
+  agentDraftDirtyRef.current = agentDraftDirty;
+  const agentProviderProfileId = agentDraft.modelProfileId || providersData?.defaultProviderProfileId || "";
+  const agentProvider = providersData?.providers.find((provider) => provider.id === agentProviderProfileId) ?? null;
+  const agentCatalog = agentProviderProfileId ? providerModelCatalogs[agentProviderProfileId] ?? null : null;
+  const agentCatalogState = agentProviderProfileId ? providerModelCatalogStates[agentProviderProfileId] ?? "idle" : "idle";
+  const agentCatalogError = agentProviderProfileId ? providerModelCatalogErrors[agentProviderProfileId] ?? null : null;
+  const agentEffectiveModelId =
+    agentDraft.model || agentProvider?.defaultRunOptions?.model || agentProvider?.model || "";
+  const selectedAgentCatalogModel = agentCatalog?.models.find((model) => model.id === agentEffectiveModelId) ?? null;
+  const agentReasoningEfforts =
+    selectedAgentCatalogModel?.reasoning.support === "supported" ? selectedAgentCatalogModel.reasoning.efforts : [];
+  const agentTemperatureUnsupported = agentProvider?.runOptionSupport?.temperature === "unsupported";
+  const agentCatalogWarnings = catalogSelectionWarnings(
+    agentCatalog,
+    agentEffectiveModelId,
+    agentDraft.model,
+    agentDraft.reasoningEffort
+  );
+
+  useEffect(() => {
+    onEditorStateChange?.({ dirty: agentDraftDirty, busy: agentMutationBusy });
+  }, [agentDraftDirty, agentMutationBusy, onEditorStateChange]);
 
   return (
     <section className="settingsPane">
@@ -331,7 +551,7 @@ export function SettingsPanel() {
           <h2>Settings</h2>
           <p className="muted">Daemon status, provider profiles, and adapter registry foundation.</p>
         </div>
-        <button onClick={loadDashboardSettings} disabled={loadState === "loading"}>
+        <button onClick={refreshDashboardSettings} disabled={loadState === "loading" || agentMutationBusy}>
           Refresh
         </button>
       </header>
@@ -488,46 +708,204 @@ export function SettingsPanel() {
 
         {activeSection === "agent" && (
           <article className="settingsCard agentSettingsCard">
-          <div className="cardHeaderRow">
-            <h3>Main Agent</h3>
-            {agentsData && <span className="muted">default: {agentsData.defaultAgentId}</span>}
-          </div>
-          <p className="muted">
-            The main agent controls the system prompt and default model tool access injected by the provider-neutral Context Builder before each run.
-          </p>
-          <label className="settingEditor">
-            Agent name
-            <input value={mainAgentName} onChange={(event) => setMainAgentName(event.target.value)} placeholder="Mango" />
-          </label>
-          <label className="settingEditor">
-            System prompt
-            <textarea
-              className="agentPromptEditor"
-              value={mainAgentSystemPrompt}
-              onChange={(event) => setMainAgentSystemPrompt(event.target.value)}
-              rows={8}
-              placeholder="Define how the main agent should behave..."
-            />
-          </label>
-          <div className="providerActions">
-            <button onClick={() => void saveMainAgent()} disabled={agentSaveState === "loading" || !mainAgentSystemPrompt.trim()}>
-              {agentSaveState === "loading" ? "Saving..." : "Save main agent"}
-            </button>
-            <button
-              onClick={() => applyMainAgentDraft(agentsData?.agents.find((agent) => agent.id === "main") ?? null)}
-              disabled={agentSaveState === "loading"}
-            >
-              Reset draft
-            </button>
-          </div>
-          <dl className="providerDetails">
-            <dt>Agent ID</dt>
-            <dd>main</dd>
-            <dt>Skills</dt>
-            <dd>{agentsData?.agents.find((agent) => agent.id === "main")?.skillIds.length ?? 0} configured (future)</dd>
-            <dt>Tools</dt>
-            <dd>{agentToolIds(agentsData?.agents.find((agent) => agent.id === "main") ?? { id: "main", toolIds: [] }).join(", ") || "none"}</dd>
-          </dl>
+            <div className="cardHeaderRow">
+              <div>
+                <h3>Agent Profiles</h3>
+                <p className="muted">Profiles are bound to sessions; each run stores an immutable internal snapshot.</p>
+              </div>
+              <div className="providerActions">
+                <button type="button" onClick={() => void createAgentProfile()} disabled={agentMutationBusy}>Create</button>
+                <button type="button" onClick={() => void cloneAgentProfile()} disabled={!agentDraftBase || agentMutationBusy}>Clone</button>
+              </div>
+            </div>
+
+            <div className="agentProfileWorkspace">
+              <div className="registryList agentProfileList" aria-label="Agent profiles">
+                {agentsData?.agents.map((agent) => (
+                  <button
+                    type="button"
+                    key={agent.id}
+                    className={agent.id === selectedAgentId ? "registryItem active" : "registryItem"}
+                    aria-pressed={agent.id === selectedAgentId}
+                    onClick={() => selectAgentProfile(agent)}
+                    disabled={agentMutationBusy || loadState === "loading"}
+                  >
+                    <strong>{agent.name}</strong>
+                    <span className="muted">{agent.id === "main" ? "main · protected" : agent.id}</span>
+                  </button>
+                ))}
+              </div>
+
+              {agentDraftBase ? (
+                <fieldset className="agentProfileEditor" disabled={agentMutationBusy || loadState === "loading"}>
+                  <div className="inspectorFormRow">
+                    <label className="settingEditor">
+                      Name
+                      <input value={agentDraft.name} onChange={(event) => updateAgentDraft({ name: event.target.value })} maxLength={120} />
+                    </label>
+                    <label className="settingEditor">
+                      Description
+                      <input value={agentDraft.description} onChange={(event) => updateAgentDraft({ description: event.target.value })} maxLength={1000} />
+                    </label>
+                  </div>
+                  <label className="settingEditor">
+                    System prompt
+                    <textarea
+                      className="agentPromptEditor"
+                      value={agentDraft.systemPrompt}
+                      onChange={(event) => updateAgentDraft({ systemPrompt: event.target.value })}
+                      rows={8}
+                      maxLength={20_000}
+                    />
+                  </label>
+                  <label className="settingEditor">
+                    Provider profile
+                    <select
+                      value={agentDraft.modelProfileId}
+                      onChange={(event) => {
+                        const modelProfileId = event.target.value;
+                        const provider = providersData?.providers.find((item) => item.id === modelProfileId);
+                        updateAgentDraft({
+                          modelProfileId,
+                          model: "",
+                          reasoningEffort: "",
+                          ...(provider?.runOptionSupport?.temperature === "unsupported" ? { temperature: "" } : {})
+                        });
+                      }}
+                    >
+                      <option value="">application provider default</option>
+                      {agentDraft.modelProfileId && !agentProvider && (
+                        <option value={agentDraft.modelProfileId}>{agentDraft.modelProfileId} (saved, unavailable)</option>
+                      )}
+                      {providersData?.providers.map((provider) => (
+                        <option key={provider.id} value={provider.id}>{provider.name} ({provider.id})</option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <div className="settingEditor">
+                    <span>Default model</span>
+                    {agentCatalog && !agentCatalog.customModelAllowed ? (
+                      <select value={agentDraft.model} onChange={(event) => updateAgentDraft({ model: event.target.value, reasoningEffort: "" })}>
+                        <option value="">provider default</option>
+                        {agentDraft.model && !agentCatalog.models.some((model) => model.id === agentDraft.model) && (
+                          <option value={agentDraft.model}>{agentDraft.model} (saved, unavailable)</option>
+                        )}
+                        {agentCatalog.models.map((model) => <option key={model.id} value={model.id}>{model.displayName ?? model.id}</option>)}
+                      </select>
+                    ) : (
+                      <>
+                        <input
+                          value={agentDraft.model}
+                          onChange={(event) => updateAgentDraft({ model: event.target.value, reasoningEffort: "" })}
+                          placeholder={agentProvider?.model ?? "provider default or exact custom model ID"}
+                          list="agent-profile-model-catalog"
+                        />
+                        <datalist id="agent-profile-model-catalog">
+                          {agentCatalog?.models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}
+                        </datalist>
+                      </>
+                    )}
+                    <div className="providerActions">
+                      <button
+                        type="button"
+                        onClick={() => void loadProviderModels(agentProviderProfileId, false)}
+                        disabled={!agentProviderProfileId || agentCatalogState === "loading"}
+                      >
+                        {agentCatalogState === "loading" ? "Loading models..." : agentCatalog ? "Reload models" : "Load models"}
+                      </button>
+                    </div>
+                    {agentCatalogError && <span className="inlineError">{agentCatalogError}</span>}
+                    {agentCatalog?.warning && <span className="muted">{agentCatalog.warning}</span>}
+                    {agentCatalogWarnings.map((warning) => <span className="inlineWarning" key={warning}>{warning}</span>)}
+                  </div>
+
+                  <div className="inspectorFormRow">
+                    <label className="settingEditor">
+                      Default reasoning effort
+                      <select
+                        value={agentDraft.reasoningEffort}
+                        onChange={(event) => updateAgentDraft({ reasoningEffort: event.target.value })}
+                        disabled={agentReasoningEfforts.length === 0 && !agentDraft.reasoningEffort}
+                      >
+                        <option value="">provider default</option>
+                        {agentDraft.reasoningEffort && !agentReasoningEfforts.some((item) => item.value === agentDraft.reasoningEffort) && (
+                          <option value={agentDraft.reasoningEffort}>{agentDraft.reasoningEffort} (saved)</option>
+                        )}
+                        {agentReasoningEfforts.map((effort) => <option key={effort.value} value={effort.value}>{effort.value}</option>)}
+                      </select>
+                    </label>
+                    <label className="settingEditor">
+                      Default temperature
+                      <input
+                        type="number"
+                        min="0"
+                        max="2"
+                        step="0.1"
+                        value={agentDraft.temperature}
+                        onChange={(event) => updateAgentDraft({ temperature: event.target.value })}
+                        placeholder="provider default"
+                        disabled={agentTemperatureUnsupported && !agentDraft.temperature}
+                      />
+                      {agentTemperatureUnsupported && <span className="muted">Unsupported by this provider; existing values are metadata-only.</span>}
+                    </label>
+                  </div>
+
+                  <fieldset className="settingEditor agentToolAllowlist">
+                    <legend>Model tool allowlist</legend>
+                    {availableTools.map((tool) => (
+                      <label key={tool.id}>
+                        <input
+                          type="checkbox"
+                          checked={agentDraft.toolIds.includes(tool.id)}
+                          onChange={(event) =>
+                            updateAgentDraft({
+                              toolIds: event.target.checked
+                                ? [...agentDraft.toolIds, tool.id]
+                                : agentDraft.toolIds.filter((id) => id !== tool.id)
+                            })
+                          }
+                        />
+                        {tool.name} <span className="muted">({tool.id})</span>
+                      </label>
+                    ))}
+                    <p className="muted">This is a hard model-tool allowlist. Global Tool Settings still decide allow/ask/deny.</p>
+                  </fieldset>
+
+                  <p className="muted">
+                    Skill IDs are stored only as a future placeholder and are not loaded or executed in this MVP.
+                    {agentDraftBase.skillIds.length > 0 ? ` Stored: ${agentDraftBase.skillIds.join(", ")}` : ""}
+                  </p>
+                  <dl className="providerDetails">
+                    <dt>ID</dt><dd className="monospace">{agentDraftBase.id}</dd>
+                    <dt>Revision</dt><dd>{agentDraftBase.revision}</dd>
+                    <dt>Tools</dt><dd>{agentDraft.toolIds.join(", ") || "none"}</dd>
+                  </dl>
+                  {agentDraftDirty && <div className="inlineWarning">Unsaved Agent Profile changes.</div>}
+                  {agentError && <div className="inlineError">{agentError}</div>}
+                  <div className="providerActions">
+                    <button
+                      type="button"
+                      onClick={() => void saveAgentProfile()}
+                      disabled={agentMutationBusy || !agentDraftDirty || !agentDraft.name.trim() || !agentDraft.systemPrompt.trim()}
+                    >
+                      {agentSaveState === "loading" ? "Saving..." : "Save profile"}
+                    </button>
+                    <button type="button" onClick={() => applyAgentDraft(agentDraftBase)} disabled={agentMutationBusy || !agentDraftDirty}>Discard changes</button>
+                    <button
+                      type="button"
+                      className="dangerButton"
+                      onClick={() => void deleteAgentProfile()}
+                      disabled={agentDraftBase.id === "main" || agentMutationBusy}
+                    >
+                      {agentDraftBase.id === "main" ? "Main protected" : "Delete profile"}
+                    </button>
+                  </div>
+                </fieldset>
+              ) : (
+                <p className="muted">Create or select an agent profile.</p>
+              )}
+            </div>
           </article>
         )}
 
@@ -834,7 +1212,114 @@ function formatToolSettingsError(error: unknown): string {
 }
 
 export function agentToolIds(agent: Pick<AgentDefinition, "id" | "toolIds">): string[] {
-  return agent.toolIds.length > 0 ? agent.toolIds : agent.id === "main" ? ["shell.exec"] : [];
+  return [...agent.toolIds];
+}
+
+function emptyAgentDraft(): AgentProfileDraft {
+  return {
+    name: "",
+    description: "",
+    systemPrompt: "",
+    modelProfileId: "",
+    model: "",
+    reasoningEffort: "",
+    temperature: "",
+    toolIds: []
+  };
+}
+
+function agentDraftFromDefinition(agent: AgentDefinition): AgentProfileDraft {
+  return {
+    name: agent.name,
+    description: agent.description ?? "",
+    systemPrompt: agent.systemPrompt,
+    modelProfileId: agent.modelProfileId ?? "",
+    model: agent.defaultRunOptions?.model ?? "",
+    reasoningEffort: agent.defaultRunOptions?.reasoningEffort ?? "",
+    temperature: agent.defaultRunOptions?.temperature === undefined ? "" : String(agent.defaultRunOptions.temperature),
+    toolIds: [...agent.toolIds]
+  };
+}
+
+export function isAgentProfileDraftDirty(agent: AgentDefinition | null, draft: AgentProfileDraft): boolean {
+  if (!agent) {
+    return false;
+  }
+  const loaded = agentDraftFromDefinition(agent);
+  return (
+    draft.name !== loaded.name ||
+    draft.description !== loaded.description ||
+    draft.systemPrompt !== loaded.systemPrompt ||
+    draft.modelProfileId !== loaded.modelProfileId ||
+    draft.model !== loaded.model ||
+    draft.reasoningEffort !== loaded.reasoningEffort ||
+    draft.temperature !== loaded.temperature ||
+    draft.toolIds.length !== loaded.toolIds.length ||
+    draft.toolIds.some((toolId, index) => toolId !== loaded.toolIds[index])
+  );
+}
+
+export function isCurrentAgentProfileMutation(requestId: number, currentRequestId: number): boolean {
+  return requestId === currentRequestId;
+}
+
+function runOptionsFromAgentDraft(draft: AgentProfileDraft): RunOptions | null {
+  const options: RunOptions = {};
+  if (draft.model.trim()) {
+    options.model = draft.model.trim();
+  }
+  if (draft.reasoningEffort.trim()) {
+    options.reasoningEffort = draft.reasoningEffort.trim();
+  }
+  if (draft.temperature.trim()) {
+    options.temperature = Number(draft.temperature);
+  }
+  return Object.keys(options).length > 0 ? options : null;
+}
+
+function compareAgentProfiles(left: AgentDefinition, right: AgentDefinition): number {
+  if (left.id === "main") {
+    return -1;
+  }
+  if (right.id === "main") {
+    return 1;
+  }
+  return left.name.localeCompare(right.name) || left.id.localeCompare(right.id);
+}
+
+function formatAgentProfileError(error: unknown): string {
+  if (!(error instanceof ApiRequestError)) {
+    return toErrorMessage(error);
+  }
+  if (error.code === "agent_revision_conflict") {
+    const latest = error.body?.latest;
+    const revision =
+      latest && typeof latest === "object" && !Array.isArray(latest)
+        ? (latest as Record<string, unknown>).revision
+        : null;
+    return `${error.message}${typeof revision === "number" ? ` Latest revision: ${revision}.` : ""} Your draft was preserved; review and retry from refreshed data.`;
+  }
+  if (error.code !== "agent_in_use") {
+    return error.message;
+  }
+  const usage = error.body?.usage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    return error.message;
+  }
+  const sessions = (usage as Record<string, unknown>).sessions;
+  if (!Array.isArray(sessions)) {
+    return error.message;
+  }
+  const labels = sessions.flatMap((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return [];
+    }
+    const session = value as Record<string, unknown>;
+    const id = typeof session.id === "string" ? session.id : "";
+    const title = typeof session.title === "string" ? session.title : "";
+    return id ? [`${title || "Untitled session"} (${id})`] : [];
+  });
+  return labels.length > 0 ? `${error.message} Sessions: ${labels.join(", ")}` : error.message;
 }
 
 export function formatRunOptions(options: RunOptions | null | undefined): string {

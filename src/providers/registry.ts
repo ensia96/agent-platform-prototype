@@ -49,6 +49,16 @@ export interface ResolvedProviderRun {
   providerResolution: ProviderResolution;
 }
 
+export class ExactProviderResolutionError extends Error {
+  constructor(
+    readonly code: "provider_not_found" | "provider_disabled" | "provider_credential_unavailable" | "provider_adapter_unavailable",
+    message: string
+  ) {
+    super(message);
+    this.name = "ExactProviderResolutionError";
+  }
+}
+
 interface ModelCatalogCacheEntry {
   catalog: ProviderModelCatalog;
   expiresAt: number;
@@ -241,6 +251,57 @@ export class ProviderRegistry {
         baseUrl: profile.baseUrl,
         credentialRef: profile.credentialRef,
         fallback
+      }
+    };
+  }
+
+  resolveRunExact(providerProfileId: string): ResolvedProviderRun {
+    const normalizedId = this.normalizeProfileId(providerProfileId);
+    const profile = normalizedId ? this.profiles.get(normalizedId) ?? null : null;
+    if (!profile) {
+      throw new ExactProviderResolutionError(
+        "provider_not_found",
+        `Saved provider profile '${providerProfileId}' is no longer available; this run was not switched to a fallback provider.`
+      );
+    }
+    if (!profile.enabled) {
+      throw new ExactProviderResolutionError(
+        "provider_disabled",
+        `Saved provider profile '${profile.name}' is disabled; this run was not switched to a fallback provider.`
+      );
+    }
+    const credential = this.resolveCredential(profile);
+    if (
+      (profile.type === "openai-compatible" && profile.authMode !== "none" && !credential.apiKey) ||
+      (profile.type === "openai-chatgpt" && profile.authMode !== "none" && !credential.oauth)
+    ) {
+      throw new ExactProviderResolutionError(
+        "provider_credential_unavailable",
+        `Credentials for saved provider profile '${profile.name}' are unavailable; this run was not switched to a fallback provider.`
+      );
+    }
+    const adapter = this.adapters.get(profile.type);
+    if (!adapter) {
+      throw new ExactProviderResolutionError(
+        "provider_adapter_unavailable",
+        `The adapter for saved provider profile '${profile.name}' is unavailable; this run was not switched to a fallback provider.`
+      );
+    }
+    const currentProfile = this.profileWithRuntimeStatus(profile);
+    return {
+      adapter,
+      profile: cloneProfile(currentProfile),
+      credential,
+      providerResolution: {
+        requestedProvider: null,
+        requestedProviderProfileId: profile.id,
+        providerProfileId: profile.id,
+        providerProfileName: profile.name,
+        providerType: profile.type,
+        model: profile.model,
+        baseUrl: profile.baseUrl,
+        credentialRef: profile.credentialRef,
+        fallback: null
       }
     };
   }

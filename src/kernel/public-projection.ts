@@ -94,6 +94,7 @@ function eventPayload(type: RunEventType, value: unknown): JsonObject {
       providerResolution: resolution,
       agentId: payload.agentId,
       agentName: payload.agentName,
+      agentRevision: payload.agentRevision,
       requestedRunOptions: payload.requestedRunOptions,
       runOptions: payload.runOptions,
       unsupportedRunOptions: payload.unsupportedRunOptions,

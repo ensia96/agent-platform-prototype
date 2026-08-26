@@ -15,7 +15,13 @@ import type {
   ToolDefinition
 } from "../shared/types";
 import { formatUsage } from "./MessageBody";
-import { advertisedReasoningEfforts, effectiveRunModelId, type ModelCatalogLoadState } from "./model-catalog";
+import {
+  advertisedReasoningEfforts,
+  catalogSelectionWarnings,
+  effectiveRunModelId,
+  profileDefaultsApplyToProvider,
+  type ModelCatalogLoadState
+} from "./model-catalog";
 import { agentToolIds, formatRunOptions } from "./SettingsPanel";
 import { PendingPermissionsPanel, ShellToolPanel, type ShellToolState } from "./ToolPanels";
 import type { RunConnectionState, RunStatusTone, RunTerminalNotice } from "./run-recovery";
@@ -30,8 +36,12 @@ export interface RunInspectorProps {
   setup: {
     agents: AgentDefinition[];
     agentId: string;
+    agentSaveState: SaveState;
+    agentError: string | null;
     providers: ProviderProfile[];
     providerProfileId: string;
+    effectiveProviderProfileId: string;
+    defaultProviderProfileId: string;
     modelOverride: string;
     reasoningEffort: ReasoningEffort | "";
     temperature: string;
@@ -100,12 +110,38 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
   const inspectorRef = useRef<HTMLElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const selectedAgent = setup.agents.find((agent) => agent.id === setup.agentId) ?? null;
-  const selectedProvider = setup.providers.find((provider) => provider.id === setup.providerProfileId) ?? null;
-  const defaultModelId = effectiveRunModelId(selectedProvider, selectedAgent, "");
-  const effectiveModelId = effectiveRunModelId(selectedProvider, selectedAgent, setup.modelOverride);
-  const reasoningEfforts = advertisedReasoningEfforts(setup.modelCatalog, selectedProvider, selectedAgent, setup.modelOverride);
+  const selectedProvider = setup.providers.find((provider) => provider.id === setup.effectiveProviderProfileId) ?? null;
+  const profileDefaultsApply = profileDefaultsApplyToProvider(
+    selectedAgent,
+    setup.effectiveProviderProfileId,
+    setup.defaultProviderProfileId,
+    Boolean(setup.providerProfileId)
+  );
+  const effectiveDefaultsAgent = profileDefaultsApply ? selectedAgent : null;
+  const defaultModelId = effectiveRunModelId(selectedProvider, effectiveDefaultsAgent, "");
+  const effectiveModelId = effectiveRunModelId(selectedProvider, effectiveDefaultsAgent, setup.modelOverride);
+  const reasoningEfforts = advertisedReasoningEfforts(
+    setup.modelCatalog,
+    selectedProvider,
+    effectiveDefaultsAgent,
+    setup.modelOverride
+  );
   const selectedCatalogModel = setup.modelCatalog?.models.find((model) => model.id === effectiveModelId) ?? null;
   const catalogHasFixedChoices = setup.modelCatalog !== null && !setup.modelCatalog.customModelAllowed;
+  const defaultReasoningEffort =
+    effectiveDefaultsAgent?.defaultRunOptions?.reasoningEffort ??
+    selectedProvider?.defaultRunOptions?.reasoningEffort ??
+    selectedCatalogModel?.reasoning.defaultEffort;
+  const defaultTemperature =
+    effectiveDefaultsAgent?.defaultRunOptions?.temperature ?? selectedProvider?.defaultRunOptions?.temperature;
+  const profileCatalogWarnings = profileDefaultsApply
+    ? catalogSelectionWarnings(
+        setup.modelCatalog,
+        effectiveRunModelId(selectedProvider, selectedAgent, ""),
+        selectedAgent?.defaultRunOptions?.model ?? "",
+        selectedAgent?.defaultRunOptions?.reasoningEffort ?? ""
+      )
+    : [];
 
   useEffect(() => {
     if (!modal) {
@@ -186,8 +222,12 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
           <summary>Run setup</summary>
           <div className="inspectorSectionBody inspectorFormGrid">
             <label>
-              Agent
-              <select value={setup.agentId || "main"} onChange={(event) => setup.onAgentChange(event.target.value)} disabled={setup.disabled}>
+              Session agent
+              <select
+                value={setup.agentId || "main"}
+                onChange={(event) => setup.onAgentChange(event.target.value)}
+                disabled={setup.disabled || setup.agentSaveState === "saving"}
+              >
                 {setup.agents.length > 0 ? (
                   setup.agents.map((agent) => (
                     <option key={agent.id} value={agent.id}>
@@ -204,22 +244,31 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                 {selectedAgent.systemPrompt.slice(0, 90)}{selectedAgent.systemPrompt.length > 90 ? "…" : ""}
                 <br />
                 Tools: {agentToolIds(selectedAgent).join(", ") || "none"}
+                <br />
+                Defaults: {formatRunOptions(selectedAgent.defaultRunOptions) || "provider defaults"}
+                <br />
+                Bound to this session. Changes affect future runs only.
               </p>
             )}
+            {setup.agentError && <div className="inlineError">{setup.agentError}</div>}
+            {setup.agentSaveState === "saved" && !setup.agentError && <div className="inlineSuccess">Session agent saved.</div>}
 
             <label>
               Provider
               <select
-                value={setup.providerProfileId || "mock"}
+                value={setup.providerProfileId}
                 onChange={(event) => setup.onProviderChange(event.target.value)}
                 disabled={setup.disabled}
               >
                 {setup.providers.length > 0 ? (
-                  setup.providers.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {providerOptionLabel(profile)}
-                    </option>
-                  ))
+                  <>
+                    <option value="">profile/provider default ({selectedProvider?.name ?? setup.effectiveProviderProfileId})</option>
+                    {setup.providers.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {providerOptionLabel(profile)}
+                      </option>
+                    ))}
+                  </>
                 ) : (
                   <>
                     <option value="mock">mock</option>
@@ -232,6 +281,11 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
               <p className="inspectorHint">
                 {selectedProvider.type} · default {selectedProvider.model ?? "provider model"} · {selectedProvider.status.state}
               </p>
+            )}
+            {!profileDefaultsApply && (
+              <div className="inlineWarning">
+                Per-run provider differs from the Agent Profile provider; profile model, reasoning, and temperature defaults are not inherited.
+              </div>
             )}
 
             <label>
@@ -270,11 +324,12 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                 type="button"
                 className="textButton"
                 onClick={setup.onRefreshModelCatalog}
-                disabled={setup.disabled || !setup.providerProfileId || setup.modelCatalogState === "loading"}
+                disabled={setup.disabled || !setup.effectiveProviderProfileId || setup.modelCatalogState === "loading"}
               >
                 Refresh models
               </button>
               {setup.modelCatalog?.warning && <span>{setup.modelCatalog.warning}</span>}
+              {profileCatalogWarnings.map((warning) => <span className="inlineWarning" key={warning}>{warning}</span>)}
             </div>
             <div className="inspectorFormRow">
               <label>
@@ -285,9 +340,7 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                   disabled={setup.disabled || reasoningEfforts.length === 0}
                 >
                   <option value="">
-                    {selectedCatalogModel?.reasoning.defaultEffort
-                      ? `provider/default (${selectedCatalogModel.reasoning.defaultEffort})`
-                      : "provider/default"}
+                    {defaultReasoningEffort ? `profile/provider default (${defaultReasoningEffort})` : "profile/provider default"}
                   </option>
                   {reasoningEfforts.map((option) => (
                     <option key={option.value} value={option.value}>{option.value}</option>
@@ -303,7 +356,7 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                   step="0.1"
                   value={setup.temperature}
                   onChange={(event) => setup.onTemperatureChange(event.target.value)}
-                  placeholder="default"
+                  placeholder={defaultTemperature === undefined ? "provider default" : `profile default (${defaultTemperature})`}
                   disabled={setup.disabled}
                 />
               </label>

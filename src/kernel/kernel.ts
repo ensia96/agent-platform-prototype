@@ -6,13 +6,16 @@ import { buildContext, defaultAgentId } from "./context-builder";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import {
   booleanField,
+  agentFromRunMetadata,
   buildContextRunMetadata,
   buildRunMetadata,
   buildRunOptionPlan,
   effectiveAgentToolIds,
+  executionSnapshotFromRunMetadata,
   mergeRunOptions,
   numberField,
   partString,
+  runOptionsFromJson,
   stringField,
   toProviderMessages
 } from "./kernel-metadata";
@@ -43,9 +46,16 @@ import {
 } from "./tool-execution";
 import type { ProviderAdapter, ProviderRunInput, ProviderToolCall } from "../providers/types";
 import type { ProviderRegistry } from "../providers/registry";
-import type { CreateRunInput, StoreAdapter, StoredPermissionRequest, UpdateAgentDefinitionInput } from "../store/types";
+import type {
+  CreateAgentDefinitionInput,
+  CreateRunInput,
+  StoreAdapter,
+  StoredPermissionRequest,
+  UpdateAgentDefinitionInput
+} from "../store/types";
 import { ActiveRunExistsStoreError } from "../store/types";
 import { providerToolNameToToolId, toModelToolDefinition } from "../shared/model-tools";
+import { hasControlCharacters, maxReasoningEffortLength, normalizeReasoningEffort } from "../shared/run-options";
 import { normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
 import { evaluateToolPermission, type ToolPermissionEvaluation } from "../tools/permission-policy";
 import type { ToolRegistry } from "../tools/registry";
@@ -98,6 +108,23 @@ export interface InvokeToolOptions {
 export interface CreateSessionOptions {
   title?: string;
   workingDirectory?: string;
+  agentId?: string;
+}
+
+export interface CreateAgentDefinitionOptions {
+  name: string;
+  description?: string | null;
+  systemPrompt: string;
+  modelProfileId?: string | null;
+  defaultRunOptions?: RunOptions | null;
+  skillIds?: string[];
+  toolIds?: string[];
+  metadata?: JsonObject;
+}
+
+export interface UpdateSessionOptions {
+  workingDirectory?: string;
+  agentId?: string;
 }
 
 interface PreparedToolInvocation {
@@ -185,11 +212,14 @@ export class Kernel {
 
   createSession(options: CreateSessionOptions | string = {}): Session {
     const input = typeof options === "string" ? { title: options } : options;
+    const agentId = input.agentId?.trim() || defaultAgentId;
+    this.getAgentDefinition(agentId);
     const now = new Date().toISOString();
     return this.store.createSession({
       id: randomUUID(),
       title: input.title?.trim() || "New session",
       workingDirectory: this.normalizeWorkingDirectory(input.workingDirectory, { allowDefault: true }),
+      agentId,
       createdAt: now,
       updatedAt: now
     });
@@ -204,9 +234,30 @@ export class Kernel {
   }
 
   updateSessionWorkingDirectory(id: string, workingDirectory: string): Session {
+    return this.updateSession(id, { workingDirectory });
+  }
+
+  updateSession(id: string, patch: UpdateSessionOptions): Session {
     this.getSession(id);
-    const now = new Date().toISOString();
-    const updated = this.store.updateSessionWorkingDirectory(id, this.normalizeWorkingDirectory(workingDirectory, { allowDefault: false }), now);
+    const workingDirectory =
+      patch.workingDirectory === undefined
+        ? undefined
+        : this.normalizeWorkingDirectory(patch.workingDirectory, { allowDefault: false });
+    const agentId = patch.agentId?.trim();
+    if (patch.agentId !== undefined) {
+      if (!agentId) {
+        throw new KernelError("Session agentId must be a non-empty string.", 400);
+      }
+      this.getAgentDefinition(agentId);
+    }
+    const updated = this.store.updateSession(
+      id,
+      {
+        ...(workingDirectory ? { workingDirectory } : {}),
+        ...(agentId ? { agentId } : {}),
+        updatedAt: new Date().toISOString()
+      }
+    );
     if (!updated) {
       throw new KernelError("Session not found", 404);
     }
@@ -276,21 +327,132 @@ export class Kernel {
   }
 
   updateAgentDefinition(input: UpdateAgentDefinitionInput): AgentDefinition {
-    const agent = this.store.updateAgentDefinition(input);
-    if (!agent) {
+    const current = this.getAgentDefinition(input.id);
+    if (current.revision !== input.expectedRevision) {
+      throw this.agentRevisionConflict(current);
+    }
+    const candidate = this.normalizeAgentDefinition({
+      name: input.name ?? current.name,
+      description: input.description !== undefined ? input.description : current.description,
+      systemPrompt: input.systemPrompt ?? current.systemPrompt,
+      modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
+      defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
+      skillIds: input.skillIds ?? current.skillIds,
+      toolIds: input.toolIds ?? current.toolIds
+    }, current.id);
+    const result = this.store.updateAgentDefinition({ ...input, ...candidate });
+    if (result.status === "not_found") {
       throw new KernelError("Agent definition not found", 404);
     }
-    return agent;
+    if (result.status === "revision_conflict") {
+      throw this.agentRevisionConflict(result.agent);
+    }
+    return result.agent;
+  }
+
+  createAgentDefinition(input: CreateAgentDefinitionOptions): AgentDefinition {
+    const candidate = this.normalizeAgentDefinition(input);
+    const now = new Date().toISOString();
+    const createInput: CreateAgentDefinitionInput = {
+      id: randomUUID(),
+      ...candidate,
+      metadata: input.metadata ?? {},
+      createdAt: now,
+      updatedAt: now
+    };
+    return this.store.createAgentDefinition(createInput);
+  }
+
+  cloneAgentDefinition(id: string, expectedRevision: number): AgentDefinition {
+    const source = this.getAgentDefinition(id);
+    if (source.revision !== expectedRevision) {
+      throw this.agentRevisionConflict(source);
+    }
+    const candidate = this.normalizeAgentDefinition({
+      name: this.nextAgentCopyName(source.name),
+      description: source.description,
+      systemPrompt: source.systemPrompt,
+      modelProfileId: source.modelProfileId,
+      defaultRunOptions: source.defaultRunOptions,
+      skillIds: source.skillIds,
+      toolIds: source.toolIds,
+      metadata: source.id === defaultAgentId ? {} : source.metadata
+    });
+    const now = new Date().toISOString();
+    const result = this.store.cloneAgentDefinition({
+      sourceId: source.id,
+      expectedSourceRevision: expectedRevision,
+      id: randomUUID(),
+      ...candidate,
+      metadata: source.id === defaultAgentId ? {} : source.metadata,
+      createdAt: now,
+      updatedAt: now
+    });
+    if (result.status === "not_found") {
+      throw new KernelError("Agent definition not found", 404);
+    }
+    if (result.status === "revision_conflict") {
+      throw this.agentRevisionConflict(result.agent);
+    }
+    return result.agent;
+  }
+
+  deleteAgentDefinition(id: string, expectedRevision: number): void {
+    const agent = this.getAgentDefinition(id);
+    if (agent.id === defaultAgentId) {
+      throw new KernelError("The main agent profile cannot be deleted.", 409, "main_agent_protected");
+    }
+    if (agent.revision !== expectedRevision) {
+      throw this.agentRevisionConflict(agent);
+    }
+    const result = this.store.deleteAgentDefinitionIfUnused(agent.id, expectedRevision);
+    if (result.status === "revision_conflict") {
+      throw this.agentRevisionConflict(result.agent);
+    }
+    if (result.status === "in_use") {
+      const sessions = result.sessions;
+      throw new KernelError(
+        `Agent profile '${result.agent.name}' is used by ${sessions.length} session${sessions.length === 1 ? "" : "s"}.`,
+        409,
+        "agent_in_use",
+        {
+          usage: {
+            sessionCount: sessions.length,
+            sessions: sessions.slice(0, 20).map((session) => ({ id: session.id, title: session.title }))
+          }
+        }
+      );
+    }
+    if (result.status === "not_found") {
+      throw new KernelError("Agent definition not found", 404);
+    }
+  }
+
+  private agentRevisionConflict(latest: AgentDefinition): KernelError {
+    return new KernelError(
+      `Agent profile '${latest.name}' changed since this draft was loaded.`,
+      409,
+      "agent_revision_conflict",
+      {
+        latest: {
+          id: latest.id,
+          name: latest.name,
+          revision: latest.revision,
+          updatedAt: latest.updatedAt
+        }
+      }
+    );
   }
 
   previewContext(sessionId: string, options: PreviewContextOptions = {}): ContextPreviewResponse {
     const session = this.getSession(sessionId);
-    const agent = this.getAgentDefinition(options.agentId ?? defaultAgentId);
+    const agent = this.resolveAgentForSession(session, options.agentId);
     const resolvedProvider = this.providers.resolveRun({
       provider: options.provider,
       providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
     });
-    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, mergeRunOptions(agent.defaultRunOptions, options.runOptions));
+    const agentDefaults = this.agentDefaultsForProvider(agent, resolvedProvider.profile.id, options);
+    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, mergeRunOptions(agentDefaults, options.runOptions));
     const providerResolution: ProviderResolution = {
       ...resolvedProvider.providerResolution,
       model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
@@ -304,6 +466,11 @@ export class Kernel {
       runOptions: optionPlan.runOptions,
       availableTools: this.getAvailableToolsForAgent(agent)
     });
+    if (agent.defaultRunOptions && !agentDefaults) {
+      contextResult.warnings.push(
+        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile."
+      );
+    }
 
     return {
       ...contextResult,
@@ -391,19 +558,20 @@ export class Kernel {
       throw new KernelError("Run text is required", 400);
     }
 
-    const agent = this.getAgentDefinition(options.agentId ?? defaultAgentId);
-    const requestedRunOptions = mergeRunOptions(agent.defaultRunOptions, options.runOptions);
+    const agent = this.resolveAgentForSession(session, options.agentId);
     const resolvedProvider = this.providers.resolveRun({
       provider: options.provider,
       providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
     });
+    const agentDefaults = this.agentDefaultsForProvider(agent, resolvedProvider.profile.id, options);
+    const requestedRunOptions = mergeRunOptions(agentDefaults, options.runOptions);
     const optionPlan = buildRunOptionPlan(resolvedProvider.profile, requestedRunOptions);
     const providerResolution: ProviderResolution = {
       ...resolvedProvider.providerResolution,
       model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
     };
-    const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {});
     const now = new Date().toISOString();
+    const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {}, now);
     const run = this.createRun({
       id: randomUUID(),
       sessionId,
@@ -455,6 +623,11 @@ export class Kernel {
       availableTools: this.getAvailableToolsForAgent(agent),
       metadata: { runId: run.id }
     });
+    if (agent.defaultRunOptions && !agentDefaults) {
+      contextResult.warnings.push(
+        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile."
+      );
+    }
     const contextMetadata = buildContextRunMetadata(contextResult.context, contextResult.warnings, contextResult.skippedMessageIds);
     this.store.mergeRunMetadata(run.id, contextMetadata, now);
     this.store.mergeMessageMetadata(assistantMessage.id, contextMetadata, now);
@@ -473,6 +646,7 @@ export class Kernel {
       providerResolution: toPublicProviderResolution(providerResolution),
       agentId: agent.id,
       agentName: agent.name,
+      agentRevision: agent.revision,
       requestedRunOptions: optionPlan.requestedRunOptions,
       runOptions: optionPlan.runOptions,
       unsupportedRunOptions: optionPlan.unsupportedRunOptions,
@@ -1787,6 +1961,42 @@ export class Kernel {
       return null;
     }
 
+    const agent = this.getAgentForRun(run);
+    if (!effectiveAgentToolIds(agent).includes(registeredTool.definition.id)) {
+      const denial = `Agent profile '${agent.name}' does not allow tool '${registeredTool.definition.id}'.`;
+      const toolCallPart = writer.recordToolCall({
+        callId,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name,
+        provider: toolProviderForPart(registeredTool.definition.id),
+        inputSummary: denial,
+        metadata: {
+          caller: "model",
+          providerToolCallName: providerToolName,
+          toolLoopIteration: iteration,
+          profileToolDenied: true,
+          agentId: agent.id,
+          agentRevision: agent.revision
+        }
+      });
+      writer.recordToolResult({
+        callId,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name,
+        status: "failed",
+        error: denial,
+        outputSummary: denial,
+        metadata: {
+          toolCallPartId: toolCallPart.id,
+          toolLoopIteration: iteration,
+          profileToolDenied: true,
+          agentId: agent.id,
+          agentRevision: agent.revision
+        }
+      });
+      return null;
+    }
+
     if (stringField(toolCall.metadata ?? {}, "argumentsParseError")) {
       const parseError = stringField(toolCall.metadata ?? {}, "argumentsParseError");
       const toolCallPart = writer.recordToolCall({
@@ -2080,18 +2290,25 @@ export class Kernel {
 
   private buildProviderInputForExistingRun(run: Run): { provider: ProviderAdapter; input: ProviderRunInput } {
     const session = this.getSession(run.sessionId);
-    const agent = this.getAgentDefinition(stringField(run.metadata, "agentId") || defaultAgentId);
-    const providerProfileId = stringField(run.metadata, "providerProfileId") || run.provider;
-    const resolvedProvider = this.providers.resolveRun({ providerProfileId });
-    const requestedRunOptions = run.runOptions ?? {};
-    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, requestedRunOptions);
+    const agent = this.getAgentForRun(run);
+    const executionSnapshot = executionSnapshotFromRunMetadata(run.metadata);
+    const providerProfileId = executionSnapshot?.providerProfileId ?? (stringField(run.metadata, "providerProfileId") || run.provider);
+    const resolvedProvider = this.resolveSavedProvider(providerProfileId);
+    const effectiveRunOptions = executionSnapshot?.runOptions ?? runOptionsFromJson(run.metadata.runOptions) ?? run.runOptions ?? {};
+    const requestedRunOptions =
+      executionSnapshot?.requestedRunOptions ?? runOptionsFromJson(run.metadata.requestedRunOptions) ?? effectiveRunOptions;
+    const unsupportedRunOptions =
+      executionSnapshot?.unsupportedRunOptions ??
+      (Array.isArray(run.metadata.unsupportedRunOptions)
+        ? run.metadata.unsupportedRunOptions.filter((value): value is string => typeof value === "string")
+        : []);
     const sourceMessages = this.store.listMessages(run.sessionId).filter((message) => message.runId !== run.id || message.role !== "assistant");
     const contextResult = buildContext({
       session,
       agent,
       messages: sourceMessages,
       providerProfileId: resolvedProvider.profile.id,
-      runOptions: optionPlan.runOptions,
+      runOptions: effectiveRunOptions,
       availableTools: this.getAvailableToolsForAgent(agent),
       metadata: { runId: run.id, resumed: true }
     });
@@ -2104,11 +2321,34 @@ export class Kernel {
         messages: toProviderMessages(contextResult.context),
         profile: resolvedProvider.profile,
         credential: resolvedProvider.credential,
-        requestedRunOptions: optionPlan.requestedRunOptions,
-        runOptions: optionPlan.runOptions,
-        unsupportedRunOptions: optionPlan.unsupportedRunOptions
+        requestedRunOptions,
+        runOptions: effectiveRunOptions,
+        unsupportedRunOptions
       }
     };
+  }
+
+  private resolveSavedProvider(providerProfileId: string) {
+    const exactResolver = (this.providers as ProviderRegistry & { resolveRunExact?: ProviderRegistry["resolveRunExact"] }).resolveRunExact;
+    if (typeof exactResolver === "function") {
+      return exactResolver.call(this.providers, providerProfileId);
+    }
+    const resolved = this.providers.resolveRun({ providerProfileId });
+    if (resolved.profile.id !== providerProfileId || resolved.providerResolution.fallback) {
+      throw new Error(
+        `Saved provider profile '${providerProfileId}' is unavailable; this run was not switched to fallback provider '${resolved.profile.id}'.`
+      );
+    }
+    return resolved;
+  }
+
+  private agentDefaultsForProvider(agent: AgentDefinition, resolvedProviderProfileId: string, options: StartRunOptions): RunOptions | null {
+    const hasProviderOverride = Boolean(options.provider?.trim() || options.providerProfileId?.trim());
+    if (!hasProviderOverride) {
+      return agent.defaultRunOptions;
+    }
+    const profileProviderProfileId = agent.modelProfileId ?? this.providers.list().defaultProviderProfileId;
+    return profileProviderProfileId === resolvedProviderProfileId ? agent.defaultRunOptions : null;
   }
 
   private getAvailableToolsForAgent(agent: AgentDefinition) {
@@ -2118,6 +2358,92 @@ export class Kernel {
       const modelTool = toModelToolDefinition(tool);
       return modelTool ? [modelTool] : [];
     });
+  }
+
+  private resolveAgentForSession(session: Session, explicitAgentId?: string): AgentDefinition {
+    return this.getAgentDefinition(explicitAgentId?.trim() || session.agentId || defaultAgentId);
+  }
+
+  private getAgentForRun(run: Run): AgentDefinition {
+    const snapshot = agentFromRunMetadata(run.metadata);
+    if (snapshot) {
+      return snapshot;
+    }
+    const agentId = stringField(run.metadata, "agentId") || defaultAgentId;
+    const fallback = this.store.getAgentDefinition(agentId) ?? this.store.getAgentDefinition(defaultAgentId);
+    if (!fallback) {
+      throw new KernelError("Agent snapshot and fallback profile are unavailable for this legacy run.", 409);
+    }
+    this.store.mergeRunMetadata(
+      run.id,
+      {
+        agentSnapshotFallback: "legacy-current-profile",
+        agentSnapshotFallbackAgentId: fallback.id
+      },
+      new Date().toISOString()
+    );
+    return fallback;
+  }
+
+  private normalizeAgentDefinition(
+    input: CreateAgentDefinitionOptions,
+    existingId?: string
+  ): Omit<CreateAgentDefinitionInput, "id" | "metadata" | "createdAt" | "updatedAt"> {
+    const name = input.name.trim();
+    if (!name || name.length > 120 || hasControlCharacters(name)) {
+      throw new KernelError("Agent name must be 1-120 characters without control characters.", 400);
+    }
+    const duplicate = this.store
+      .listAgentDefinitions()
+      .find((agent) => agent.id !== existingId && agent.name.trim().toLocaleLowerCase() === name.toLocaleLowerCase());
+    if (duplicate) {
+      throw new KernelError(`Agent profile name '${name}' is already in use.`, 409, "duplicate_agent_name");
+    }
+
+    const systemPrompt = input.systemPrompt;
+    if (!systemPrompt.trim() || systemPrompt.length > 20_000 || hasUnsafeTextControlCharacters(systemPrompt)) {
+      throw new KernelError("Agent systemPrompt must be 1-20000 characters without unsafe control characters.", 400);
+    }
+    const description = input.description?.trim() || null;
+    if ((description?.length ?? 0) > 1_000 || (description ? hasUnsafeTextControlCharacters(description) : false)) {
+      throw new KernelError("Agent description must be 1000 characters or fewer without unsafe control characters.", 400);
+    }
+
+    const modelProfileId = input.modelProfileId?.trim() || null;
+    if (modelProfileId && !this.providers.list().providers.some((profile) => profile.id === modelProfileId)) {
+      throw new KernelError(`Provider profile '${modelProfileId}' was not found.`, 400, "unknown_provider_profile");
+    }
+
+    const defaultRunOptions = normalizeAgentRunOptions(input.defaultRunOptions);
+    const skillIds = normalizeAgentIdList(input.skillIds ?? [], "skillIds");
+    const toolIds = normalizeAgentIdList(input.toolIds ?? [], "toolIds");
+    for (const toolId of toolIds) {
+      if (!this.tools.get(toolId)) {
+        throw new KernelError(`Tool '${toolId}' is not registered.`, 400, "unknown_tool");
+      }
+    }
+
+    return {
+      name,
+      description,
+      systemPrompt,
+      modelProfileId,
+      defaultRunOptions,
+      skillIds,
+      toolIds
+    };
+  }
+
+  private nextAgentCopyName(sourceName: string): string {
+    const names = new Set(this.store.listAgentDefinitions().map((agent) => agent.name.trim().toLocaleLowerCase()));
+    for (let suffix = 1; suffix <= 10_000; suffix += 1) {
+      const copySuffix = ` Copy${suffix === 1 ? "" : ` ${suffix}`}`;
+      const candidate = `${sourceName.slice(0, 120 - copySuffix.length).trimEnd()}${copySuffix}`;
+      if (!names.has(candidate.toLocaleLowerCase())) {
+        return candidate;
+      }
+    }
+    throw new KernelError("Unable to allocate a unique cloned agent name.", 409);
   }
 
   private emit(run: Run, type: RunEventType, payload: unknown): RunEvent {
@@ -2132,6 +2458,56 @@ export class Kernel {
     this.eventBus.publish(event);
     return event;
   }
+}
+
+function normalizeAgentRunOptions(value: RunOptions | null | undefined): RunOptions | null {
+  if (!value) {
+    return null;
+  }
+  const options: RunOptions = {};
+  const model = value.model?.trim();
+  if (model) {
+    if (model.length > 200 || hasControlCharacters(model)) {
+      throw new KernelError("Agent default model must be 200 characters or fewer without control characters.", 400);
+    }
+    options.model = model;
+  }
+  const reasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
+  if (value.reasoningEffort && (!reasoningEffort || value.reasoningEffort.length > maxReasoningEffortLength)) {
+    throw new KernelError(`Agent default reasoning effort must be ${maxReasoningEffortLength} characters or fewer.`, 400);
+  }
+  if (reasoningEffort) {
+    options.reasoningEffort = reasoningEffort;
+  }
+  if (value.temperature !== undefined) {
+    if (!Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 2) {
+      throw new KernelError("Agent default temperature must be between 0 and 2.", 400);
+    }
+    options.temperature = value.temperature;
+  }
+  return Object.keys(options).length > 0 ? options : null;
+}
+
+function normalizeAgentIdList(values: string[], field: "skillIds" | "toolIds"): string[] {
+  if (values.length > 100) {
+    throw new KernelError(`Agent ${field} must contain 100 IDs or fewer.`, 400);
+  }
+  const output: string[] = [];
+  for (const value of values) {
+    const id = value.trim();
+    if (!id || id.length > 120 || hasControlCharacters(id)) {
+      throw new KernelError(`Agent ${field} must contain non-empty IDs of 120 characters or fewer.`, 400);
+    }
+    if (output.includes(id)) {
+      throw new KernelError(`Agent ${field} contains duplicate ID '${id}'.`, 400);
+    }
+    output.push(id);
+  }
+  return output;
+}
+
+function hasUnsafeTextControlCharacters(value: string): boolean {
+  return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
 }
 
 function assertExistingDirectory(path: string, label: string): void {

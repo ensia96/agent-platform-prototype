@@ -25,7 +25,12 @@ import { isActiveRunStatus, isTerminalRunStatus } from "../shared/types";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 import { ChatHeader } from "./ChatHeader";
 import { MessageBody } from "./MessageBody";
-import { reconcileModelOverride, reconcileReasoningEffort, type ModelCatalogLoadState } from "./model-catalog";
+import {
+  profileDefaultsApplyToProvider,
+  reconcileModelOverride,
+  reconcileReasoningEffort,
+  type ModelCatalogLoadState
+} from "./model-catalog";
 import { RunInspector } from "./RunInspector";
 import { RunActionButton } from "./RunActionButton";
 import {
@@ -45,8 +50,9 @@ import {
   type RunConnectionState,
   type RunTerminalNotice
 } from "./run-recovery";
-import { SettingsPanel } from "./SettingsPanel";
+import { SettingsPanel, type SettingsEditorState } from "./SettingsPanel";
 import { shellToolStateFromResponse, type ShellToolState } from "./ToolPanels";
+import { mergeSessionMutation } from "./session-mutations";
 
 type LoadState = "idle" | "loading" | "error";
 type Tab = "chat" | "settings";
@@ -62,9 +68,9 @@ export function App() {
   const [input, setInput] = useState("");
   const [sendOnEnter, setSendOnEnter] = useState(readSendOnEnterPreference);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
+  const [defaultProviderProfileId, setDefaultProviderProfileId] = useState("");
   const [agents, setAgents] = useState<AgentDefinition[]>([]);
   const [tools, setTools] = useState<ToolDefinition[]>([]);
-  const [agentId, setAgentId] = useState("main");
   const [providerProfileId, setProviderProfileId] = useState("");
   const [modelOverride, setModelOverride] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort | "">("");
@@ -82,6 +88,8 @@ export function App() {
   const [workingDirectoryDraft, setWorkingDirectoryDraft] = useState("");
   const [workingDirectorySaveState, setWorkingDirectorySaveState] = useState<SaveState>("idle");
   const [workingDirectoryError, setWorkingDirectoryError] = useState<string | null>(null);
+  const [sessionAgentSaveState, setSessionAgentSaveState] = useState<SaveState>("idle");
+  const [sessionAgentError, setSessionAgentError] = useState<string | null>(null);
   const [shellCommand, setShellCommand] = useState("");
   const [shellCwd, setShellCwd] = useState("");
   const [shellTimeoutMs, setShellTimeoutMs] = useState("");
@@ -99,6 +107,7 @@ export function App() {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("chat");
+  const [settingsEditorState, setSettingsEditorState] = useState<SettingsEditorState>({ dirty: false, busy: false });
   const [inspectorOpen, setInspectorOpen] = useState(
     () => typeof window === "undefined" || !window.matchMedia(INSPECTOR_OVERLAY_QUERY).matches
   );
@@ -116,6 +125,7 @@ export function App() {
   const workingDirectoryRequestIdRef = useRef(0);
   const runStartRequestIdRef = useRef(0);
   const contextPreviewRequestIdRef = useRef(0);
+  const sessionAgentRequestIdRef = useRef(0);
   const inspectorToggleRef = useRef<HTMLButtonElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const messagesShouldFollowRef = useRef(true);
@@ -129,12 +139,21 @@ export function App() {
   const modelOverrideRef = useRef(modelOverride);
   const previousActiveTabRef = useRef<Tab>(activeTab);
   selectedSessionIdRef.current = selectedSessionId;
-  providerProfileIdRef.current = providerProfileId;
   modelOverrideRef.current = modelOverride;
   const activeRunId = activeRun?.id ?? null;
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
-  const selectedProvider = providers.find((profile) => profile.id === providerProfileId) ?? null;
+  const agentId = selectedSession?.agentId ?? "main";
   const selectedAgent = agents.find((agent) => agent.id === agentId) ?? null;
+  const effectiveProviderProfileId = providerProfileId || selectedAgent?.modelProfileId || defaultProviderProfileId;
+  const selectedProvider = providers.find((profile) => profile.id === effectiveProviderProfileId) ?? null;
+  const selectedAgentDefaultsApply = profileDefaultsApplyToProvider(
+    selectedAgent,
+    effectiveProviderProfileId,
+    defaultProviderProfileId,
+    Boolean(providerProfileId)
+  );
+  const effectiveDefaultsAgent = selectedAgentDefaultsApply ? selectedAgent : null;
+  providerProfileIdRef.current = effectiveProviderProfileId;
   const selectedPendingPermissions = pendingPermissions.filter((permission) => permission.sessionId === selectedSessionId);
 
   useEffect(() => {
@@ -165,6 +184,12 @@ export function App() {
     setContextPreview(null);
     setContextPreviewState("idle");
     setMessages([]);
+    setProviderProfileId("");
+    setModelOverride("");
+    setReasoningEffort("");
+    setTemperature("");
+    setSessionAgentSaveState("idle");
+    setSessionAgentError(null);
     void loadPendingPermissions();
     if (!selectedSessionId) {
       return undefined;
@@ -209,20 +234,20 @@ export function App() {
     setModelCatalog(null);
     setModelCatalogError(null);
     setReasoningEffort("");
-    if (!providerProfileId) {
+    if (!effectiveProviderProfileId) {
       setModelCatalogState("idle");
       return;
     }
-    void loadProviderModelCatalog(providerProfileId);
+    void loadProviderModelCatalog(effectiveProviderProfileId);
     return () => modelCatalogAbortRef.current?.abort();
-  }, [providerProfileId]);
+  }, [effectiveProviderProfileId]);
 
   useEffect(() => {
     if (!modelCatalog) {
       return;
     }
-    setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, selectedProvider, selectedAgent, modelOverride, current));
-  }, [modelCatalog, modelOverride, selectedAgent, selectedProvider]);
+    setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, selectedProvider, effectiveDefaultsAgent, modelOverride, current));
+  }, [effectiveDefaultsAgent, modelCatalog, modelOverride, selectedProvider]);
 
   useEffect(() => {
     writeSendOnEnterPreference(sendOnEnter);
@@ -361,8 +386,9 @@ export function App() {
     try {
       const response = await requestJson<ProviderListResponse>("/api/providers");
       setProviders(response.providers);
+      setDefaultProviderProfileId(response.defaultProviderProfileId);
       setProviderProfileId((current) =>
-        response.providers.some((profile) => profile.id === current) ? current : response.defaultProviderProfileId
+        !current || response.providers.some((profile) => profile.id === current) ? current : ""
       );
     } catch (requestError) {
       setError(toErrorMessage(requestError));
@@ -388,7 +414,14 @@ export function App() {
       setModelCatalog(catalog);
       setModelCatalogState("loaded");
       const profile = providers.find((item) => item.id === profileId) ?? null;
-      const agent = agents.find((item) => item.id === agentId) ?? null;
+      const agent = profileDefaultsApplyToProvider(
+        agents.find((item) => item.id === agentId) ?? null,
+        profileId,
+        defaultProviderProfileId,
+        Boolean(providerProfileId)
+      )
+        ? agents.find((item) => item.id === agentId) ?? null
+        : null;
       const nextModelOverride = reconcileModelOverride(catalog, modelOverrideRef.current);
       setModelOverride(nextModelOverride);
       setReasoningEffort((current) => reconcileReasoningEffort(catalog, profile, agent, nextModelOverride, current));
@@ -405,7 +438,6 @@ export function App() {
     try {
       const response = await requestJson<AgentListResponse>("/api/agents");
       setAgents(response.agents);
-      setAgentId((current) => (response.agents.some((agent) => agent.id === current) ? current : response.defaultAgentId));
     } catch (requestError) {
       setError(toErrorMessage(requestError));
     }
@@ -443,12 +475,27 @@ export function App() {
       workingDirectoryRequestIdRef.current += 1;
       runStartRequestIdRef.current += 1;
       contextPreviewRequestIdRef.current += 1;
+      sessionAgentRequestIdRef.current += 1;
       permissionActionTokenRef.current += 1;
       selectedSessionIdRef.current = sessionId;
       setRunStartPending(false);
       setPermissionActionId(null);
     }
     setSelectedSessionId(sessionId);
+  }
+
+  function changeTab(nextTab: Tab) {
+    if (activeTab === "settings" && nextTab !== "settings") {
+      if (settingsEditorState.busy) {
+        window.alert("Wait for the Agent Profile mutation to finish before leaving Settings.");
+        return;
+      }
+      if (settingsEditorState.dirty && !window.confirm("Discard unsaved Agent Profile changes and leave Settings?")) {
+        return;
+      }
+      setSettingsEditorState({ dirty: false, busy: false });
+    }
+    setActiveTab(nextTab);
   }
 
   function isCurrentSessionGeneration(sessionId: string, generation: number): boolean {
@@ -499,6 +546,10 @@ export function App() {
       setWorkingDirectoryError("Select or create a session before changing its working directory.");
       return;
     }
+    if (sessionAgentSaveState === "saving") {
+      setWorkingDirectoryError("Wait for the session agent change to finish.");
+      return;
+    }
     const workingDirectory = workingDirectoryDraft.trim();
     if (!workingDirectory) {
       setWorkingDirectoryError("Working directory is required.");
@@ -522,7 +573,9 @@ export function App() {
       ) {
         return;
       }
-      setSessions((current) => current.map((item) => (item.id === session.id ? session : item)));
+      setSessions((current) =>
+        current.map((item) => (item.id === session.id ? mergeSessionMutation(item, session, ["workingDirectory"]) : item))
+      );
       setWorkingDirectoryDraft(session.workingDirectory);
       setWorkingDirectorySaveState("saved");
     } catch (requestError) {
@@ -533,9 +586,51 @@ export function App() {
     }
   }
 
+  async function updateSessionAgent(agentId: string) {
+    const session = selectedSession;
+    if (!session || activeRun || workingDirectorySaveState === "saving") {
+      return;
+    }
+    const generation = sessionGenerationRef.current;
+    const requestId = sessionAgentRequestIdRef.current + 1;
+    sessionAgentRequestIdRef.current = requestId;
+    setSessionAgentSaveState("saving");
+    setSessionAgentError(null);
+    try {
+      const updated = await requestJson<Session>(`/api/sessions/${session.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agentId })
+      });
+      if (
+        updated.id !== session.id ||
+        !isCurrentSessionOperation(session.id, generation, requestId, sessionAgentRequestIdRef.current)
+      ) {
+        return;
+      }
+      setSessions((current) => current.map((item) => (item.id === updated.id ? mergeSessionMutation(item, updated, ["agentId"]) : item)));
+      setProviderProfileId("");
+      setModelOverride("");
+      setReasoningEffort("");
+      setTemperature("");
+      setSessionAgentSaveState("saved");
+    } catch (requestError) {
+      if (isCurrentSessionOperation(session.id, generation, requestId, sessionAgentRequestIdRef.current)) {
+        setSessionAgentSaveState("idle");
+        setSessionAgentError(toErrorMessage(requestError));
+      }
+    }
+  }
+
   async function startRun() {
     const text = input.trim();
-    if (!text || activeRun || runStartPending) {
+    if (
+      !text ||
+      activeRun ||
+      runStartPending ||
+      sessionAgentSaveState === "saving" ||
+      workingDirectorySaveState === "saving"
+    ) {
       return;
     }
 
@@ -569,7 +664,6 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text,
-          agentId: agentId || "main",
           providerProfileId: providerProfileId || undefined,
           runOptions: hasRunOptions(runOptions) ? runOptions : undefined
         })
@@ -663,7 +757,6 @@ export function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          agentId: agentId || "main",
           providerProfileId: providerProfileId || undefined,
           runOptions: hasRunOptions(runOptions) ? runOptions : undefined,
           text: input.trim() || undefined
@@ -1111,7 +1204,12 @@ export function App() {
   const displayedRunStatus = runDiscoveryPending
     ? { label: "checking active runs", tone: "reconnecting" as const }
     : runDisplayStatus(activeRun, runConnectionState, runTerminalNotice, Boolean(selectedSession));
-  const runControlsDisabled = Boolean(activeRun) || runDiscoveryPending || runStartPending;
+  const runControlsDisabled =
+    Boolean(activeRun) ||
+    runDiscoveryPending ||
+    runStartPending ||
+    sessionAgentSaveState === "saving" ||
+    workingDirectorySaveState === "saving";
 
   return (
     <main
@@ -1127,10 +1225,10 @@ export function App() {
         </div>
 
         <nav className="tabList" aria-label="Dashboard sections">
-          <button className={activeTab === "chat" ? "tab active" : "tab"} onClick={() => setActiveTab("chat")}>
+          <button className={activeTab === "chat" ? "tab active" : "tab"} onClick={() => changeTab("chat")}>
             Chat
           </button>
-          <button className={activeTab === "settings" ? "tab active" : "tab"} onClick={() => setActiveTab("settings")}>
+          <button className={activeTab === "settings" ? "tab active" : "tab"} onClick={() => changeTab("settings")}>
             Settings
           </button>
         </nav>
@@ -1248,7 +1346,13 @@ export function App() {
                   <RunActionButton
                     activeRun={activeRun}
                     cancelPending={cancelPending}
-                    runDisabled={!input.trim() || runDiscoveryPending || runStartPending}
+                    runDisabled={
+                      !input.trim() ||
+                      runDiscoveryPending ||
+                      runStartPending ||
+                      sessionAgentSaveState === "saving" ||
+                      workingDirectorySaveState === "saving"
+                    }
                     onCancel={() => void cancelRun()}
                   />
                   {activeRun && <span className="cancelHint">Cancellation is best-effort; completed side effects remain.</span>}
@@ -1269,8 +1373,12 @@ export function App() {
                 setup={{
                   agents,
                   agentId,
+                  agentSaveState: sessionAgentSaveState,
+                  agentError: sessionAgentError,
                   providers,
                   providerProfileId,
+                  effectiveProviderProfileId,
+                  defaultProviderProfileId,
                   modelOverride,
                   reasoningEffort,
                   temperature,
@@ -1278,13 +1386,8 @@ export function App() {
                   modelCatalog,
                   modelCatalogState,
                   modelCatalogError,
-                  onRefreshModelCatalog: () => void loadProviderModelCatalog(providerProfileId, true),
-                  onAgentChange: (value) => {
-                    setAgentId(value);
-                    const profile = providers.find((item) => item.id === providerProfileId) ?? null;
-                    const agent = agents.find((item) => item.id === value) ?? null;
-                    setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, profile, agent, modelOverride, current));
-                  },
+                  onRefreshModelCatalog: () => void loadProviderModelCatalog(effectiveProviderProfileId, true),
+                  onAgentChange: (value) => void updateSessionAgent(value),
                   onProviderChange: (value) => {
                     setProviderProfileId(value);
                     setModelOverride("");
@@ -1294,8 +1397,16 @@ export function App() {
                   },
                   onModelOverrideChange: (value) => {
                     setModelOverride(value);
-                    const profile = providers.find((item) => item.id === providerProfileId) ?? null;
-                    const agent = agents.find((item) => item.id === agentId) ?? null;
+                    const profile = providers.find((item) => item.id === effectiveProviderProfileId) ?? null;
+                    const candidateAgent = agents.find((item) => item.id === agentId) ?? null;
+                    const agent = profileDefaultsApplyToProvider(
+                      candidateAgent,
+                      effectiveProviderProfileId,
+                      defaultProviderProfileId,
+                      Boolean(providerProfileId)
+                    )
+                      ? candidateAgent
+                      : null;
                     setReasoningEffort((current) => reconcileReasoningEffort(modelCatalog, profile, agent, value, current));
                   },
                   onReasoningEffortChange: setReasoningEffort,
@@ -1358,7 +1469,7 @@ export function App() {
           )}
         </>
       ) : (
-        <SettingsPanel />
+        <SettingsPanel onAgentsChanged={setAgents} onEditorStateChange={setSettingsEditorState} />
       )}
     </main>
   );

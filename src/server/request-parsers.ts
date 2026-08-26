@@ -7,6 +7,7 @@ import {
 } from "../shared/tool-settings";
 import { hasControlCharacters, maxReasoningEffortLength, normalizeReasoningEffort } from "../shared/run-options";
 import type {
+  CreateAgentDefinitionRequest,
   CreateSessionRequest,
   JsonObject,
   JsonValue,
@@ -18,6 +19,7 @@ import type {
 } from "../shared/types";
 
 export type AgentDefinitionPatch = {
+  expectedRevision?: number;
   name?: string;
   description?: string | null;
   systemPrompt?: string;
@@ -81,6 +83,12 @@ export function parseCreateSessionRequest(body: Record<string, unknown>): Create
     }
     request.workingDirectory = body.workingDirectory;
   }
+  if (body.agentId !== undefined && body.agentId !== null && body.agentId !== "") {
+    if (typeof body.agentId !== "string" || !body.agentId.trim()) {
+      throw new KernelError("Session field 'agentId' must be a non-empty string when provided.", 400);
+    }
+    request.agentId = body.agentId.trim();
+  }
   return request;
 }
 
@@ -88,16 +96,29 @@ export function parseSessionPatch(body: unknown): UpdateSessionRequest {
   if (!isPlainObject(body)) {
     throw new KernelError("PATCH /api/sessions/:id expects a JSON object.", 400);
   }
-  const allowedKeys = new Set(["workingDirectory"]);
+  const allowedKeys = new Set(["workingDirectory", "agentId"]);
   for (const key of Object.keys(body)) {
     if (!allowedKeys.has(key)) {
       throw new KernelError(`Unsupported session field '${key}'.`, 400);
     }
   }
-  if (typeof body.workingDirectory !== "string" || !body.workingDirectory.trim()) {
-    throw new KernelError("Session field 'workingDirectory' must be a non-empty string.", 400);
+  const request: UpdateSessionRequest = {};
+  if ("workingDirectory" in body) {
+    if (typeof body.workingDirectory !== "string" || !body.workingDirectory.trim()) {
+      throw new KernelError("Session field 'workingDirectory' must be a non-empty string.", 400);
+    }
+    request.workingDirectory = body.workingDirectory;
   }
-  return { workingDirectory: body.workingDirectory };
+  if ("agentId" in body) {
+    if (typeof body.agentId !== "string" || !body.agentId.trim()) {
+      throw new KernelError("Session field 'agentId' must be a non-empty string.", 400);
+    }
+    request.agentId = body.agentId.trim();
+  }
+  if (Object.keys(request).length === 0) {
+    throw new KernelError("Session patch requires workingDirectory or agentId.", 400);
+  }
+  return request;
 }
 
 export function parseShellExecRequest(body: Record<string, unknown>): ShellExecRequest {
@@ -166,7 +187,8 @@ export function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
     "defaultRunOptions",
     "skillIds",
     "toolIds",
-    "metadata"
+    "metadata",
+    "expectedRevision"
   ]);
   for (const key of Object.keys(body)) {
     if (!allowedKeys.has(key)) {
@@ -175,13 +197,16 @@ export function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
   }
 
   const patch: AgentDefinitionPatch = {};
+  if ("expectedRevision" in body) {
+    patch.expectedRevision = parsePositiveRevision(body.expectedRevision);
+  }
   if ("name" in body) {
     if (typeof body.name !== "string") {
       throw new KernelError("Agent field 'name' must be a string.", 400);
     }
     const name = body.name.trim();
-    if (!name || name.length > 120) {
-      throw new KernelError("Agent field 'name' must be 1-120 characters.", 400);
+    if (!name || name.length > 120 || hasControlCharacters(name)) {
+      throw new KernelError("Agent field 'name' must be 1-120 characters without control characters.", 400);
     }
     patch.name = name;
   }
@@ -215,8 +240,8 @@ export function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
       patch.modelProfileId = null;
     } else if (typeof body.modelProfileId === "string") {
       const modelProfileId = body.modelProfileId.trim();
-      if (modelProfileId.length > 120) {
-        throw new KernelError("Agent field 'modelProfileId' must be 120 characters or fewer.", 400);
+      if (modelProfileId.length > 120 || hasControlCharacters(modelProfileId)) {
+        throw new KernelError("Agent field 'modelProfileId' must be 120 characters or fewer without control characters.", 400);
       }
       patch.modelProfileId = modelProfileId || null;
     } else {
@@ -242,10 +267,45 @@ export function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
     if (containsSensitiveKey(body.metadata)) {
       throw new KernelError("Agent metadata must not contain credential, token, secret, or API key fields.", 400);
     }
+    if (containsReservedAgentMetadataKey(body.metadata)) {
+      throw new KernelError("Agent metadata keys beginning with '_' and reserved migration keys are not user-editable.", 400);
+    }
     patch.metadata = body.metadata;
   }
 
   return patch;
+}
+
+export function parseCreateAgentDefinition(body: unknown): CreateAgentDefinitionRequest {
+  const patch = parseAgentDefinitionPatch(body);
+  if (patch.expectedRevision !== undefined) {
+    throw new KernelError("Agent creation does not accept expectedRevision.", 400);
+  }
+  if (!patch.name || !patch.systemPrompt) {
+    throw new KernelError("Agent creation requires name and systemPrompt.", 400);
+  }
+  return {
+    name: patch.name,
+    systemPrompt: patch.systemPrompt,
+    description: patch.description,
+    modelProfileId: patch.modelProfileId,
+    defaultRunOptions: patch.defaultRunOptions,
+    skillIds: patch.skillIds,
+    toolIds: patch.toolIds,
+    metadata: patch.metadata
+  };
+}
+
+export function parseExpectedAgentRevision(body: unknown): number {
+  if (!isPlainObject(body)) {
+    throw new KernelError("Agent mutation expects body { expectedRevision }.", 400);
+  }
+  for (const key of Object.keys(body)) {
+    if (key !== "expectedRevision") {
+      throw new KernelError(`Unsupported agent mutation field '${key}'.`, 400);
+    }
+  }
+  return parsePositiveRevision(body.expectedRevision);
 }
 
 export function parseRunOptionsFromBody(body: Record<string, unknown> | undefined): RunOptions | undefined {
@@ -268,8 +328,8 @@ function parseRunOptionsValue(rawOptions: unknown): RunOptions | undefined {
         throw new KernelError("Run option 'model' must be a string.", 400);
       }
       const model = rawOptions.model.trim();
-      if (model.length > 200) {
-        throw new KernelError("Run option 'model' must be 200 characters or fewer.", 400);
+      if (model.length > 200 || hasControlCharacters(model)) {
+        throw new KernelError("Run option 'model' must be 200 characters or fewer without control characters.", 400);
       }
       if (model) {
         options.model = model;
@@ -313,6 +373,13 @@ function parseRunOptionsValue(rawOptions: unknown): RunOptions | undefined {
 
 function isValidSettingKey(key: string): boolean {
   return key.trim().length > 0 && key.length <= 128;
+}
+
+function parsePositiveRevision(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new KernelError("Agent expectedRevision must be a positive integer.", 400);
+  }
+  return value;
 }
 
 function isJsonValue(value: unknown): value is JsonValue {
@@ -370,9 +437,13 @@ function parseStringList(value: unknown, fieldName: string): string[] {
     if (trimmed.length > 120) {
       throw new KernelError(`Agent field '${fieldName}' IDs must be 120 characters or fewer.`, 400);
     }
-    if (!output.includes(trimmed)) {
-      output.push(trimmed);
+    if (hasControlCharacters(trimmed)) {
+      throw new KernelError(`Agent field '${fieldName}' IDs must not contain control characters.`, 400);
     }
+    if (output.includes(trimmed)) {
+      throw new KernelError(`Agent field '${fieldName}' contains duplicate ID '${trimmed}'.`, 400);
+    }
+    output.push(trimmed);
   }
   return output;
 }
@@ -389,4 +460,16 @@ function containsSensitiveKey(value: unknown): boolean {
 
 function isSensitiveMetadataKey(key: string): boolean {
   return /authorization|cookie|token|secret|api[_-]?key|credential|password|refresh|access/i.test(key);
+}
+
+function containsReservedAgentMetadataKey(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.some(containsReservedAgentMetadataKey);
+  }
+  if (!isPlainObject(value)) {
+    return false;
+  }
+  return Object.entries(value).some(
+    ([key, nested]) => key.startsWith("_") || key === "explicitToolAllowlistVersion" || containsReservedAgentMetadataKey(nested)
+  );
 }

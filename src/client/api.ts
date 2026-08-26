@@ -34,6 +34,9 @@ export async function requestJson<T>(url: string, init?: RequestInit): Promise<T
       body as Record<string, unknown> | null
     );
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return (await response.json()) as T;
 }
 
