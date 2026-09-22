@@ -94,6 +94,29 @@ export interface RunOptions {
   temperature?: number;
 }
 
+export type ContextWindowSource = "provider" | "adapter" | "user" | "assumed";
+
+export interface ModelContextCapability {
+  windowTokens: number;
+  source: ContextWindowSource;
+  /** True when a last-good provider catalog value outlived its normal TTL. */
+  stale?: boolean;
+}
+
+export interface ProviderContextPlanningProfile {
+  requiredInstructions: Array<{ id: string; content: string }>;
+  fixedWrapperTokens: number;
+  perMessageTokens: number;
+  toolEnvelopeTokens: number;
+}
+
+export interface AgentContextPolicy {
+  contextWindowTokensOverride?: number;
+  reservedOutputTokens?: number;
+  safetyMarginRatio?: number;
+  automaticCompaction?: boolean;
+}
+
 export interface AgentDefinition {
   id: string;
   revision: number;
@@ -102,6 +125,7 @@ export interface AgentDefinition {
   systemPrompt: string;
   modelProfileId: string | null;
   defaultRunOptions: RunOptions | null;
+  contextPolicy: AgentContextPolicy | null;
   skillIds: string[];
   toolIds: string[];
   metadata: JsonObject;
@@ -112,7 +136,7 @@ export interface AgentDefinition {
 export interface ContextMessage {
   role: MessageRole;
   content: string;
-  source?: "session" | "current" | "synthetic";
+  source?: "session" | "current" | "synthetic" | "compaction";
   messageId?: string;
   parts?: ContextMessagePart[];
   metadata?: JsonObject;
@@ -136,10 +160,69 @@ export interface BuiltContext {
   skillIds?: string[];
   toolIds?: string[];
   metadata: JsonObject;
+  plan: ContextPlan;
+}
+
+export type ContextCandidateKind =
+  | "system"
+  | "message_turn"
+  | "tool_schema"
+  | "tool_result"
+  | "current_input"
+  | "compaction_summary"
+  | "skill"
+  | "file"
+  | "subsession_handoff";
+
+export type ContextCandidateRetention = "required" | "recent" | "compressible" | "discardable";
+
+export interface ContextCandidate {
+  kind: ContextCandidateKind;
+  sourceIds: string[];
+  estimatedTokens: number;
+  retention: ContextCandidateRetention;
+}
+
+export interface ContextPlanItem extends ContextCandidate {
+  reason?: string;
+}
+
+export interface ContextPlan {
+  windowTokens: number;
+  windowSource: ContextWindowSource;
+  reservedOutputTokens: number;
+  safetyMarginTokens: number;
+  inputBudgetTokens: number;
+  estimatedInputTokens: number;
+  providerNeutralTokens: number;
+  nativeOverheadTokens: number;
+  capabilityStale: boolean;
+  historyWatermark: string | null;
+  historyThroughMessageId: string | null;
+  selectedHistoryFromMessageId: string | null;
+  selectedHistoryThroughMessageId: string | null;
+  activeSegmentId: string | null;
+  inheritedArtifactId: string | null;
+  preTrimEstimatedInputTokens: number;
+  compactionRecommended: boolean;
+  compactionReason: "budget_threshold" | "trimming_applied" | null;
+  included: ContextPlanItem[];
+  omitted: ContextPlanItem[];
+  trimmingApplied: boolean;
+  estimatorVersion: string;
+}
+
+export interface ContextPlanRecord {
+  planId: string;
+  providerTurn: number;
+  toolIteration: number;
+  createdAt: ISODateString;
+  plan: ContextPlan;
 }
 
 export interface ContextBuildResult {
   context: BuiltContext;
+  plan: ContextPlan;
   warnings: string[];
   skippedMessageIds: string[];
 }
@@ -268,6 +351,7 @@ export interface ProviderModelCatalogItem {
   owner?: string;
   created?: number;
   reasoning: ProviderModelReasoningCapabilities;
+  context?: ModelContextCapability;
 }
 
 export interface ProviderModelCatalog {
@@ -286,6 +370,7 @@ export interface Session {
   title: string;
   workingDirectory: string;
   agentId: string;
+  activeSegmentId: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
@@ -376,6 +461,7 @@ export interface Message {
   id: string;
   sessionId: string;
   runId: string | null;
+  segmentId: string;
   role: MessageRole;
   status: MessageStatus;
   error: string | null;
@@ -393,6 +479,7 @@ export interface Run {
   sessionId: string;
   provider: string;
   status: RunStatus;
+  segmentId: string;
   metadata: JsonObject;
   model: string | null;
   runOptions: RunOptions | null;
@@ -402,7 +489,68 @@ export interface Run {
   error: string | null;
 }
 
-export type PublicRunPhase = "running" | "provider" | "tool" | "waiting_permission" | "cancelling";
+export type ContextSegmentStatus = "active" | "sealed";
+
+export interface ContextSegment {
+  id: string;
+  sessionId: string;
+  ordinal: number;
+  previousSegmentId: string | null;
+  status: ContextSegmentStatus;
+  firstMessageId: string | null;
+  lastMessageId: string | null;
+  inheritedArtifactId: string | null;
+  messageCount: number;
+  createdAt: ISODateString;
+  sealedAt: ISODateString | null;
+}
+
+export interface ContextArtifact {
+  id: string;
+  kind: "compaction";
+  sessionId: string;
+  sourceSegmentId: string;
+  targetSegmentId: string | null;
+  previousArtifactId: string | null;
+  sourceMessageIds: string[];
+  sourceCategories: ContextArtifactSourceCategory[];
+  sourceFirstMessageId: string | null;
+  sourceLastMessageId: string | null;
+  summary: string;
+  strategyVersion: string;
+  estimatorVersion: string;
+  estimatedTokensBefore: number;
+  estimatedTokensAfter: number;
+  resolvedWindowTokens: number;
+  windowSource: ContextWindowSource;
+  status: "completed" | "failed";
+  providerProfileId: string | null;
+  model: string | null;
+  usage: RunUsage | null;
+  error: string | null;
+  createdAt: ISODateString;
+}
+
+export interface ContextArtifactSourceCategory {
+  category: "completed_turn" | "unsuccessful_turn" | "standalone_tool" | "orphan_record" | "summary_recovery";
+  messageIds: string[];
+  runId: string | null;
+  status: string;
+}
+
+export interface ContextSegmentDetail extends ContextSegment {
+  artifact: ContextArtifact | null;
+  recentFailure: ContextArtifact | null;
+}
+
+export interface CompactContextResponse {
+  state: "completed" | "failed" | "noop";
+  segment: ContextSegment;
+  artifact: ContextArtifact | null;
+  message?: string;
+}
+
+export type PublicRunPhase = "running" | "provider" | "tool" | "compacting_context" | "waiting_permission" | "cancelling";
 
 export interface PublicRunSummary {
   id: string;
@@ -416,6 +564,18 @@ export interface PublicRunSummary {
   createdAt: ISODateString;
   updatedAt: ISODateString;
   error: string | null;
+  context: {
+    planId: string;
+    providerTurn: number;
+    toolIteration: number;
+    inputBudgetTokens: number;
+    estimatedInputTokens: number;
+    providerNeutralTokens: number;
+    nativeOverheadTokens: number;
+    trimmingApplied: boolean;
+    windowSource: ContextWindowSource;
+    capabilityStale: boolean;
+  } | null;
 }
 
 export const CORE_RUN_EVENT_TYPES = [
@@ -429,7 +589,12 @@ export const CORE_RUN_EVENT_TYPES = [
   "run_completed",
   "run_cancelled",
   "run_failed",
-  "run_interrupted"
+  "run_interrupted",
+  "context_compaction_started",
+  "context_compaction_completed",
+  "context_compaction_failed",
+  "context_compaction_skipped",
+  "segment_rotated"
 ] as const;
 
 export const TOOL_RUN_EVENT_TYPES = [
@@ -545,6 +710,7 @@ export interface CreateAgentDefinitionRequest {
   systemPrompt: string;
   modelProfileId?: string | null;
   defaultRunOptions?: RunOptions | null;
+  contextPolicy?: AgentContextPolicy | null;
   skillIds?: string[];
   toolIds?: string[];
   metadata?: JsonObject;

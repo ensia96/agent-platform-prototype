@@ -59,7 +59,7 @@ async function providerCancellationScenario(): Promise<void> {
     const provider = new BlockingProvider();
     const kernel = createKernel(store, eventBus, provider, new ToolRegistry(), workingDirectory);
     const session = kernel.createSession({ title: "provider cancel", workingDirectory });
-    const created = kernel.startRun(session.id, "block until cancelled");
+    const created = await kernel.startRun(session.id, "block until cancelled");
     assert.equal("metadata" in created.run, false);
     assert.equal("baseUrl" in created.providerResolution, false);
     assert.equal("credentialRef" in created.providerResolution, false);
@@ -110,7 +110,7 @@ async function providerCancellationScenario(): Promise<void> {
     assert.equal(kernel.cancelRun(created.run.id).status, "cancelled");
     assert.deepEqual(terminalEventTypes(kernel, created.run.id), ["run_cancelled"], "terminal cancel was not idempotent");
 
-    const queued = kernel.startRun(session.id, "cancel before queued provider execution");
+    const queued = await kernel.startRun(session.id, "cancel before queued provider execution");
     assert.equal(kernel.cancelRun(queued.run.id).status, "cancelled");
     await delay(0);
     assert.equal(provider.runs, 1, "provider started after the queued run was already cancelled");
@@ -251,7 +251,7 @@ async function boundedShutdownScenario(): Promise<void> {
     const eventBus = new RunEventBus();
     const kernel = createKernel(store, eventBus, provider, new ToolRegistry(), workingDirectory);
     const session = kernel.createSession({ title: "bounded shutdown", workingDirectory });
-    const created = kernel.startRun(session.id, "ignore abort until fixture release");
+    const created = await kernel.startRun(session.id, "ignore abort until fixture release");
     await provider.started;
 
     await kernel.shutdown(25);
@@ -275,7 +275,7 @@ async function boundedShutdownScenario(): Promise<void> {
       workingDirectory
     );
     const cooperativeSession = cooperativeKernel.createSession({ title: "shutdown grace", workingDirectory });
-    const cooperativeRun = cooperativeKernel.startRun(cooperativeSession.id, "finish during shutdown grace");
+    const cooperativeRun = await cooperativeKernel.startRun(cooperativeSession.id, "finish during shutdown grace");
     await cooperativeProvider.started;
     const cooperativeShutdown = cooperativeKernel.shutdown(1_000);
     cooperativeProvider.finish();
@@ -763,12 +763,12 @@ async function singleActiveRunInvariantScenario(): Promise<void> {
     const provider = new BlockingProvider();
     const kernel = createKernel(store, new RunEventBus(), provider, new ToolRegistry(), workingDirectory);
     const session = kernel.createSession({ title: "single active", workingDirectory });
-    const first = kernel.startRun(session.id, "first active run");
+    const first = await kernel.startRun(session.id, "first active run");
     await provider.started;
 
     let conflict: unknown;
     try {
-      kernel.startRun(session.id, "must be rejected");
+      await kernel.startRun(session.id, "must be rejected");
     } catch (error) {
       conflict = error;
     }

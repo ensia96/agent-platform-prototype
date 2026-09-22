@@ -1,5 +1,6 @@
 import { refreshOpenAIChatGPTCredential } from "./openai-chatgpt-auth";
 import { extractRunUsage } from "./usage";
+import { providerContextLengthErrorIfRecognized } from "./provider-errors";
 import { normalizeReasoningEffort } from "../shared/run-options";
 import {
   defaultOpenAIChatGPTEndpoint,
@@ -33,8 +34,14 @@ import type {
 
 const refreshSkewMs = 60_000;
 const modelCatalogTimeoutMs = 15_000;
-const defaultCodexInstructions =
+export const defaultCodexInstructions =
   "You are ChatGPT, a helpful assistant. Answer the user's message directly and concisely unless they ask for more detail.";
+export const openAIChatGPTContextPlanning = {
+  requiredInstructions: [{ id: "chatgpt-default-codex-instructions", content: defaultCodexInstructions }],
+  fixedWrapperTokens: 48,
+  perMessageTokens: 8,
+  toolEnvelopeTokens: 24
+};
 const diagnosticBodyPreviewLimit = 1000;
 export const openAIChatGPTClientVersion = "0.0.0";
 export const openAIChatGPTUserAgent = `agent-platform-prototype/${openAIChatGPTClientVersion}`;
@@ -83,6 +90,7 @@ interface OpenAIChatGPTProviderOptions {
 export class OpenAIChatGPTProvider implements ProviderAdapter {
   readonly id = "openai-chatgpt";
   readonly label = "OpenAI ChatGPT OAuth Codex provider";
+  readonly contextPlanning = openAIChatGPTContextPlanning;
 
   private readonly credentialStore: OpenAIChatGPTCredentialStore;
   private readonly issuer: string;
@@ -263,6 +271,10 @@ export class OpenAIChatGPTProvider implements ProviderAdapter {
     if (!response.ok) {
       const diagnostic = await responseErrorDiagnostic(response);
       console.warn("OpenAI ChatGPT Codex request failed", diagnostic);
+      const contextError = providerContextLengthErrorIfRecognized(diagnostic);
+      if (contextError) {
+        throw contextError;
+      }
       throw new Error(formatProviderError("OpenAI ChatGPT Codex provider failed", diagnostic));
     }
 
@@ -382,11 +394,13 @@ export function parseOpenAIChatGPTModelCatalog(
       : undefined;
     const displayName = catalogText(model.display_name, 200, false);
     const description = catalogText(model.description, 1000, true);
+    const contextWindow = conservativeChatGPTContextWindow(model.context_window, model.max_context_window);
     candidates.push({
       item: {
         id,
         ...(displayName ? { displayName } : {}),
         ...(description ? { description } : {}),
+        ...(contextWindow ? { context: { windowTokens: contextWindow, source: "provider" as const } } : {}),
         reasoning: {
           support: efforts.length > 0 ? "supported" : hasReasoningLevelList ? "unsupported" : "unknown",
           efforts,
@@ -414,10 +428,18 @@ export function parseOpenAIChatGPTModelCatalog(
     source: "provider",
     stale: false,
     fetchedAt,
-    warning: "Experimental ChatGPT/Codex internal model catalog; availability and response fields may change without notice.",
+    warning:
+      "Experimental ChatGPT/Codex internal model catalog; availability and response fields may change without notice. When context_window and max_context_window are both present, the smaller positive integer is used conservatively.",
     customModelAllowed: true,
     models
   };
+}
+
+function conservativeChatGPTContextWindow(contextWindow: unknown, maxContextWindow: unknown): number | null {
+  const values = [contextWindow, maxContextWindow].filter(
+    (value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0
+  );
+  return values.length > 0 ? Math.min(...values) : null;
 }
 
 function parseChatGPTEfforts(value: unknown): Array<{ value: string; description?: string }> {
@@ -593,6 +615,10 @@ async function handleStreamEvent(
   const streamError = streamErrorDiagnostic(parsed);
   if (streamError) {
     console.warn("OpenAI ChatGPT Codex stream failed", streamError);
+    const contextError = providerContextLengthErrorIfRecognized(streamError);
+    if (contextError) {
+      throw contextError;
+    }
     throw new Error(formatProviderError("OpenAI ChatGPT Codex stream failed", streamError));
   }
 

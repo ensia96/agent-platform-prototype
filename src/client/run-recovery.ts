@@ -197,7 +197,11 @@ export function updateRunFromEvent(run: PublicRunSummary, event: RunEvent): Publ
   if (run.status === "waiting_permission") {
     return { ...run, updatedAt: event.createdAt };
   }
-  const currentPhase: PublicRunPhase = event.type.startsWith("tool") ? "tool" : "provider";
+  const currentPhase: PublicRunPhase = event.type.startsWith("context_compaction") || event.type === "segment_rotated"
+    ? "compacting_context"
+    : event.type.startsWith("tool")
+      ? "tool"
+      : "provider";
   return { ...run, status: run.status === "cancelling" ? "cancelling" : "running", currentPhase, updatedAt: event.createdAt };
 }
 
@@ -233,6 +237,9 @@ export function runDisplayStatus(
     }
     if (activeRun.status === "cancelling") {
       return { label: reconnecting ? "cancelling · reconnecting" : "cancelling", tone: "cancelling" };
+    }
+    if (activeRun.currentPhase === "compacting_context") {
+      return { label: reconnecting ? "compacting context · reconnecting" : "compacting context", tone: "running" };
     }
     if (reconnecting) {
       return { label: "reconnecting", tone: "reconnecting" };

@@ -2,7 +2,9 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type {
   AgentDefinition,
   AgentListResponse,
+  CompactContextResponse,
   ContextPreviewResponse,
+  ContextSegmentDetail,
   CreateRunResponse,
   InvokeToolResponse,
   Message,
@@ -65,6 +67,8 @@ export function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [contextSegments, setContextSegments] = useState<ContextSegmentDetail[]>([]);
+  const [expandedSegmentMessages, setExpandedSegmentMessages] = useState<Record<string, Message[]>>({});
   const [input, setInput] = useState("");
   const [sendOnEnter, setSendOnEnter] = useState(readSendOnEnterPreference);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
@@ -85,6 +89,7 @@ export function App() {
   const [providerNotice, setProviderNotice] = useState<string | null>(null);
   const [contextPreview, setContextPreview] = useState<ContextPreviewResponse | null>(null);
   const [contextPreviewState, setContextPreviewState] = useState<LoadState>("idle");
+  const [contextCompactionState, setContextCompactionState] = useState<LoadState>("idle");
   const [workingDirectoryDraft, setWorkingDirectoryDraft] = useState("");
   const [workingDirectorySaveState, setWorkingDirectorySaveState] = useState<SaveState>("idle");
   const [workingDirectoryError, setWorkingDirectoryError] = useState<string | null>(null);
@@ -183,7 +188,10 @@ export function App() {
     setLastShellResponse(null);
     setContextPreview(null);
     setContextPreviewState("idle");
+    setContextCompactionState("idle");
     setMessages([]);
+    setContextSegments([]);
+    setExpandedSegmentMessages({});
     setProviderProfileId("");
     setModelOverride("");
     setReasoningEffort("");
@@ -299,8 +307,10 @@ export function App() {
       }
       const selection = selectRecoveredRun(activeRuns);
       let nextMessages: Message[];
+      let nextSegments: ContextSegmentDetail[];
       try {
         nextMessages = await requestJson<Message[]>(`/api/sessions/${sessionId}/messages`);
+        nextSegments = await requestJson<ContextSegmentDetail[]>(`/api/sessions/${sessionId}/context/segments`);
       } catch (requestError) {
         if (selection.run && recoveryId === sessionRecoveryIdRef.current && sessionId === selectedSessionIdRef.current) {
           setRunRecoveryWarning(selection.warning);
@@ -318,6 +328,13 @@ export function App() {
       }
       if (recoveryId !== sessionRecoveryIdRef.current || sessionId !== selectedSessionIdRef.current) {
         return;
+      }
+      setContextSegments(nextSegments);
+      const activeSegment = nextSegments.find((segment) => segment.status === "active");
+      if (activeSegment) {
+        setSessions((current) =>
+          current.map((item) => (item.id === sessionId ? { ...item, activeSegmentId: activeSegment.id } : item))
+        );
       }
 
       messagesShouldFollowRef.current = true;
@@ -365,6 +382,7 @@ export function App() {
     setError(null);
     try {
       const nextMessages = await requestJson<Message[]>(`/api/sessions/${sessionId}/messages`);
+      const nextSegments = await requestJson<ContextSegmentDetail[]>(`/api/sessions/${sessionId}/context/segments`);
       if (loadId !== messagesLoadIdRef.current || sessionId !== selectedSessionIdRef.current) {
         return;
       }
@@ -375,8 +393,42 @@ export function App() {
       setMessages((current) =>
         trackedRunId ? mergeSnapshotWithTrackedRun(nextMessages, current, trackedRunId) : nextMessages
       );
+      setContextSegments(nextSegments);
+      const activeSegment = nextSegments.find((segment) => segment.status === "active");
+      if (activeSegment) {
+        setSessions((current) =>
+          current.map((item) => (item.id === sessionId ? { ...item, activeSegmentId: activeSegment.id } : item))
+        );
+      }
     } catch (requestError) {
       if (loadId === messagesLoadIdRef.current && sessionId === selectedSessionIdRef.current) {
+        setError(toErrorMessage(requestError));
+      }
+    }
+  }
+
+  async function toggleSegmentMessages(segmentId: string) {
+    const sessionId = selectedSessionId;
+    const generation = sessionGenerationRef.current;
+    if (!sessionId) {
+      return;
+    }
+    if (expandedSegmentMessages[segmentId]) {
+      setExpandedSegmentMessages((current) => {
+        const next = { ...current };
+        delete next[segmentId];
+        return next;
+      });
+      return;
+    }
+    try {
+      const source = await requestJson<Message[]>(
+        `/api/sessions/${sessionId}/context/segments/${encodeURIComponent(segmentId)}/messages`
+      );
+      if (!isCurrentContextUiRequest(sessionId, generation, selectedSessionIdRef.current, sessionGenerationRef.current)) return;
+      setExpandedSegmentMessages((current) => ({ ...current, [segmentId]: source }));
+    } catch (requestError) {
+      if (isCurrentContextUiRequest(sessionId, generation, selectedSessionIdRef.current, sessionGenerationRef.current)) {
         setError(toErrorMessage(requestError));
       }
     }
@@ -770,6 +822,34 @@ export function App() {
     } catch (requestError) {
       if (isCurrentSessionOperation(sessionId, generation, requestId, contextPreviewRequestIdRef.current)) {
         setContextPreviewState("error");
+        setError(toErrorMessage(requestError));
+      }
+    }
+  }
+
+  async function compactContextNow() {
+    const sessionId = selectedSessionId;
+    const generation = sessionGenerationRef.current;
+    if (!sessionId || activeRun || selectedPendingPermissions.length > 0) {
+      return;
+    }
+    setContextCompactionState("loading");
+    setError(null);
+    try {
+      const response = await requestJson<CompactContextResponse>(`/api/sessions/${sessionId}/context/compact`, { method: "POST" });
+      if (!isCurrentContextUiRequest(sessionId, generation, selectedSessionIdRef.current, sessionGenerationRef.current)) return;
+      await loadSessions();
+      await loadMessages(sessionId, true);
+      if (!isCurrentContextUiRequest(sessionId, generation, selectedSessionIdRef.current, sessionGenerationRef.current)) return;
+      if (response.state === "failed") {
+        setContextCompactionState("error");
+        setError(response.message ?? "Context compaction failed; the active segment was unchanged.");
+      } else {
+        setContextCompactionState("idle");
+      }
+    } catch (requestError) {
+      if (isCurrentContextUiRequest(sessionId, generation, selectedSessionIdRef.current, sessionGenerationRef.current)) {
+        setContextCompactionState("error");
         setError(toErrorMessage(requestError));
       }
     }
@@ -1295,7 +1375,22 @@ export function App() {
 
             <div className="messages" ref={messagesScrollRef} onScroll={handleMessagesScroll}>
               <div className="messageStream">
-                {messages.length === 0 && <p className="muted empty">Create a session and send a message.</p>}
+                {contextSegments.find((segment) => segment.status === "active")?.recentFailure && (
+                  <div className="runRecoveryWarning">
+                    Recent context compaction failed; the active segment was preserved. Review Context details or retry Compact now.
+                  </div>
+                )}
+                {messages.length === 0 && !contextSegments.some((segment) => segment.status === "sealed") && (
+                  <p className="muted empty">Create a session and send a message.</p>
+                )}
+                {contextSegments.filter((segment) => segment.status === "sealed").map((segment) => (
+                  <ContextSegmentBoundary
+                    key={segment.id}
+                    segment={segment}
+                    messages={expandedSegmentMessages[segment.id]}
+                    onToggle={() => void toggleSegmentMessages(segment.id)}
+                  />
+                ))}
                 {messages.map((message) => (
                   <article className={`message ${message.role}`} key={message.id}>
                     <div className="messageMeta">
@@ -1451,6 +1546,8 @@ export function App() {
                   contextPreview,
                   contextPreviewState,
                   onPreviewContext: () => void previewContext(),
+                  compactionState: contextCompactionState,
+                  onCompactContext: () => void compactContextNow(),
                   shellTool,
                   sessionWorkingDirectory: selectedSession?.workingDirectory ?? null,
                   shellCommand,
@@ -1473,6 +1570,58 @@ export function App() {
       )}
     </main>
   );
+}
+
+export function ContextSegmentBoundary({
+  segment,
+  messages,
+  onToggle
+}: {
+  segment: ContextSegmentDetail;
+  messages?: Message[];
+  onToggle: () => void;
+}) {
+  return (
+    <section className="contextSegmentBoundary">
+      <strong>이전 맥락이 압축되었습니다</strong>
+      <p className="muted">원문을 펼쳐 읽어도 모델 context에 다시 포함되지는 않습니다.</p>
+      {segment.artifact && (
+        <details>
+          <summary>요약 보기</summary>
+          <p>{segment.artifact.summary}</p>
+          <small>
+            {segment.artifact.estimatedTokensBefore.toLocaleString()} → {segment.artifact.estimatedTokensAfter.toLocaleString()} tokens · {segment.artifact.strategyVersion} · {new Date(segment.artifact.createdAt).toLocaleString()}
+          </small>
+          <small>
+            source {segment.artifact.sourceFirstMessageId ?? "unknown"} → {segment.artifact.sourceLastMessageId ?? "unknown"}
+          </small>
+        </details>
+      )}
+      {segment.recentFailure && (
+        <p className="runRecoveryWarning">
+          Recent compaction failed: {segment.recentFailure.error ?? "unknown error"}. The active context was unchanged.
+        </p>
+      )}
+      <button type="button" onClick={onToggle}>
+        {messages ? "이전 원문 접기" : `원문 ${segment.messageCount.toLocaleString()}개 메시지 보기`}
+      </button>
+      {messages?.map((message) => (
+        <article className={`message ${message.role}`} key={message.id}>
+          <div className="messageMeta"><strong>{message.role}</strong><span>{message.status}</span></div>
+          <MessageBody message={message} />
+        </article>
+      ))}
+    </section>
+  );
+}
+
+export function isCurrentContextUiRequest(
+  requestedSessionId: string,
+  requestedGeneration: number,
+  currentSessionId: string | null,
+  currentGeneration: number
+): boolean {
+  return requestedSessionId === currentSessionId && requestedGeneration === currentGeneration;
 }
 
 function readSendOnEnterPreference(): boolean {

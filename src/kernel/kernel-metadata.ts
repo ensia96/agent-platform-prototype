@@ -3,6 +3,8 @@ import type { ProviderMessage } from "../providers/types";
 import type {
   AgentDefinition,
   BuiltContext,
+  ContextPlan,
+  ContextPlanRecord,
   JsonObject,
   MessagePart,
   ProviderProfile,
@@ -21,6 +23,7 @@ export interface RunExecutionSnapshot {
   runOptions: RunOptions;
   requestedRunOptions: RunOptions;
   unsupportedRunOptions: string[];
+  contextPolicy: AgentDefinition["contextPolicy"];
 }
 
 export function stringField(object: JsonObject, key: string): string {
@@ -135,7 +138,8 @@ export function buildRunMetadata(
       providerProfileId: providerResolution.providerProfileId,
       runOptions: runOptionsToJson(optionPlan.runOptions),
       requestedRunOptions: runOptionsToJson(optionPlan.requestedRunOptions),
-      unsupportedRunOptions: optionPlan.unsupportedRunOptions
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions,
+      contextPolicy: contextPolicyToJson(agent.contextPolicy)
     },
     providerProfileId: providerResolution.providerProfileId,
     providerProfileName: providerResolution.providerProfileName,
@@ -170,6 +174,7 @@ export function agentRunSnapshotToJson(agent: AgentDefinition, snapshotAt: strin
     systemPrompt: agent.systemPrompt,
     modelProfileId: agent.modelProfileId,
     defaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
+    contextPolicy: contextPolicyToJson(agent.contextPolicy),
     skillIds: uniqueStrings(agent.skillIds),
     toolIds: uniqueStrings(agent.toolIds),
     createdAt: agent.createdAt,
@@ -213,6 +218,7 @@ export function agentFromRunMetadata(metadata: JsonObject): AgentDefinition | nu
     systemPrompt,
     modelProfileId: typeof snapshot.modelProfileId === "string" && snapshot.modelProfileId.trim() ? snapshot.modelProfileId : null,
     defaultRunOptions: nonEmptyRunOptions(runOptionsFromJson(snapshot.defaultRunOptions)),
+    contextPolicy: contextPolicyFromJson(snapshot.contextPolicy),
     skillIds: stringArray(snapshot.skillIds),
     toolIds: stringArray(snapshot.toolIds),
     metadata: {},
@@ -236,10 +242,11 @@ export function executionSnapshotFromRunMetadata(metadata: JsonObject): RunExecu
   const unsupportedRunOptions = Array.isArray(snapshot.unsupportedRunOptions)
     ? snapshot.unsupportedRunOptions.filter((value): value is string => typeof value === "string")
     : null;
+  const contextPolicy = contextPolicyFromJson(snapshot.contextPolicy);
   if (!providerProfileId || !runOptions || !requestedRunOptions || !unsupportedRunOptions) {
     return null;
   }
-  return { providerProfileId, runOptions, requestedRunOptions, unsupportedRunOptions };
+  return { providerProfileId, runOptions, requestedRunOptions, unsupportedRunOptions, contextPolicy };
 }
 
 function providerResolutionToJson(resolution: ProviderResolution): JsonObject {
@@ -286,10 +293,17 @@ function runOptionsToJson(options: RunOptions): JsonObject {
   return output;
 }
 
-export function buildContextRunMetadata(context: BuiltContext, warnings: string[], skippedMessageIds: string[]): JsonObject {
+export function buildContextRunMetadata(
+  context: BuiltContext,
+  warnings: string[],
+  skippedMessageIds: string[],
+  initialRecord: ContextPlanRecord
+): JsonObject {
   const metadata: JsonObject = {
-    contextSnapshot: builtContextToJson(context),
-    contextBuilder: contextSummaryToJson(context, warnings, skippedMessageIds)
+    contextSnapshot: builtContextToJson(context, initialRecord.planId),
+    contextBuilder: contextSummaryToJson(context, warnings, skippedMessageIds),
+    contextPlanRecords: [contextPlanRecordToJson(initialRecord)],
+    latestContextPlanId: initialRecord.planId
   };
   if (warnings.length > 0) {
     metadata.contextWarnings = warnings;
@@ -312,11 +326,23 @@ export function contextSummaryToJson(context: BuiltContext, warnings: string[], 
     availableToolIds: context.availableTools.map((tool) => tool.id),
     runOptions: runOptionsToJson(context.runOptions),
     warningCount: warnings.length,
-    skippedMessageIds
+    skippedMessageIds,
+    contextWindowTokens: context.plan.windowTokens,
+    contextWindowSource: context.plan.windowSource,
+    contextInputBudgetTokens: context.plan.inputBudgetTokens,
+    estimatedContextInputTokens: context.plan.estimatedInputTokens,
+    providerNeutralContextTokens: context.plan.providerNeutralTokens,
+    nativeContextOverheadTokens: context.plan.nativeOverheadTokens,
+    contextCapabilityStale: context.plan.capabilityStale,
+    contextTrimmingApplied: context.plan.trimmingApplied,
+    activeContextSegmentId: context.plan.activeSegmentId,
+    inheritedContextArtifactId: context.plan.inheritedArtifactId,
+    contextCompactionRecommended: context.plan.compactionRecommended,
+    contextCompactionReason: context.plan.compactionReason
   };
 }
 
-function builtContextToJson(context: BuiltContext): JsonObject {
+function builtContextToJson(context: BuiltContext, contextPlanRef: string): JsonObject {
   const output: JsonObject = {
     agent: agentToJson(context.agent),
     systemPrompt: context.systemPrompt,
@@ -331,7 +357,8 @@ function builtContextToJson(context: BuiltContext): JsonObject {
       metadata: tool.metadata
     })),
     runOptions: runOptionsToJson(context.runOptions),
-    metadata: context.metadata
+    metadata: context.metadata,
+    contextPlanRef
   };
   if (context.providerProfileId) {
     output.providerProfileId = context.providerProfileId;
@@ -345,7 +372,63 @@ function builtContextToJson(context: BuiltContext): JsonObject {
   return output;
 }
 
+export function contextPlanToJson(plan: ContextPlan): JsonObject {
+  return {
+    windowTokens: plan.windowTokens,
+    windowSource: plan.windowSource,
+    reservedOutputTokens: plan.reservedOutputTokens,
+    safetyMarginTokens: plan.safetyMarginTokens,
+    inputBudgetTokens: plan.inputBudgetTokens,
+    estimatedInputTokens: plan.estimatedInputTokens,
+    providerNeutralTokens: plan.providerNeutralTokens,
+    nativeOverheadTokens: plan.nativeOverheadTokens,
+    capabilityStale: plan.capabilityStale,
+    historyWatermark: plan.historyWatermark,
+    historyThroughMessageId: plan.historyThroughMessageId,
+    selectedHistoryFromMessageId: plan.selectedHistoryFromMessageId,
+    selectedHistoryThroughMessageId: plan.selectedHistoryThroughMessageId,
+    activeSegmentId: plan.activeSegmentId,
+    inheritedArtifactId: plan.inheritedArtifactId,
+    preTrimEstimatedInputTokens: plan.preTrimEstimatedInputTokens,
+    compactionRecommended: plan.compactionRecommended,
+    compactionReason: plan.compactionReason,
+    included: plan.included.map(contextPlanItemToJson),
+    omitted: plan.omitted.map(contextPlanItemToJson),
+    trimmingApplied: plan.trimmingApplied,
+    estimatorVersion: plan.estimatorVersion
+  };
+}
+
+export function contextPlanRecordToJson(record: ContextPlanRecord): JsonObject {
+  return {
+    planId: record.planId,
+    providerTurn: record.providerTurn,
+    toolIteration: record.toolIteration,
+    createdAt: record.createdAt,
+    plan: contextPlanToJson(record.plan)
+  };
+}
+
+function contextPlanItemToJson(item: ContextPlan["included"][number]): JsonObject {
+  return {
+    kind: item.kind,
+    sourceIds: item.sourceIds,
+    estimatedTokens: item.estimatedTokens,
+    retention: item.retention,
+    ...(item.reason ? { reason: item.reason } : {})
+  };
+}
+
 function contextMessageToJson(message: BuiltContext["messages"][number]): JsonObject {
+  if (message.source === "compaction") {
+    return {
+      role: message.role,
+      source: message.source,
+      messageId: message.messageId ?? null,
+      artifactRef: message.metadata?.artifactId ?? message.messageId ?? null,
+      contentLength: message.content.length
+    };
+  }
   const output: JsonObject = {
     role: message.role,
     content: message.content
@@ -385,6 +468,7 @@ export function agentToJson(agent: AgentDefinition): JsonObject {
     description: agent.description,
     modelProfileId: agent.modelProfileId,
     defaultRunOptions: runOptionsToJson(agent.defaultRunOptions ?? {}),
+    contextPolicy: contextPolicyToJson(agent.contextPolicy),
     skillIds: agent.skillIds,
     toolIds: agent.toolIds,
     metadata: agent.metadata,
@@ -409,6 +493,47 @@ export function runOptionsFromJson(value: unknown): RunOptions | null {
     temperature: numberField(object, "temperature") ?? undefined
   });
   return options;
+}
+
+function contextPolicyToJson(policy: AgentDefinition["contextPolicy"]): JsonObject {
+  const output: JsonObject = {};
+  if (policy?.contextWindowTokensOverride !== undefined) {
+    output.contextWindowTokensOverride = policy.contextWindowTokensOverride;
+  }
+  if (policy?.reservedOutputTokens !== undefined) {
+    output.reservedOutputTokens = policy.reservedOutputTokens;
+  }
+  if (policy?.safetyMarginRatio !== undefined) {
+    output.safetyMarginRatio = policy.safetyMarginRatio;
+  }
+  if (policy?.automaticCompaction !== undefined) {
+    output.automaticCompaction = policy.automaticCompaction;
+  }
+  return output;
+}
+
+function contextPolicyFromJson(value: unknown): AgentDefinition["contextPolicy"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const object = value as JsonObject;
+  const policy: NonNullable<AgentDefinition["contextPolicy"]> = {};
+  const windowTokens = numberField(object, "contextWindowTokensOverride");
+  const reservedOutputTokens = numberField(object, "reservedOutputTokens");
+  const safetyMarginRatio = numberField(object, "safetyMarginRatio");
+  if (windowTokens !== null) {
+    policy.contextWindowTokensOverride = windowTokens;
+  }
+  if (reservedOutputTokens !== null) {
+    policy.reservedOutputTokens = reservedOutputTokens;
+  }
+  if (safetyMarginRatio !== null) {
+    policy.safetyMarginRatio = safetyMarginRatio;
+  }
+  if (typeof object.automaticCompaction === "boolean") {
+    policy.automaticCompaction = object.automaticCompaction;
+  }
+  return Object.keys(policy).length > 0 ? policy : null;
 }
 
 function nonEmptyRunOptions(options: RunOptions | null): RunOptions | null {

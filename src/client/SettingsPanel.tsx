@@ -33,6 +33,10 @@ export interface AgentProfileDraft {
   model: string;
   reasoningEffort: string;
   temperature: string;
+  contextWindowTokensOverride: string;
+  reservedOutputTokens: string;
+  safetyMarginPercent: string;
+  automaticCompaction: boolean;
   toolIds: string[];
 }
 
@@ -343,6 +347,7 @@ export function SettingsPanel({
           systemPrompt: agentDraft.systemPrompt,
           modelProfileId: agentDraft.modelProfileId || null,
           defaultRunOptions: runOptionsFromAgentDraft(agentDraft),
+          contextPolicy: contextPolicyFromAgentDraft(agentDraft),
           toolIds: agentDraft.toolIds
         })
       });
@@ -791,7 +796,7 @@ export function SettingsPanel({
                         {agentDraft.model && !agentCatalog.models.some((model) => model.id === agentDraft.model) && (
                           <option value={agentDraft.model}>{agentDraft.model} (saved, unavailable)</option>
                         )}
-                        {agentCatalog.models.map((model) => <option key={model.id} value={model.id}>{model.displayName ?? model.id}</option>)}
+                        {agentCatalog.models.map((model) => <option key={model.id} value={model.id}>{formatCatalogModelLabel(model)}</option>)}
                       </select>
                     ) : (
                       <>
@@ -802,7 +807,7 @@ export function SettingsPanel({
                           list="agent-profile-model-catalog"
                         />
                         <datalist id="agent-profile-model-catalog">
-                          {agentCatalog?.models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}
+                          {agentCatalog?.models.map((model) => <option key={model.id} value={model.id}>{formatCatalogModelLabel(model)}</option>)}
                         </datalist>
                       </>
                     )}
@@ -850,6 +855,60 @@ export function SettingsPanel({
                       {agentTemperatureUnsupported && <span className="muted">Unsupported by this provider; existing values are metadata-only.</span>}
                     </label>
                   </div>
+
+                  <details className="agentContextPolicy">
+                    <summary>Context budget policy</summary>
+                    <p className="muted">
+                      Optional conservative planning overrides. Empty values use the catalog capability or the clearly marked 16k assumed fallback.
+                    </p>
+                    <div className="inspectorFormRow">
+                      <label className="settingEditor">
+                        Context window override
+                        <input
+                          type="number"
+                          min="1024"
+                          max="2000000"
+                          step="1"
+                          value={agentDraft.contextWindowTokensOverride}
+                          onChange={(event) => updateAgentDraft({ contextWindowTokensOverride: event.target.value })}
+                          placeholder="catalog / assumed 16384"
+                        />
+                      </label>
+                      <label className="settingEditor">
+                        Reserved output tokens (planning only)
+                        <input
+                          type="number"
+                          min="128"
+                          max="500000"
+                          step="1"
+                          value={agentDraft.reservedOutputTokens}
+                          onChange={(event) => updateAgentDraft({ reservedOutputTokens: event.target.value })}
+                          placeholder="default 2048"
+                        />
+                      </label>
+                      <label className="settingEditor">
+                        Safety margin (%)
+                        <input
+                          type="number"
+                          min="0"
+                          max="50"
+                          step="0.1"
+                          value={agentDraft.safetyMarginPercent}
+                          onChange={(event) => updateAgentDraft({ safetyMarginPercent: event.target.value })}
+                          placeholder="default 10"
+                        />
+                      </label>
+                    </div>
+                    <p className="muted">This reserve reduces the input budget; it is not sent as a provider output-token cap.</p>
+                    <label className="settingCheckbox">
+                      <input
+                        type="checkbox"
+                        checked={agentDraft.automaticCompaction}
+                        onChange={(event) => updateAgentDraft({ automaticCompaction: event.target.checked })}
+                      />
+                      Automatically compact finalized older turns when context pressure is high
+                    </label>
+                  </details>
 
                   <fieldset className="settingEditor agentToolAllowlist">
                     <legend>Model tool allowlist</legend>
@@ -1121,6 +1180,7 @@ function ProviderModelCatalogPanel({ catalog }: { catalog: ProviderModelCatalog 
               <li key={model.id}>
                 <code>{model.id}</code>
                 {model.displayName && model.displayName !== model.id && <span>{model.displayName}</span>}
+                {model.context && <span>{model.context.windowTokens.toLocaleString()} context tokens · {model.context.source}</span>}
                 {model.description && <span className="muted">{model.description}</span>}
                 <span className="muted">{formatCatalogReasoning(model.reasoning)}</span>
                 {model.owner && <span className="muted">owner: {model.owner}</span>}
@@ -1224,6 +1284,10 @@ function emptyAgentDraft(): AgentProfileDraft {
     model: "",
     reasoningEffort: "",
     temperature: "",
+    contextWindowTokensOverride: "",
+    reservedOutputTokens: "",
+    safetyMarginPercent: "",
+    automaticCompaction: true,
     toolIds: []
   };
 }
@@ -1237,6 +1301,12 @@ function agentDraftFromDefinition(agent: AgentDefinition): AgentProfileDraft {
     model: agent.defaultRunOptions?.model ?? "",
     reasoningEffort: agent.defaultRunOptions?.reasoningEffort ?? "",
     temperature: agent.defaultRunOptions?.temperature === undefined ? "" : String(agent.defaultRunOptions.temperature),
+    contextWindowTokensOverride:
+      agent.contextPolicy?.contextWindowTokensOverride === undefined ? "" : String(agent.contextPolicy.contextWindowTokensOverride),
+    reservedOutputTokens: agent.contextPolicy?.reservedOutputTokens === undefined ? "" : String(agent.contextPolicy.reservedOutputTokens),
+    safetyMarginPercent:
+      agent.contextPolicy?.safetyMarginRatio === undefined ? "" : String(agent.contextPolicy.safetyMarginRatio * 100),
+    automaticCompaction: agent.contextPolicy?.automaticCompaction !== false,
     toolIds: [...agent.toolIds]
   };
 }
@@ -1254,6 +1324,10 @@ export function isAgentProfileDraftDirty(agent: AgentDefinition | null, draft: A
     draft.model !== loaded.model ||
     draft.reasoningEffort !== loaded.reasoningEffort ||
     draft.temperature !== loaded.temperature ||
+    draft.contextWindowTokensOverride !== loaded.contextWindowTokensOverride ||
+    draft.reservedOutputTokens !== loaded.reservedOutputTokens ||
+    draft.safetyMarginPercent !== loaded.safetyMarginPercent ||
+    draft.automaticCompaction !== loaded.automaticCompaction ||
     draft.toolIds.length !== loaded.toolIds.length ||
     draft.toolIds.some((toolId, index) => toolId !== loaded.toolIds[index])
   );
@@ -1275,6 +1349,21 @@ function runOptionsFromAgentDraft(draft: AgentProfileDraft): RunOptions | null {
     options.temperature = Number(draft.temperature);
   }
   return Object.keys(options).length > 0 ? options : null;
+}
+
+function contextPolicyFromAgentDraft(draft: AgentProfileDraft): AgentDefinition["contextPolicy"] {
+  const policy: NonNullable<AgentDefinition["contextPolicy"]> = {};
+  if (draft.contextWindowTokensOverride.trim()) {
+    policy.contextWindowTokensOverride = Number(draft.contextWindowTokensOverride);
+  }
+  if (draft.reservedOutputTokens.trim()) {
+    policy.reservedOutputTokens = Number(draft.reservedOutputTokens);
+  }
+  if (draft.safetyMarginPercent.trim()) {
+    policy.safetyMarginRatio = Number(draft.safetyMarginPercent) / 100;
+  }
+  policy.automaticCompaction = draft.automaticCompaction;
+  return Object.keys(policy).length > 0 ? policy : null;
 }
 
 function compareAgentProfiles(left: AgentDefinition, right: AgentDefinition): number {
@@ -1332,6 +1421,11 @@ export function formatRunOptions(options: RunOptions | null | undefined): string
     options.temperature !== undefined ? `temperature=${options.temperature}` : ""
   ].filter(Boolean);
   return parts.join(", ");
+}
+
+function formatCatalogModelLabel(model: ProviderModelCatalog["models"][number]): string {
+  const name = model.displayName && model.displayName !== model.id ? `${model.displayName} (${model.id})` : model.id;
+  return model.context ? `${name} · ${model.context.windowTokens.toLocaleString()} context (${model.context.source})` : name;
 }
 
 function formatRunOptionSupport(support: NonNullable<ProviderProfile["runOptionSupport"]>): string {

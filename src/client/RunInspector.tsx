@@ -91,6 +91,8 @@ export interface RunInspectorProps {
     contextPreview: ContextPreviewResponse | null;
     contextPreviewState: LoadState;
     onPreviewContext: () => void;
+    compactionState: LoadState;
+    onCompactContext: () => void;
     shellTool: ToolDefinition | null;
     sessionWorkingDirectory: string | null;
     shellCommand: string;
@@ -299,7 +301,7 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                   <option value="">provider/default{defaultModelId ? ` (${defaultModelId})` : ""}</option>
                   {setup.modelCatalog?.models.map((model) => (
                     <option key={model.id} value={model.id}>
-                      {model.displayName && model.displayName !== model.id ? `${model.displayName} (${model.id})` : model.id}
+                      {modelOptionLabel(model)}
                     </option>
                   ))}
                 </select>
@@ -313,7 +315,7 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                     disabled={setup.disabled}
                   />
                   <datalist id="run-model-catalog">
-                    {setup.modelCatalog?.models.map((model) => <option key={model.id} value={model.id}>{model.displayName}</option>)}
+                    {setup.modelCatalog?.models.map((model) => <option key={model.id} value={model.id}>{modelOptionLabel(model)}</option>)}
                   </datalist>
                 </>
               )}
@@ -389,6 +391,18 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                   <dd>{runStatus.connectionState}</dd>
                   <dt>Phase</dt>
                   <dd>{runStatus.activeRun.currentPhase ?? runStatus.activeRun.status}</dd>
+                  {runStatus.activeRun.context && (
+                    <>
+                      <dt>Context estimate</dt>
+                      <dd>
+                        {runStatus.activeRun.context.estimatedInputTokens.toLocaleString()} / {runStatus.activeRun.context.inputBudgetTokens.toLocaleString()}
+                        {` · ${runStatus.activeRun.context.windowSource}`}
+                        {runStatus.activeRun.context.capabilityStale ? " · stale" : ""}
+                        {` · provider turn ${runStatus.activeRun.context.providerTurn}`}
+                        {runStatus.activeRun.context.trimmingApplied ? " · trimmed" : ""}
+                      </dd>
+                    </>
+                  )}
                 </dl>
                 <div className="inspectorCancelRow">
                   <span className="inspectorHint">Best-effort; completed side effects remain.</span>
@@ -446,6 +460,13 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                 </div>
                 <button type="button" onClick={advanced.onPreviewContext} disabled={setup.disabled || advanced.contextPreviewState === "loading"}>
                   {advanced.contextPreviewState === "loading" ? "Previewing..." : "Preview"}
+                </button>
+                <button
+                  type="button"
+                  onClick={advanced.onCompactContext}
+                  disabled={setup.disabled || advanced.compactionState === "loading" || Boolean(runStatus.activeRun) || permissions.items.length > 0}
+                >
+                  {advanced.compactionState === "loading" ? "Compacting..." : "Compact now"}
                 </button>
               </div>
               {advanced.contextPreview && <ContextPreviewPanel preview={advanced.contextPreview} />}
@@ -522,6 +543,22 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
       <p className="contextPreviewSummary">
         {preview.context.agent.name} · {preview.context.messages.length} messages · {preview.providerResolution.providerProfileName}
       </p>
+      <dl className="inspectorDetails contextBudgetSummary">
+        <dt>Context window</dt><dd>{preview.plan.windowTokens.toLocaleString()} tokens · {preview.plan.windowSource}{preview.plan.capabilityStale ? " · stale last-good" : ""}</dd>
+        <dt>Output reserve</dt><dd>{preview.plan.reservedOutputTokens.toLocaleString()} · planning only, not a provider output cap</dd>
+        <dt>Safety margin</dt><dd>{preview.plan.safetyMarginTokens.toLocaleString()}</dd>
+        <dt>Input budget</dt><dd>{preview.plan.inputBudgetTokens.toLocaleString()}</dd>
+        <dt>Provider-neutral content</dt><dd>{preview.plan.providerNeutralTokens.toLocaleString()} · estimated</dd>
+        <dt>Provider-native overhead</dt><dd>{preview.plan.nativeOverheadTokens.toLocaleString()} · estimated</dd>
+        <dt>Total estimated input</dt><dd>{preview.plan.estimatedInputTokens.toLocaleString()} · estimated</dd>
+        <dt>Trimming</dt><dd>{preview.plan.trimmingApplied ? "applied" : "not needed"}</dd>
+        <dt>History watermark</dt><dd>{preview.plan.historyWatermark ?? "none"}</dd>
+        <dt>Selected suffix</dt><dd>{preview.plan.selectedHistoryFromMessageId ? `${preview.plan.selectedHistoryFromMessageId} → ${preview.plan.selectedHistoryThroughMessageId}` : "none"}</dd>
+        <dt>Active segment</dt><dd>{preview.plan.activeSegmentId ?? "none"}</dd>
+        <dt>Inherited summary</dt><dd>{preview.plan.inheritedArtifactId ?? "none"}</dd>
+        <dt>Compaction</dt><dd>{preview.plan.compactionRecommended ? `recommended · ${preview.plan.compactionReason}` : "not recommended"}</dd>
+        <dt>Estimator</dt><dd>{preview.plan.estimatorVersion}</dd>
+      </dl>
       <div className="contextPreviewGrid">
         <section>
           <h4>System prompt</h4>
@@ -569,10 +606,28 @@ function ContextPreviewPanel({ preview }: { preview: ContextPreviewResponse }) {
             ))
           )}
         </section>
+        <section className="contextMessagesPreview">
+          <h4>Context plan</h4>
+          <p className="inspectorHint">Safe source IDs and estimates only; no candidate content is copied into this plan.</p>
+          {[...preview.plan.included.map((item) => ({ ...item, state: "included" })), ...preview.plan.omitted.map((item) => ({ ...item, state: "omitted" }))].map(
+            (item, index) => (
+              <div className="contextMessage" key={`${item.state}-${item.kind}-${index}`}>
+                <strong>{item.state} · {item.kind} · {item.estimatedTokens} estimated tokens</strong>
+                <span className="contextPartTypes">{item.retention}{item.reason ? ` · ${item.reason}` : ""}</span>
+                <pre>{item.sourceIds.join("\n")}</pre>
+              </div>
+            )
+          )}
+        </section>
       </div>
       {preview.warnings.length > 0 && <p className="inspectorHint">Warnings: {preview.warnings.join(" ")}</p>}
     </div>
   );
+}
+
+function modelOptionLabel(model: ProviderModelCatalog["models"][number]): string {
+  const name = model.displayName && model.displayName !== model.id ? `${model.displayName} (${model.id})` : model.id;
+  return model.context ? `${name} · ${model.context.windowTokens.toLocaleString()} context (${model.context.source})` : name;
 }
 
 function modelCatalogSummary(

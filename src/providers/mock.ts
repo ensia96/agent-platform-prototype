@@ -2,10 +2,17 @@ import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderR
 import type { ProviderModelCatalog, ProviderProfile, ProviderTestResponse } from "../shared/types";
 
 export const mockModelId = "mock-stream-v1";
+export const mockContextWindowTokens = 32_768;
 
 export class MockProvider implements ProviderAdapter {
   readonly id = "mock";
   readonly label = "Mock streaming provider";
+  readonly contextPlanning = {
+    requiredInstructions: [],
+    fixedWrapperTokens: 16,
+    perMessageTokens: 6,
+    toolEnvelopeTokens: 16
+  };
 
   async test(profile: ProviderProfile, _credential: ProviderCredential): Promise<ProviderTestResponse> {
     const checkedAt = new Date().toISOString();
@@ -38,7 +45,8 @@ export class MockProvider implements ProviderAdapter {
           id: mockModelId,
           displayName: "Local mock streaming model",
           description: "Deterministic local fixture model used to verify streaming without provider credentials.",
-          reasoning: { support: "unsupported", efforts: [] }
+          reasoning: { support: "unsupported", efforts: [] },
+          context: { windowTokens: mockContextWindowTokens, source: "adapter" }
         }
       ]
     };

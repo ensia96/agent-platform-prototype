@@ -12,6 +12,7 @@ import type {
   CreateMessageInput,
   CreateRunInput,
   CreateSessionInput,
+  CreateContextArtifactInput,
   DaemonLeaseRecord,
   FinalizeRunInput,
   FinalizeRunResult,
@@ -19,6 +20,8 @@ import type {
   ListRunsFilter,
   RunCancellationResult,
   RequestRunCancellationInput,
+  RotateContextSegmentInput,
+  ReplaceInheritedContextArtifactInput,
   StoreAdapter,
   StoredPermissionRequest,
   DeleteAgentDefinitionResult,
@@ -28,10 +31,13 @@ import type {
   UpdateMessagePartInput,
   UpsertMessageTextPartInput
 } from "./types";
-import { ActiveRunExistsStoreError } from "./types";
+import { ActiveRunExistsStoreError, ContextSegmentChangedStoreError } from "./types";
 import type {
   ActiveRunStatus,
   AgentDefinition,
+  ContextArtifact,
+  ContextArtifactSourceCategory,
+  ContextSegment,
   JsonObject,
   JsonValue,
   Message,
@@ -61,6 +67,7 @@ type SessionRow = {
   title: string;
   working_directory: string | null;
   agent_id: string;
+  active_segment_id: string;
   created_at: string;
   updated_at: string;
 };
@@ -70,6 +77,7 @@ type RunRow = {
   session_id: string;
   provider: string;
   status: RunStatus;
+  segment_id: string;
   created_at: string;
   updated_at: string;
   error: string | null;
@@ -80,12 +88,53 @@ type MessageRow = {
   id: string;
   session_id: string;
   run_id: string | null;
+  segment_id: string;
   role: MessageRole;
   status: MessageStatus;
   created_at: string;
   updated_at: string;
   metadata_json: string;
   run_error: string | null;
+};
+
+type ContextSegmentRow = {
+  id: string;
+  session_id: string;
+  ordinal: number;
+  previous_segment_id: string | null;
+  status: "active" | "sealed";
+  first_message_id: string | null;
+  last_message_id: string | null;
+  inherited_artifact_id: string | null;
+  created_at: string;
+  sealed_at: string | null;
+  message_count: number;
+};
+
+type ContextArtifactRow = {
+  id: string;
+  kind: "compaction";
+  session_id: string;
+  source_segment_id: string;
+  target_segment_id: string | null;
+  previous_artifact_id: string | null;
+  source_message_ids_json: string;
+  source_categories_json: string;
+  source_first_message_id: string | null;
+  source_last_message_id: string | null;
+  summary: string;
+  strategy_version: string;
+  estimator_version: string;
+  estimated_tokens_before: number;
+  estimated_tokens_after: number;
+  resolved_window_tokens: number;
+  window_source: ContextArtifact["windowSource"];
+  status: "completed" | "failed";
+  provider_profile_id: string | null;
+  model: string | null;
+  usage_json: string;
+  error: string | null;
+  created_at: string;
 };
 
 type MessagePartRow = {
@@ -124,6 +173,7 @@ type AgentDefinitionRow = {
   system_prompt: string;
   model_profile_id: string | null;
   default_run_options_json: string;
+  context_policy_json: string;
   skill_ids_json: string;
   tool_ids_json: string;
   metadata_json: string;
@@ -182,25 +232,36 @@ export class SQLiteStore implements StoreAdapter {
 
   listSessions(): Session[] {
     const rows = this.db
-      .prepare("SELECT id, title, working_directory, agent_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
+      .prepare("SELECT id, title, working_directory, agent_id, active_segment_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
       .all() as SessionRow[];
     return rows.map((row) => rowToSession(row, this.defaultWorkingDirectory));
   }
 
   getSession(id: string): Session | null {
     const row = this.db
-      .prepare("SELECT id, title, working_directory, agent_id, created_at, updated_at FROM sessions WHERE id = ?")
+      .prepare("SELECT id, title, working_directory, agent_id, active_segment_id, created_at, updated_at FROM sessions WHERE id = ?")
       .get(id) as SessionRow | undefined;
     return row ? rowToSession(row, this.defaultWorkingDirectory) : null;
   }
 
   createSession(input: CreateSessionInput): Session {
-    this.db
-      .prepare(
-        `INSERT INTO sessions (id, title, working_directory, agent_id, created_at, updated_at, metadata_json)
-         VALUES (@id, @title, @workingDirectory, @agentId, @createdAt, @updatedAt, '{}')`
-      )
-      .run({ ...input, agentId: input.agentId ?? "main" });
+    const activeSegmentId = input.activeSegmentId ?? `segment:${input.id}:0`;
+    const create = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO sessions (id, title, working_directory, agent_id, active_segment_id, created_at, updated_at, metadata_json)
+           VALUES (@id, @title, @workingDirectory, @agentId, @activeSegmentId, @createdAt, @updatedAt, '{}')`
+        )
+        .run({ ...input, activeSegmentId, agentId: input.agentId ?? "main" });
+      this.db
+        .prepare(
+          `INSERT INTO context_segments
+             (id, session_id, ordinal, previous_segment_id, status, created_at)
+           VALUES (?, ?, 0, NULL, 'active', ?)`
+        )
+        .run(activeSegmentId, input.id, input.createdAt);
+    });
+    create.immediate();
     return this.getSession(input.id)!;
   }
 
@@ -231,7 +292,7 @@ export class SQLiteStore implements StoreAdapter {
   listSessionsByAgentId(agentId: string): Session[] {
     const rows = this.db
       .prepare(
-        `SELECT id, title, working_directory, agent_id, created_at, updated_at
+         `SELECT id, title, working_directory, agent_id, active_segment_id, created_at, updated_at
          FROM sessions
          WHERE agent_id = ?
          ORDER BY updated_at DESC, created_at DESC, id ASC`
@@ -244,14 +305,296 @@ export class SQLiteStore implements StoreAdapter {
     this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?").run(updatedAt, id);
   }
 
+  listContextSegments(sessionId: string): ContextSegment[] {
+    const rows = this.db
+      .prepare(
+        `SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.segment_id = s.id) AS message_count
+         FROM context_segments s WHERE s.session_id = ? ORDER BY s.ordinal ASC`
+      )
+      .all(sessionId) as ContextSegmentRow[];
+    return rows.map(rowToContextSegment);
+  }
+
+  getContextSegment(id: string): ContextSegment | null {
+    const row = this.db
+      .prepare(
+        `SELECT s.*, (SELECT COUNT(*) FROM messages m WHERE m.segment_id = s.id) AS message_count
+         FROM context_segments s WHERE s.id = ?`
+      )
+      .get(id) as ContextSegmentRow | undefined;
+    return row ? rowToContextSegment(row) : null;
+  }
+
+  listContextArtifacts(sessionId: string): ContextArtifact[] {
+    const rows = this.db
+      .prepare("SELECT * FROM context_artifacts WHERE session_id = ? ORDER BY created_at ASC, id ASC")
+      .all(sessionId) as ContextArtifactRow[];
+    return rows.map(rowToContextArtifact);
+  }
+
+  getContextArtifact(id: string): ContextArtifact | null {
+    const row = this.db.prepare("SELECT * FROM context_artifacts WHERE id = ?").get(id) as ContextArtifactRow | undefined;
+    return row ? rowToContextArtifact(row) : null;
+  }
+
+  createContextArtifact(input: CreateContextArtifactInput): ContextArtifact {
+    const targetSegmentId = input.targetSegmentId ?? null;
+    const source = this.getContextSegment(input.sourceSegmentId);
+    const target = targetSegmentId ? this.getContextSegment(targetSegmentId) : null;
+    const previous = input.previousArtifactId ? this.getContextArtifact(input.previousArtifactId) : null;
+    if (
+      !source ||
+      source.sessionId !== input.sessionId ||
+      (targetSegmentId && (!target || target.sessionId !== input.sessionId)) ||
+      (input.previousArtifactId && (!previous || previous.sessionId !== input.sessionId || previous.status !== "completed"))
+    ) {
+      throw new Error("Context artifact session/source/lineage invariant failed.");
+    }
+    this.insertContextArtifact({ ...input, targetSegmentId });
+    return this.getContextArtifact(input.id)!;
+  }
+
+  rotateContextSegment(input: RotateContextSegmentInput): { segment: ContextSegment; artifact: ContextArtifact } | null {
+    const rotate = this.db.transaction(() => {
+      const session = this.db
+        .prepare("SELECT active_segment_id FROM sessions WHERE id = ?")
+        .get(input.sessionId) as { active_segment_id: string | null } | undefined;
+      if (session?.active_segment_id !== input.expectedActiveSegmentId) {
+        return null;
+      }
+      const activeRun = this.db
+        .prepare(
+          `SELECT id FROM runs WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'cancelling')
+           AND (? IS NULL OR id <> ?) LIMIT 1`
+        )
+        .get(input.sessionId, input.allowedActiveRunId ?? null, input.allowedActiveRunId ?? null) as { id: string } | undefined;
+      if (activeRun) {
+        return null;
+      }
+      const source = this.getContextSegment(input.expectedActiveSegmentId);
+      if (!source || source.status !== "active" || source.sessionId !== input.sessionId) {
+        return null;
+      }
+      if (
+        input.artifact.sessionId !== input.sessionId ||
+        input.artifact.sourceSegmentId !== source.id ||
+        input.artifact.status !== "completed" ||
+        input.artifact.previousArtifactId !== source.inheritedArtifactId ||
+        input.artifact.targetSegmentId !== null
+      ) {
+        return null;
+      }
+      const sourceIds = input.artifact.sourceMessageIds;
+      if (sourceIds.length === 0) {
+        return null;
+      }
+      const categorizedSourceIds = input.artifact.sourceCategories.flatMap((category) => category.messageIds);
+      if (
+        !sameStringSet(sourceIds, categorizedSourceIds) ||
+        input.artifact.sourceFirstMessageId !== sourceIds[0] ||
+        input.artifact.sourceLastMessageId !== sourceIds[sourceIds.length - 1]
+      ) return null;
+      const placeholders = sourceIds.map(() => "?").join(", ");
+      const sourceCount = (this.db
+        .prepare(`SELECT COUNT(*) AS count FROM messages WHERE segment_id = ? AND id IN (${placeholders})`)
+        .get(input.expectedActiveSegmentId, ...sourceIds) as { count: number }).count;
+      if (sourceCount !== sourceIds.length) {
+        return null;
+      }
+      const expectedMessageIds = [...sourceIds, ...input.preservedMessageIds];
+      const currentMessageRows = this.db
+        .prepare("SELECT id, run_id FROM messages WHERE session_id = ? AND segment_id = ?")
+        .all(input.sessionId, input.expectedActiveSegmentId) as Array<{ id: string; run_id: string | null }>;
+      if (
+        new Set(expectedMessageIds).size !== expectedMessageIds.length ||
+        !sameStringSet(expectedMessageIds, currentMessageRows.map((row) => row.id))
+      ) {
+        return null;
+      }
+      const expectedRunIds = [...input.sourceRunIds, ...input.preservedRunIds];
+      const currentRunRows = this.db
+        .prepare("SELECT id FROM runs WHERE session_id = ? AND segment_id = ?")
+        .all(input.sessionId, input.expectedActiveSegmentId) as Array<{ id: string }>;
+      if (
+        new Set(expectedRunIds).size !== expectedRunIds.length ||
+        !sameStringSet(expectedRunIds, currentRunRows.map((row) => row.id))
+      ) {
+        return null;
+      }
+      const sourceMessageSet = new Set(sourceIds);
+      const preservedMessageSet = new Set(input.preservedMessageIds);
+      const sourceRunSet = new Set(input.sourceRunIds);
+      const preservedRunSet = new Set(input.preservedRunIds);
+      for (const runId of expectedRunIds) {
+        const runMessages = currentMessageRows.filter((row) => row.run_id === runId);
+        if (runMessages.length === 0) {
+          if (!preservedRunSet.has(runId)) return null;
+          continue;
+        }
+        const hasSource = runMessages.some((row) => sourceMessageSet.has(row.id));
+        const hasPreserved = runMessages.some((row) => preservedMessageSet.has(row.id));
+        if (hasSource && hasPreserved) return null;
+        if (hasSource !== sourceRunSet.has(runId) || hasPreserved !== preservedRunSet.has(runId)) return null;
+      }
+      this.db
+        .prepare(
+          `UPDATE context_segments SET status = 'sealed', first_message_id = ?, last_message_id = ?, sealed_at = ?
+           WHERE id = ? AND status = 'active'`
+        )
+        .run(sourceIds[0], sourceIds[sourceIds.length - 1], input.rotatedAt, input.expectedActiveSegmentId);
+      this.db
+        .prepare(
+          `INSERT INTO context_segments
+             (id, session_id, ordinal, previous_segment_id, status, inherited_artifact_id, created_at)
+           VALUES (?, ?, ?, ?, 'active', ?, ?)`
+        )
+        .run(
+          input.newSegmentId,
+          input.sessionId,
+          source.ordinal + 1,
+          source.id,
+          input.artifact.id,
+          input.rotatedAt
+        );
+      this.insertContextArtifact({ ...input.artifact, targetSegmentId: input.newSegmentId });
+      if (input.preservedMessageIds.length > 0) {
+        this.db
+          .prepare(`UPDATE messages SET segment_id = ? WHERE id IN (${input.preservedMessageIds.map(() => "?").join(", ")})`)
+          .run(input.newSegmentId, ...input.preservedMessageIds);
+      }
+      if (input.preservedRunIds.length > 0) {
+        this.db
+          .prepare(`UPDATE runs SET segment_id = ? WHERE id IN (${input.preservedRunIds.map(() => "?").join(", ")})`)
+          .run(input.newSegmentId, ...input.preservedRunIds);
+      }
+      const updated = this.db
+        .prepare("UPDATE sessions SET active_segment_id = ?, updated_at = ? WHERE id = ? AND active_segment_id = ?")
+        .run(input.newSegmentId, input.rotatedAt, input.sessionId, input.expectedActiveSegmentId);
+      if (updated.changes !== 1) {
+        throw new Error("Context segment rotation lost its session CAS.");
+      }
+      return { segment: this.getContextSegment(input.newSegmentId)!, artifact: this.getContextArtifact(input.artifact.id)! };
+    });
+    return rotate.immediate();
+  }
+
+  replaceInheritedContextArtifact(
+    input: ReplaceInheritedContextArtifactInput
+  ): { segment: ContextSegment; artifact: ContextArtifact } | null {
+    const replace = this.db.transaction(() => {
+      const session = this.db.prepare("SELECT active_segment_id FROM sessions WHERE id = ?").get(input.sessionId) as
+        | { active_segment_id: string | null }
+        | undefined;
+      const segment = this.getContextSegment(input.expectedActiveSegmentId);
+      const previous = this.getContextArtifact(input.expectedArtifactId);
+      if (
+        session?.active_segment_id !== input.expectedActiveSegmentId ||
+        !segment ||
+        segment.sessionId !== input.sessionId ||
+        segment.status !== "active" ||
+        segment.inheritedArtifactId !== input.expectedArtifactId ||
+        !previous ||
+        previous.status !== "completed" ||
+        previous.targetSegmentId !== segment.id
+      ) return null;
+      if (
+        input.artifact.sessionId !== input.sessionId ||
+        input.artifact.status !== "completed" ||
+        input.artifact.previousArtifactId !== previous.id ||
+        input.artifact.sourceSegmentId !== previous.sourceSegmentId ||
+        input.artifact.targetSegmentId !== segment.id ||
+        !sameStringSet(input.artifact.sourceMessageIds, previous.sourceMessageIds) ||
+        input.artifact.sourceFirstMessageId !== previous.sourceFirstMessageId ||
+        input.artifact.sourceLastMessageId !== previous.sourceLastMessageId ||
+        input.artifact.sourceCategories.length !== 1 ||
+        input.artifact.sourceCategories[0]?.category !== "summary_recovery" ||
+        !sameStringSet(input.artifact.sourceCategories[0].messageIds, previous.sourceMessageIds)
+      ) return null;
+      this.insertContextArtifact(input.artifact);
+      const updated = this.db
+        .prepare(
+          `UPDATE context_segments SET inherited_artifact_id = ?
+           WHERE id = ? AND session_id = ? AND status = 'active' AND inherited_artifact_id = ?`
+        )
+        .run(input.artifact.id, segment.id, input.sessionId, previous.id);
+      if (updated.changes !== 1) throw new Error("Inherited context artifact CAS was lost.");
+      this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ? AND active_segment_id = ?")
+        .run(input.updatedAt, input.sessionId, segment.id);
+      return { segment: this.getContextSegment(segment.id)!, artifact: this.getContextArtifact(input.artifact.id)! };
+    });
+    return replace.immediate();
+  }
+
+  listMessagesBySegment(segmentId: string): Message[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.id, m.session_id, m.run_id, m.segment_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+            r.error AS run_error
+         FROM messages m
+         LEFT JOIN runs r ON r.id = m.run_id
+         WHERE m.segment_id = ?
+         ORDER BY m.created_at ASC,
+           CASE m.role WHEN 'system' THEN 0 WHEN 'user' THEN 1 WHEN 'assistant' THEN 2 ELSE 3 END,
+           m.id ASC`
+      )
+      .all(segmentId) as MessageRow[];
+    if (rows.length === 0) {
+      return [];
+    }
+    const partsByMessage = this.getPartsByMessageIds(rows.map((row) => row.id));
+    return rows.map((row) => rowToMessage(row, partsByMessage.get(row.id) ?? []));
+  }
+
+  private insertContextArtifact(input: ContextArtifact): void {
+    this.db
+      .prepare(
+        `INSERT INTO context_artifacts (
+           id, kind, session_id, source_segment_id, target_segment_id, previous_artifact_id,
+           source_message_ids_json, source_categories_json, source_first_message_id, source_last_message_id, summary,
+           strategy_version, estimator_version, estimated_tokens_before, estimated_tokens_after,
+           resolved_window_tokens, window_source, status, provider_profile_id, model, usage_json, error, created_at
+         ) VALUES (
+           @id, @kind, @sessionId, @sourceSegmentId, @targetSegmentId, @previousArtifactId,
+           @sourceMessageIdsJson, @sourceCategoriesJson, @sourceFirstMessageId, @sourceLastMessageId, @summary,
+           @strategyVersion, @estimatorVersion, @estimatedTokensBefore, @estimatedTokensAfter,
+           @resolvedWindowTokens, @windowSource, @status, @providerProfileId, @model, @usageJson, @error, @createdAt
+         )`
+      )
+      .run({
+        ...input,
+        sourceMessageIdsJson: JSON.stringify(input.sourceMessageIds),
+        sourceCategoriesJson: JSON.stringify(input.sourceCategories),
+        usageJson: JSON.stringify(input.usage ?? {})
+      });
+  }
+
   createRun(input: CreateRunInput): Run {
     if (input.status !== "running") {
       throw new Error("Runs must be created in the running state.");
     }
+    const segmentId = input.segmentId ?? this.getSession(input.sessionId)?.activeSegmentId;
+    if (!segmentId) {
+      throw new Error(`Session '${input.sessionId}' has no active context segment.`);
+    }
     const create = this.db.transaction(() => {
+      const sessionRow = this.db
+        .prepare("SELECT active_segment_id FROM sessions WHERE id = ?")
+        .get(input.sessionId) as { active_segment_id: string | null } | undefined;
+      const expectedSegmentId = input.expectedActiveSegmentId ?? segmentId;
+      const segmentRow = this.db
+        .prepare("SELECT session_id, status FROM context_segments WHERE id = ?")
+        .get(expectedSegmentId) as { session_id: string; status: string } | undefined;
+      if (
+        sessionRow?.active_segment_id !== expectedSegmentId ||
+        !segmentRow ||
+        segmentRow.session_id !== input.sessionId ||
+        segmentRow.status !== "active"
+      ) {
+        throw new ContextSegmentChangedStoreError(input.sessionId, expectedSegmentId, sessionRow?.active_segment_id ?? null);
+      }
       const activeRow = this.db
         .prepare(
-          `SELECT id, session_id, provider, status, created_at, updated_at, error, metadata_json
+          `SELECT id, session_id, segment_id, provider, status, created_at, updated_at, error, metadata_json
            FROM runs
            WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'cancelling')
            ORDER BY updated_at DESC, created_at DESC, id DESC
@@ -264,10 +607,10 @@ export class SQLiteStore implements StoreAdapter {
 
       this.db
         .prepare(
-          `INSERT INTO runs (id, session_id, provider, status, created_at, updated_at, error, metadata_json)
-           VALUES (@id, @sessionId, @provider, @status, @createdAt, @updatedAt, @error, @metadataJson)`
+          `INSERT INTO runs (id, session_id, segment_id, provider, status, created_at, updated_at, error, metadata_json)
+           VALUES (@id, @sessionId, @segmentId, @provider, @status, @createdAt, @updatedAt, @error, @metadataJson)`
         )
-        .run({ ...input, error: input.error ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
+        .run({ ...input, segmentId: expectedSegmentId, error: input.error ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
     });
     create.immediate();
     return this.getRun(input.id)!;
@@ -275,7 +618,7 @@ export class SQLiteStore implements StoreAdapter {
 
   getRun(id: string): Run | null {
     const row = this.db
-      .prepare("SELECT id, session_id, provider, status, created_at, updated_at, error, metadata_json FROM runs WHERE id = ?")
+      .prepare("SELECT id, session_id, segment_id, provider, status, created_at, updated_at, error, metadata_json FROM runs WHERE id = ?")
       .get(id) as RunRow | undefined;
     return row ? rowToRun(row) : null;
   }
@@ -298,7 +641,7 @@ export class SQLiteStore implements StoreAdapter {
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
     const rows = this.db
       .prepare(
-        `SELECT id, session_id, provider, status, created_at, updated_at, error, metadata_json
+        `SELECT id, session_id, segment_id, provider, status, created_at, updated_at, error, metadata_json
          FROM runs
          ${where}
          ORDER BY created_at ASC, id ASC`
@@ -451,7 +794,7 @@ export class SQLiteStore implements StoreAdapter {
   listMessages(sessionId: string): Message[] {
     const rows = this.db
       .prepare(
-        `SELECT m.id, m.session_id, m.run_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+         `SELECT m.id, m.session_id, m.run_id, m.segment_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
             r.error AS run_error
          FROM messages m
          LEFT JOIN runs r ON r.id = m.run_id
@@ -473,7 +816,7 @@ export class SQLiteStore implements StoreAdapter {
   getMessage(id: string): Message | null {
     const row = this.db
       .prepare(
-        `SELECT m.id, m.session_id, m.run_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+         `SELECT m.id, m.session_id, m.run_id, m.segment_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
             r.error AS run_error
          FROM messages m
          LEFT JOIN runs r ON r.id = m.run_id
@@ -492,7 +835,7 @@ export class SQLiteStore implements StoreAdapter {
   getAssistantMessageForRun(runId: string): Message | null {
     const row = this.db
       .prepare(
-        `SELECT m.id, m.session_id, m.run_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
+         `SELECT m.id, m.session_id, m.run_id, m.segment_id, m.role, m.status, m.created_at, m.updated_at, m.metadata_json,
             r.error AS run_error
          FROM messages m
          LEFT JOIN runs r ON r.id = m.run_id
@@ -511,12 +854,39 @@ export class SQLiteStore implements StoreAdapter {
   }
 
   createMessage(input: CreateMessageInput): Message {
-    this.db
-      .prepare(
-        `INSERT INTO messages (id, session_id, run_id, role, status, created_at, updated_at, metadata_json)
-         VALUES (@id, @sessionId, @runId, @role, @status, @createdAt, @updatedAt, @metadataJson)`
-      )
-      .run({ ...input, runId: input.runId ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
+    const segmentId = input.segmentId ?? this.getSession(input.sessionId)?.activeSegmentId;
+    if (!segmentId) {
+      throw new Error(`Session '${input.sessionId}' has no active context segment.`);
+    }
+    const create = this.db.transaction(() => {
+      const segment = this.db
+        .prepare("SELECT session_id, status FROM context_segments WHERE id = ?")
+        .get(segmentId) as { session_id: string; status: string } | undefined;
+      const session = this.db.prepare("SELECT active_segment_id FROM sessions WHERE id = ?").get(input.sessionId) as
+        | { active_segment_id: string | null }
+        | undefined;
+      const run = input.runId
+        ? (this.db.prepare("SELECT session_id, segment_id FROM runs WHERE id = ?").get(input.runId) as
+            | { session_id: string; segment_id: string }
+            | undefined)
+        : null;
+      if (
+        !segment ||
+        segment.session_id !== input.sessionId ||
+        segment.status !== "active" ||
+        session?.active_segment_id !== segmentId ||
+        (input.runId && (!run || run.session_id !== input.sessionId || run.segment_id !== segmentId))
+      ) {
+        throw new ContextSegmentChangedStoreError(input.sessionId, segmentId, session?.active_segment_id ?? null);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO messages (id, session_id, run_id, segment_id, role, status, created_at, updated_at, metadata_json)
+           VALUES (@id, @sessionId, @runId, @segmentId, @role, @status, @createdAt, @updatedAt, @metadataJson)`
+        )
+        .run({ ...input, segmentId, runId: input.runId ?? null, metadataJson: JSON.stringify(input.metadata ?? {}) });
+    });
+    create.immediate();
     return this.getMessage(input.id)!;
   }
 
@@ -652,7 +1022,7 @@ export class SQLiteStore implements StoreAdapter {
   listAgentDefinitions(): AgentDefinition[] {
     const rows = this.db
       .prepare(
-        `SELECT id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
+        `SELECT id, revision, name, description, system_prompt, model_profile_id, default_run_options_json, context_policy_json,
                 skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          FROM agent_definitions
          ORDER BY CASE id WHEN 'main' THEN 0 ELSE 1 END, name ASC, id ASC`
@@ -664,7 +1034,7 @@ export class SQLiteStore implements StoreAdapter {
   getAgentDefinition(id: string): AgentDefinition | null {
     const row = this.db
       .prepare(
-        `SELECT id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
+        `SELECT id, revision, name, description, system_prompt, model_profile_id, default_run_options_json, context_policy_json,
                 skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          FROM agent_definitions
          WHERE id = ?`
@@ -677,16 +1047,17 @@ export class SQLiteStore implements StoreAdapter {
     this.db
       .prepare(
         `INSERT INTO agent_definitions (
-           id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
+           id, revision, name, description, system_prompt, model_profile_id, default_run_options_json, context_policy_json,
            skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          ) VALUES (
-           @id, 1, @name, @description, @systemPrompt, @modelProfileId, @defaultRunOptionsJson,
+           @id, 1, @name, @description, @systemPrompt, @modelProfileId, @defaultRunOptionsJson, @contextPolicyJson,
            @skillIdsJson, @toolIdsJson, @metadataJson, @createdAt, @updatedAt
          )`
       )
       .run({
         ...input,
         defaultRunOptionsJson: JSON.stringify(runOptionsToJsonObject(input.defaultRunOptions ?? {})),
+        contextPolicyJson: JSON.stringify(input.contextPolicy ?? {}),
         skillIdsJson: JSON.stringify(input.skillIds),
         toolIdsJson: JSON.stringify(input.toolIds),
         metadataJson: JSON.stringify(input.metadata ?? {})
@@ -726,6 +1097,7 @@ export class SQLiteStore implements StoreAdapter {
         systemPrompt: input.systemPrompt ?? current.systemPrompt,
         modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
         defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
+        contextPolicy: input.contextPolicy !== undefined ? input.contextPolicy : current.contextPolicy,
         skillIds: input.skillIds ?? current.skillIds,
         toolIds: input.toolIds ?? current.toolIds,
         metadata: input.metadata ?? current.metadata,
@@ -745,6 +1117,7 @@ export class SQLiteStore implements StoreAdapter {
                system_prompt = @systemPrompt,
                model_profile_id = @modelProfileId,
                default_run_options_json = @defaultRunOptionsJson,
+               context_policy_json = @contextPolicyJson,
                skill_ids_json = @skillIdsJson,
                tool_ids_json = @toolIdsJson,
                metadata_json = @metadataJson,
@@ -760,6 +1133,7 @@ export class SQLiteStore implements StoreAdapter {
           systemPrompt: next.systemPrompt,
           modelProfileId: next.modelProfileId,
           defaultRunOptionsJson: JSON.stringify(runOptionsToJsonObject(next.defaultRunOptions ?? {})),
+          contextPolicyJson: JSON.stringify(next.contextPolicy ?? {}),
           skillIdsJson: JSON.stringify(next.skillIds),
           toolIdsJson: JSON.stringify(next.toolIds),
           metadataJson: JSON.stringify(next.metadata),
@@ -967,6 +1341,7 @@ export class SQLiteStore implements StoreAdapter {
         title TEXT NOT NULL,
         working_directory TEXT,
         agent_id TEXT NOT NULL DEFAULT 'main',
+        active_segment_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         metadata_json TEXT NOT NULL DEFAULT '{}'
@@ -975,6 +1350,7 @@ export class SQLiteStore implements StoreAdapter {
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
+        segment_id TEXT,
         provider TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -988,6 +1364,7 @@ export class SQLiteStore implements StoreAdapter {
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         run_id TEXT,
+        segment_id TEXT,
         role TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -1009,6 +1386,52 @@ export class SQLiteStore implements StoreAdapter {
         metadata_json TEXT NOT NULL DEFAULT '{}',
         UNIQUE(message_id, seq),
         FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS context_segments (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        previous_segment_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'sealed')),
+        first_message_id TEXT,
+        last_message_id TEXT,
+        inherited_artifact_id TEXT,
+        created_at TEXT NOT NULL,
+        sealed_at TEXT,
+        UNIQUE(session_id, ordinal),
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY (previous_segment_id) REFERENCES context_segments(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS context_artifacts (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind = 'compaction'),
+        session_id TEXT NOT NULL,
+        source_segment_id TEXT NOT NULL,
+        target_segment_id TEXT,
+        previous_artifact_id TEXT,
+        source_message_ids_json TEXT NOT NULL,
+        source_categories_json TEXT NOT NULL DEFAULT '[]',
+        source_first_message_id TEXT,
+        source_last_message_id TEXT,
+        summary TEXT NOT NULL,
+        strategy_version TEXT NOT NULL,
+        estimator_version TEXT NOT NULL,
+        estimated_tokens_before INTEGER NOT NULL,
+        estimated_tokens_after INTEGER NOT NULL,
+        resolved_window_tokens INTEGER NOT NULL,
+        window_source TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+        provider_profile_id TEXT,
+        model TEXT,
+        usage_json TEXT NOT NULL DEFAULT '{}',
+        error TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY (source_segment_id) REFERENCES context_segments(id),
+        FOREIGN KEY (target_segment_id) REFERENCES context_segments(id),
+        FOREIGN KEY (previous_artifact_id) REFERENCES context_artifacts(id)
       );
 
       CREATE TABLE IF NOT EXISTS events (
@@ -1093,6 +1516,7 @@ export class SQLiteStore implements StoreAdapter {
         system_prompt TEXT NOT NULL,
         model_profile_id TEXT,
         default_run_options_json TEXT NOT NULL DEFAULT '{}',
+        context_policy_json TEXT NOT NULL DEFAULT '{}',
         skill_ids_json TEXT NOT NULL DEFAULT '[]',
         tool_ids_json TEXT NOT NULL DEFAULT '[]',
         metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -1116,14 +1540,74 @@ export class SQLiteStore implements StoreAdapter {
       CREATE INDEX IF NOT EXISTS idx_app_settings_updated_at ON app_settings(updated_at);
       CREATE INDEX IF NOT EXISTS idx_provider_profiles_source ON provider_profiles(source, updated_at);
       CREATE INDEX IF NOT EXISTS idx_agent_definitions_updated_at ON agent_definitions(updated_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_context_segments_one_active ON context_segments(session_id) WHERE status = 'active';
+      CREATE INDEX IF NOT EXISTS idx_context_artifacts_session ON context_artifacts(session_id, created_at);
     `);
     this.ensureSessionWorkingDirectoryColumn();
     this.ensureSessionAgentIdColumn();
     this.ensureMessagePartStructuredColumns();
     this.ensureAgentRevisionColumn();
+    this.ensureAgentContextPolicyColumn();
+    this.ensureContextSegmentColumnsAndBackfill();
+    this.ensureContextArtifactCategoryColumn();
     this.seedDefaultAgents();
     this.migrateMainAgentExplicitToolAllowlist();
     this.ensureAgentReferenceTriggers();
+  }
+
+  private ensureContextSegmentColumnsAndBackfill(): void {
+    const sessionColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!sessionColumns.has("active_segment_id")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN active_segment_id TEXT");
+    }
+    const messageColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!messageColumns.has("segment_id")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN segment_id TEXT");
+    }
+    const runColumns = new Set(
+      (this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!runColumns.has("segment_id")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN segment_id TEXT");
+    }
+    const backfill = this.db.transaction(() => {
+      const sessions = this.db.prepare("SELECT id, created_at FROM sessions WHERE active_segment_id IS NULL OR trim(active_segment_id) = ''").all() as Array<{
+        id: string;
+        created_at: string;
+      }>;
+      for (const session of sessions) {
+        const segmentId = `segment:${session.id}:0`;
+        this.db
+          .prepare(
+            `INSERT OR IGNORE INTO context_segments (id, session_id, ordinal, status, created_at)
+             VALUES (?, ?, 0, 'active', ?)`
+          )
+          .run(segmentId, session.id, session.created_at);
+        this.db.prepare("UPDATE sessions SET active_segment_id = ? WHERE id = ?").run(segmentId, session.id);
+      }
+      this.db
+        .prepare("UPDATE messages SET segment_id = (SELECT active_segment_id FROM sessions WHERE sessions.id = messages.session_id) WHERE segment_id IS NULL")
+        .run();
+      this.db
+        .prepare("UPDATE runs SET segment_id = (SELECT active_segment_id FROM sessions WHERE sessions.id = runs.session_id) WHERE segment_id IS NULL")
+        .run();
+    });
+    backfill.immediate();
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_segment ON messages(segment_id, created_at)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_runs_segment ON runs(segment_id, created_at)");
+  }
+
+  private ensureContextArtifactCategoryColumn(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(context_artifacts)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!columns.has("source_categories_json")) {
+      this.db.exec("ALTER TABLE context_artifacts ADD COLUMN source_categories_json TEXT NOT NULL DEFAULT '[]'");
+    }
   }
 
   private ensureSessionAgentIdColumn(): void {
@@ -1172,16 +1656,25 @@ export class SQLiteStore implements StoreAdapter {
     this.db.prepare("UPDATE agent_definitions SET revision = 1 WHERE revision IS NULL OR revision < 1").run();
   }
 
+  private ensureAgentContextPolicyColumn(): void {
+    const columns = new Set(
+      (this.db.prepare("PRAGMA table_info(agent_definitions)").all() as Array<{ name: string }>).map((column) => column.name)
+    );
+    if (!columns.has("context_policy_json")) {
+      this.db.exec("ALTER TABLE agent_definitions ADD COLUMN context_policy_json TEXT NOT NULL DEFAULT '{}'");
+    }
+  }
+
   private seedDefaultAgents(): void {
     const now = new Date().toISOString();
     const defaultMainAgentToolIdsJson = JSON.stringify(defaultMainAgentToolIds);
     this.db
       .prepare(
         `INSERT INTO agent_definitions (
-           id, revision, name, description, system_prompt, model_profile_id, default_run_options_json,
+           id, revision, name, description, system_prompt, model_profile_id, default_run_options_json, context_policy_json,
            skill_ids_json, tool_ids_json, metadata_json, created_at, updated_at
          )
-          VALUES (@id, 1, @name, @description, @systemPrompt, NULL, '{}', '[]', @toolIdsJson, @metadataJson, @createdAt, @updatedAt)
+          VALUES (@id, 1, @name, @description, @systemPrompt, NULL, '{}', '{}', '[]', @toolIdsJson, @metadataJson, @createdAt, @updatedAt)
           ON CONFLICT(id) DO NOTHING`
       )
       .run({
@@ -1402,6 +1895,7 @@ function rowToSession(row: SessionRow, defaultWorkingDirectory: string): Session
     title: row.title,
     workingDirectory: normalizeStoredWorkingDirectory(row.working_directory, defaultWorkingDirectory),
     agentId: row.agent_id || "main",
+    activeSegmentId: row.active_segment_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -1432,6 +1926,7 @@ function rowToRun(row: RunRow): Run {
   return {
     id: row.id,
     sessionId: row.session_id,
+    segmentId: row.segment_id,
     provider: row.provider,
     status: row.status,
     metadata,
@@ -1452,6 +1947,7 @@ function rowToMessage(row: MessageRow, parts: MessagePart[]): Message {
     id: row.id,
     sessionId: row.session_id,
     runId: row.run_id,
+    segmentId: row.segment_id,
     role: row.role,
     status: row.status,
     error,
@@ -1462,6 +1958,51 @@ function rowToMessage(row: MessageRow, parts: MessagePart[]): Message {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     parts
+  };
+}
+
+function rowToContextSegment(row: ContextSegmentRow): ContextSegment {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    ordinal: row.ordinal,
+    previousSegmentId: row.previous_segment_id,
+    status: row.status,
+    firstMessageId: row.first_message_id,
+    lastMessageId: row.last_message_id,
+    inheritedArtifactId: row.inherited_artifact_id,
+    messageCount: row.message_count,
+    createdAt: row.created_at,
+    sealedAt: row.sealed_at
+  };
+}
+
+function rowToContextArtifact(row: ContextArtifactRow): ContextArtifact {
+  const usage = usageFromMetadata({ usage: parseJsonObject(row.usage_json) });
+  return {
+    id: row.id,
+    kind: row.kind,
+    sessionId: row.session_id,
+    sourceSegmentId: row.source_segment_id,
+    targetSegmentId: row.target_segment_id,
+    previousArtifactId: row.previous_artifact_id,
+    sourceMessageIds: parseStringArray(row.source_message_ids_json),
+    sourceCategories: parseContextArtifactCategories(row.source_categories_json),
+    sourceFirstMessageId: row.source_first_message_id,
+    sourceLastMessageId: row.source_last_message_id,
+    summary: row.summary,
+    strategyVersion: row.strategy_version,
+    estimatorVersion: row.estimator_version,
+    estimatedTokensBefore: row.estimated_tokens_before,
+    estimatedTokensAfter: row.estimated_tokens_after,
+    resolvedWindowTokens: row.resolved_window_tokens,
+    windowSource: row.window_source,
+    status: row.status,
+    providerProfileId: row.provider_profile_id,
+    model: row.model,
+    usage,
+    error: row.error,
+    createdAt: row.created_at
   };
 }
 
@@ -1501,6 +2042,7 @@ function rowToAgentDefinition(row: AgentDefinitionRow): AgentDefinition {
     systemPrompt: row.system_prompt,
     modelProfileId: row.model_profile_id,
     defaultRunOptions: runOptionsFromJsonObject(parseJsonObject(row.default_run_options_json)),
+    contextPolicy: contextPolicyFromJsonObject(parseJsonObject(row.context_policy_json)),
     skillIds: parseStringArray(row.skill_ids_json),
     toolIds: parseStringArray(row.tool_ids_json),
     metadata: parseJsonObject(row.metadata_json),
@@ -1516,6 +2058,7 @@ function sameMutableAgentDefinition(left: AgentDefinition, right: AgentDefinitio
     left.systemPrompt === right.systemPrompt &&
     left.modelProfileId === right.modelProfileId &&
     isDeepStrictEqual(left.defaultRunOptions, right.defaultRunOptions) &&
+    isDeepStrictEqual(left.contextPolicy, right.contextPolicy) &&
     isDeepStrictEqual(left.skillIds, right.skillIds) &&
     isDeepStrictEqual(left.toolIds, right.toolIds) &&
     isDeepStrictEqual(left.metadata, right.metadata)
@@ -1623,6 +2166,23 @@ function runOptionsToJsonObject(options: RunOptions): JsonObject {
   return output;
 }
 
+function contextPolicyFromJsonObject(value: JsonObject): AgentDefinition["contextPolicy"] {
+  const policy: NonNullable<AgentDefinition["contextPolicy"]> = {};
+  if (typeof value.contextWindowTokensOverride === "number" && Number.isInteger(value.contextWindowTokensOverride)) {
+    policy.contextWindowTokensOverride = value.contextWindowTokensOverride;
+  }
+  if (typeof value.reservedOutputTokens === "number" && Number.isInteger(value.reservedOutputTokens)) {
+    policy.reservedOutputTokens = value.reservedOutputTokens;
+  }
+  if (typeof value.safetyMarginRatio === "number" && Number.isFinite(value.safetyMarginRatio)) {
+    policy.safetyMarginRatio = value.safetyMarginRatio;
+  }
+  if (typeof value.automaticCompaction === "boolean") {
+    policy.automaticCompaction = value.automaticCompaction;
+  }
+  return Object.keys(policy).length > 0 ? policy : null;
+}
+
 function parseStringArray(value: string | null | undefined): string[] {
   if (!value) {
     return [];
@@ -1637,6 +2197,39 @@ function parseStringArray(value: string | null | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+function parseContextArtifactCategories(value: string | null | undefined): ContextArtifactSourceCategory[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((entry) => {
+      if (!isJsonObject(entry) || !Array.isArray(entry.messageIds) || typeof entry.category !== "string") return [];
+      const category = entry.category;
+      if (
+        category !== "completed_turn" &&
+        category !== "unsuccessful_turn" &&
+        category !== "standalone_tool" &&
+        category !== "orphan_record" &&
+        category !== "summary_recovery"
+      ) return [];
+      return [{
+        category,
+        messageIds: entry.messageIds.filter((id): id is string => typeof id === "string"),
+        runId: typeof entry.runId === "string" ? entry.runId : null,
+        status: typeof entry.status === "string" ? entry.status : "unknown"
+      }];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((value) => rightSet.has(value));
 }
 
 function usageFromMetadata(metadata: JsonObject): RunUsage | null {

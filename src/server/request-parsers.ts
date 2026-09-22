@@ -25,6 +25,7 @@ export type AgentDefinitionPatch = {
   systemPrompt?: string;
   modelProfileId?: string | null;
   defaultRunOptions?: RunOptions | null;
+  contextPolicy?: CreateAgentDefinitionRequest["contextPolicy"];
   skillIds?: string[];
   toolIds?: string[];
   metadata?: JsonObject;
@@ -185,6 +186,7 @@ export function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
     "systemPrompt",
     "modelProfileId",
     "defaultRunOptions",
+    "contextPolicy",
     "skillIds",
     "toolIds",
     "metadata",
@@ -252,6 +254,9 @@ export function parseAgentDefinitionPatch(body: unknown): AgentDefinitionPatch {
   if ("defaultRunOptions" in body) {
     patch.defaultRunOptions = body.defaultRunOptions === null ? null : parseRunOptionsValue(body.defaultRunOptions) ?? {};
   }
+  if ("contextPolicy" in body) {
+    patch.contextPolicy = parseAgentContextPolicy(body.contextPolicy);
+  }
 
   if ("skillIds" in body) {
     patch.skillIds = parseStringList(body.skillIds, "skillIds");
@@ -290,6 +295,7 @@ export function parseCreateAgentDefinition(body: unknown): CreateAgentDefinition
     description: patch.description,
     modelProfileId: patch.modelProfileId,
     defaultRunOptions: patch.defaultRunOptions,
+    contextPolicy: patch.contextPolicy,
     skillIds: patch.skillIds,
     toolIds: patch.toolIds,
     metadata: patch.metadata
@@ -369,6 +375,47 @@ function parseRunOptionsValue(rawOptions: unknown): RunOptions | undefined {
   }
 
   return options;
+}
+
+function parseAgentContextPolicy(value: unknown): CreateAgentDefinitionRequest["contextPolicy"] {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (!isPlainObject(value)) {
+    throw new KernelError("Agent field 'contextPolicy' must be a JSON object or null.", 400);
+  }
+  const allowedKeys = new Set(["contextWindowTokensOverride", "reservedOutputTokens", "safetyMarginRatio", "automaticCompaction"]);
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.has(key)) {
+      throw new KernelError(`Unsupported Agent context policy field '${key}'.`, 400);
+    }
+  }
+  const policy: NonNullable<CreateAgentDefinitionRequest["contextPolicy"]> = {};
+  if (value.contextWindowTokensOverride !== undefined && value.contextWindowTokensOverride !== null && value.contextWindowTokensOverride !== "") {
+    if (typeof value.contextWindowTokensOverride !== "number" || !Number.isInteger(value.contextWindowTokensOverride)) {
+      throw new KernelError("Agent contextWindowTokensOverride must be an integer.", 400);
+    }
+    policy.contextWindowTokensOverride = value.contextWindowTokensOverride;
+  }
+  if (value.reservedOutputTokens !== undefined && value.reservedOutputTokens !== null && value.reservedOutputTokens !== "") {
+    if (typeof value.reservedOutputTokens !== "number" || !Number.isInteger(value.reservedOutputTokens)) {
+      throw new KernelError("Agent reservedOutputTokens must be an integer.", 400);
+    }
+    policy.reservedOutputTokens = value.reservedOutputTokens;
+  }
+  if (value.safetyMarginRatio !== undefined && value.safetyMarginRatio !== null && value.safetyMarginRatio !== "") {
+    if (typeof value.safetyMarginRatio !== "number" || !Number.isFinite(value.safetyMarginRatio)) {
+      throw new KernelError("Agent safetyMarginRatio must be a finite number.", 400);
+    }
+    policy.safetyMarginRatio = value.safetyMarginRatio;
+  }
+  if (value.automaticCompaction !== undefined) {
+    if (typeof value.automaticCompaction !== "boolean") {
+      throw new KernelError("Agent automaticCompaction must be a boolean.", 400);
+    }
+    policy.automaticCompaction = value.automaticCompaction;
+  }
+  return Object.keys(policy).length > 0 ? policy : null;
 }
 
 function isValidSettingKey(key: string): boolean {

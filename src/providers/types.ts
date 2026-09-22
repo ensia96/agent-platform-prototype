@@ -6,6 +6,7 @@ import type {
   MessagePartType,
   ProviderModelCatalog,
   ProviderProfile,
+  ProviderContextPlanningProfile,
   ProviderTestResponse,
   RunOptions,
   RunUsage,
@@ -136,6 +137,8 @@ export interface ProviderRunResult {
 export interface ProviderAdapter {
   id: string;
   label: string;
+  /** Static, credential-free overhead visible in this adapter's native request payload. */
+  readonly contextPlanning?: ProviderContextPlanningProfile;
   test(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderTestResponse>;
   listModels?(profile: ProviderProfile, credential: ProviderCredential): Promise<ProviderModelCatalog>;
   /**

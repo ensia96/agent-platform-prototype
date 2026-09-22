@@ -2,6 +2,7 @@ import type {
   AgentDefinition,
   BuiltContext,
   ContextBuildResult,
+  ContextArtifact,
   ContextMessage,
   ContextMessagePart,
   JsonObject,
@@ -10,9 +11,12 @@ import type {
   MessagePart,
   MessagePartType,
   RunOptions,
+  ModelContextCapability,
+  ProviderContextPlanningProfile,
   Session
 } from "../shared/types";
 import { normalizeReasoningEffort } from "../shared/run-options";
+import { boundHistoricalContextText, planContext, resolveContextBudget, type ResolvedContextBudget } from "./context-budget";
 
 export const defaultAgentId = "main";
 
@@ -31,6 +35,13 @@ export interface ContextBuildInput {
   availableTools?: ModelToolDefinition[];
   metadata?: JsonObject;
   builtAt?: string;
+  currentMessageId?: string;
+  contextCapability?: ModelContextCapability | null;
+  resolvedBudget?: ResolvedContextBudget;
+  providerOverhead?: ProviderContextPlanningProfile;
+  syntheticMessages?: ContextMessage[];
+  activeSegmentId?: string;
+  compactionArtifact?: ContextArtifact | null;
 }
 
 export function buildContext(input: ContextBuildInput): ContextBuildResult {
@@ -38,6 +49,20 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
   const skippedMessageIds: string[] = [];
   const messages: ContextMessage[] = [];
   const sortedMessages = [...input.messages].sort(compareMessages);
+
+  if (input.compactionArtifact?.status === "completed") {
+    messages.push({
+      role: "system",
+      content: `Cumulative continuity summary from earlier context:\n${input.compactionArtifact.summary}`,
+      source: "compaction",
+      messageId: input.compactionArtifact.id,
+      metadata: {
+        artifactId: input.compactionArtifact.id,
+        sourceSegmentId: input.compactionArtifact.sourceSegmentId,
+        strategyVersion: input.compactionArtifact.strategyVersion
+      }
+    });
+  }
 
   for (const message of sortedMessages) {
     const contextMessage = messageToContextMessage(message, warnings, skippedMessageIds);
@@ -56,12 +81,29 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
       ...(input.currentMessage?.metadata ? { metadata: input.currentMessage.metadata } : {})
     });
   }
+  messages.push(...(input.syntheticMessages ?? []).map((message) => ({ ...message, source: "synthetic" as const })));
 
-  // TODO: add token counting, history trimming, explicit file expansion, skills, and subagent context slots.
   const builtAt = input.builtAt ?? new Date().toISOString();
   const runOptions = cleanRunOptions(input.runOptions ?? {});
   const availableTools = [...(input.availableTools ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   const workingDirectory = input.session.workingDirectory;
+  const systemPrompt = buildSystemPrompt(input.agent.systemPrompt, workingDirectory);
+  const planned = planContext({
+    systemPrompt,
+    messages,
+    availableTools,
+    budget: input.resolvedBudget ?? resolveContextBudget(input.contextCapability, input.agent.contextPolicy),
+    currentMessageId: input.currentMessageId,
+    providerOverhead: input.providerOverhead,
+    activeSegmentId: input.activeSegmentId ?? input.session.activeSegmentId,
+    inheritedArtifactId: input.compactionArtifact?.id
+  });
+  const includedMessageIds = new Set(planned.messages.flatMap((message) => (message.messageId ? [message.messageId] : [])));
+  for (const message of messages) {
+    if (message.messageId && !includedMessageIds.has(message.messageId) && !skippedMessageIds.includes(message.messageId)) {
+      skippedMessageIds.push(message.messageId);
+    }
+  }
   const metadata: JsonObject = {
     ...(input.metadata ?? {}),
     kind: "provider-neutral-context",
@@ -69,7 +111,7 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
     workingDirectory,
     agentId: input.agent.id,
     builtAt,
-    messageCount: messages.length,
+    messageCount: planned.messages.length,
     availableToolIds: availableTools.map((tool) => tool.id),
     sourceMessageCount: sortedMessages.length,
     sourceMessageIds: sortedMessages.map((message) => message.id),
@@ -81,18 +123,45 @@ export function buildContext(input: ContextBuildInput): ContextBuildResult {
 
   const context: BuiltContext = {
     agent: input.agent,
-    systemPrompt: buildSystemPrompt(input.agent.systemPrompt, workingDirectory),
+    systemPrompt,
     workingDirectory,
-    messages,
+    messages: planned.messages,
     availableTools,
     runOptions,
     ...(input.providerProfileId ? { providerProfileId: input.providerProfileId } : {}),
     skillIds: input.agent.skillIds,
     toolIds: availableTools.map((tool) => tool.id),
-    metadata
+    metadata,
+    plan: planned.plan
   };
 
-  return { context, warnings, skippedMessageIds };
+  if (planned.plan.trimmingApplied) {
+    warnings.push(
+      `Context planning omitted ${planned.plan.omitted.length} candidate(s) or bounded large context-only text to fit the input budget.`
+    );
+  }
+  if (planned.plan.windowSource === "assumed") {
+    warnings.push(
+      `The ${planned.plan.windowTokens}-token context window is a conservative assumed fallback, not a provider-reported model capability.`
+    );
+  }
+  if (planned.plan.capabilityStale) {
+    warnings.push(
+      `The ${planned.plan.windowTokens}-token provider context window is a stale last-good catalog value because refresh failed.`
+    );
+  }
+  return { context, plan: planned.plan, warnings, skippedMessageIds };
+}
+
+export function projectStoredMessagesForContext(source: Message[]): ContextMessage[] {
+  const warnings: string[] = [];
+  const skippedMessageIds: string[] = [];
+  return [...source]
+    .sort(compareMessages)
+    .flatMap((message) => {
+      const projected = messageToContextMessage(message, warnings, skippedMessageIds);
+      return projected ? [projected] : [];
+    });
 }
 
 function buildSystemPrompt(agentSystemPrompt: string, workingDirectory: string): string {
@@ -115,13 +184,10 @@ function messageToContextMessage(message: Message, warnings: string[], skippedMe
     return null;
   }
 
-  if (message.role !== "assistant" && message.status === "failed") {
-    skippedMessageIds.push(message.id);
-    warnings.push(`Skipped ${message.role} message ${message.id} because it failed.`);
-    return null;
-  }
-
-  const contextParts = message.parts.map((part) => partToContextPart(part));
+  const commandOutputCallIds = new Set(
+    message.parts.flatMap((part) => (part.type === "command_output" && partString(part, "callId") ? [partString(part, "callId")] : []))
+  );
+  const contextParts = message.parts.map((part) => partToContextPart(part, commandOutputCallIds));
   const includedParts = contextParts.filter((part) => part.text.trim().length > 0);
   const content = includedParts.map((part) => part.text).join("\n\n");
   if (!content.trim()) {
@@ -153,14 +219,17 @@ function messageToContextMessage(message: Message, warnings: string[], skippedMe
   };
 }
 
-function partToContextPart(part: MessagePart): ContextMessagePart {
-  const { text, skipReason } = partContextText(part);
+function partToContextPart(part: MessagePart, commandOutputCallIds: ReadonlySet<string>): ContextMessagePart {
+  const { text, skipReason, bounded } = partContextText(part, commandOutputCallIds);
   const metadata: JsonObject = {
     seq: part.seq,
     includeInContext: Boolean(text.trim())
   };
   if (skipReason) {
     metadata.skipReason = skipReason;
+  }
+  if (bounded) {
+    metadata.contextTextBounded = true;
   }
 
   return {
@@ -171,7 +240,10 @@ function partToContextPart(part: MessagePart): ContextMessagePart {
   };
 }
 
-function partContextText(part: MessagePart): { text: string; skipReason?: string } {
+function partContextText(
+  part: MessagePart,
+  commandOutputCallIds: ReadonlySet<string>
+): { text: string; skipReason?: string; bounded?: boolean } {
   if (part.type === "text") {
     return { text: part.text || partString(part, "text") };
   }
@@ -179,19 +251,25 @@ function partContextText(part: MessagePart): { text: string; skipReason?: string
   if (part.type === "tool_result") {
     const status = partString(part, "status");
     const error = partString(part, "error");
-    if (status === "failed" || status === "cancelled" || error) {
-      return { text: "", skipReason: "failed_tool_result" };
-    }
-
-    const body = partString(part, "outputSummary") || partString(part, "output") || part.text;
-    if (!body.trim()) {
-      return { text: "", skipReason: "empty_tool_result" };
-    }
-
     const label = ["tool result", partString(part, "toolName") || partString(part, "toolId"), partString(part, "callId")]
       .filter(Boolean)
       .join(" · ");
-    return { text: `[${label}]\n${body}` };
+    const callId = partString(part, "callId");
+    const summary = partString(part, "outputSummary");
+    if (callId && commandOutputCallIds.has(callId)) {
+      const statusText = [status || "completed", summary].filter(Boolean).join(": ");
+      return { text: `[${label}] ${statusText}`, skipReason: "raw_output_projected_from_command_output_only" };
+    }
+    if (status === "failed" || status === "cancelled" || error) {
+      return { text: `[${label}] ${[status, error].filter(Boolean).join(": ")}` };
+    }
+
+    const body = summary || partString(part, "output") || part.text;
+    if (!body.trim()) {
+      return { text: `[${label}] ${status || "completed"}` };
+    }
+    const boundedBody = boundHistoricalContextText(body);
+    return { text: `[${label}]\n${boundedBody}`, ...(boundedBody !== body ? { bounded: true } : {}) };
   }
 
   if (part.type === "command_output") {
@@ -208,7 +286,8 @@ function partContextText(part: MessagePart): { text: string; skipReason?: string
     ]
       .filter(Boolean)
       .join(" · ");
-    return { text: `[${header}]\n${body}` };
+    const boundedBody = boundHistoricalContextText(body);
+    return { text: `[${header}]\n${boundedBody}`, ...(boundedBody !== body ? { bounded: true } : {}) };
   }
 
   if (part.type === "file_ref") {

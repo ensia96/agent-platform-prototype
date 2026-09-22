@@ -155,6 +155,20 @@ input {
   padding: 10px;
 }
 
+.contextSegmentBoundary {
+  border: 1px solid #cbd5e1;
+  border-left: 4px solid #2563eb;
+  border-radius: 10px;
+  padding: 12px;
+  background: #f8fafc;
+  display: grid;
+  gap: 8px;
+}
+
+.contextSegmentBoundary details p {
+  white-space: pre-wrap;
+}
+
 .contextPreview summary {
   cursor: pointer;
   font-weight: 700;
@@ -1130,6 +1144,25 @@ input {
 .agentToolAllowlist {
   border: 1px solid #e2e8f0;
   border-radius: 10px;
+  padding: 10px;
+}
+
+.agentContextPolicy {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 12px;
+  padding: 10px;
+}
+
+.agentContextPolicy summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.contextBudgetSummary {
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #eff6ff;
   padding: 10px;
 }
 

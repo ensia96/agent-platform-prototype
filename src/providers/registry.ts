@@ -1,4 +1,4 @@
-import { MockProvider, mockModelId } from "./mock";
+import { MockProvider, mockContextWindowTokens, mockModelId } from "./mock";
 import { OpenAIChatGPTProvider } from "./openai-chatgpt";
 import {
   defaultOpenAIChatGPTEndpoint,
@@ -14,6 +14,7 @@ import type {
   ProviderFallbackInfo,
   ProviderListResponse,
   ProviderModelCatalog,
+  ModelContextCapability,
   ProviderProfile,
   ProviderProfileType,
   ProviderResolution,
@@ -137,6 +138,42 @@ export class ProviderRegistry {
         this.modelCatalogRequests.delete(profile.id);
       }
     }
+  }
+
+  getModelContextCapability(providerProfileId: string, modelId: string | null | undefined): ModelContextCapability | null {
+    const profileId = this.normalizeProfileId(providerProfileId);
+    const exactModelId = modelId?.trim();
+    if (!profileId) {
+      return null;
+    }
+    if (profileId === mockProfileId && (!exactModelId || exactModelId === mockModelId)) {
+      return { windowTokens: mockContextWindowTokens, source: "adapter" };
+    }
+    if (!exactModelId) {
+      return null;
+    }
+    const cached = this.modelCatalogCache.get(profileId)?.catalog;
+    const item = cached?.models.find((model) => model.id === exactModelId);
+    return item?.context ? { ...item.context, ...(cached?.stale ? { stale: true } : {}) } : null;
+  }
+
+  /** Runtime and preview use this same lazy, TTL-backed path; UI catalog loading is not a prerequisite. */
+  async resolveModelContextCapability(
+    providerProfileId: string,
+    modelId: string | null | undefined
+  ): Promise<ModelContextCapability | null> {
+    const exactModelId = modelId?.trim();
+    const immediate = this.getModelContextCapability(providerProfileId, exactModelId);
+    if (!exactModelId) {
+      return immediate;
+    }
+    const profileId = this.normalizeProfileId(providerProfileId);
+    if (immediate?.source === "adapter" || !profileId) {
+      return immediate;
+    }
+    const catalog = await this.getModelCatalog(profileId);
+    const item = catalog?.models.find((model) => model.id === exactModelId);
+    return item?.context ? { ...item.context, ...(catalog?.stale ? { stale: true } : {}) } : null;
   }
 
   invalidateModelCatalog(id?: string): void {
@@ -569,6 +606,7 @@ function cloneModelCatalog(catalog: ProviderModelCatalog): ProviderModelCatalog 
 function cloneModelCatalogItem(item: ProviderModelCatalog["models"][number]): ProviderModelCatalog["models"][number] {
   return {
     ...item,
+    ...(item.context ? { context: { ...item.context } } : {}),
     reasoning: {
       ...item.reasoning,
       efforts: item.reasoning.efforts.map((effort) => ({ ...effort }))

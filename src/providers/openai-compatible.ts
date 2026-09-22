@@ -1,5 +1,6 @@
 import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput, ProviderRunResult, ProviderToolCall } from "./types";
 import { extractRunUsage } from "./usage";
+import { providerContextLengthErrorIfRecognized } from "./provider-errors";
 import type {
   BuiltContext,
   JsonObject,
@@ -15,6 +16,15 @@ const defaultBaseUrl = "https://api.openai.com/v1";
 const defaultModel = "gpt-4o-mini";
 const testTimeoutMs = 15_000;
 const modelIdMaxLength = 200;
+export const openAICompatibleTransportWrapperTokens = 24;
+export const openAICompatibleSystemMessageWrapperTokens = 8;
+export const openAICompatibleContextPlanning = {
+  requiredInstructions: [],
+  // Chat Completions always carries one native system message in addition to transport framing.
+  fixedWrapperTokens: openAICompatibleTransportWrapperTokens + openAICompatibleSystemMessageWrapperTokens,
+  perMessageTokens: 8,
+  toolEnvelopeTokens: 24
+};
 
 export interface OpenAICompatibleProviderOptions {
   fetch?: typeof fetch;
@@ -23,6 +33,7 @@ export interface OpenAICompatibleProviderOptions {
 export class OpenAICompatibleProvider implements ProviderAdapter {
   readonly id = "openai-compatible";
   readonly label = "OpenAI-compatible streaming provider";
+  readonly contextPlanning = openAICompatibleContextPlanning;
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: OpenAICompatibleProviderOptions = {}) {
@@ -151,7 +162,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     const requestBody: Record<string, unknown> = {
       model,
       stream: true,
-      messages: buildOpenAICompatibleMessages(input.context)
+      messages: buildOpenAICompatibleRequestMessages(input.context)
     };
     if (input.context.availableTools.length > 0) {
       requestBody.tools = buildOpenAICompatibleTools(input.context.availableTools);
@@ -182,6 +193,10 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
+      const contextError = providerContextLengthErrorIfRecognized({ status: response.status, message: body });
+      if (contextError) {
+        throw contextError;
+      }
       throw new Error(`OpenAI-compatible provider failed (${response.status}): ${trimForDisplay(body) || response.statusText}`);
     }
 
@@ -325,6 +340,15 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext, too
     throw new Error(`Failed to parse OpenAI-compatible SSE event (${toErrorMessage(error)})`);
   }
 
+  const streamError = openAIStreamErrorFields(parsed);
+  if (streamError) {
+    const contextError = providerContextLengthErrorIfRecognized({ status: 400, ...streamError });
+    if (contextError) {
+      throw contextError;
+    }
+    throw new Error("OpenAI-compatible provider returned an SSE error event.");
+  }
+
   const usage = extractRunUsage(parsed);
   if (usage) {
     await context.writer.writeUsage(usage);
@@ -348,6 +372,23 @@ async function handleSseEvent(rawEvent: string, context: ProviderRunContext, too
   }
 
   return false;
+}
+
+function openAIStreamErrorFields(value: unknown): { code?: string; type?: string; message?: string } | null {
+  if (!isJsonObject(value)) {
+    return null;
+  }
+  const direct = isJsonObject(value.error) ? value.error : null;
+  const nestedResponse = isJsonObject(value.response) && isJsonObject(value.response.error) ? value.response.error : null;
+  const error = direct ?? nestedResponse;
+  if (!error) {
+    return null;
+  }
+  return {
+    ...(typeof error.code === "string" ? { code: error.code } : {}),
+    ...(typeof error.type === "string" ? { type: error.type } : {}),
+    ...(typeof error.message === "string" ? { message: error.message } : {})
+  };
 }
 
 interface OpenAIToolCallDelta {
@@ -480,7 +521,9 @@ function getRunModel(input: ProviderRunInput): string {
   return input.context.runOptions.model?.trim() || input.runOptions.model?.trim() || getModel(input.profile);
 }
 
-function buildOpenAICompatibleMessages(context: BuiltContext): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+export function buildOpenAICompatibleRequestMessages(
+  context: BuiltContext
+): Array<{ role: "system" | "user" | "assistant"; content: string }> {
   const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
   const systemPrompt = context.systemPrompt.trim();
   if (systemPrompt) {

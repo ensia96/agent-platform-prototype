@@ -451,7 +451,7 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
     assert.equal(laterAgentPatch?.workingDirectory, "/opposite-order-cwd");
     store.updateSession(raceSession.id, { agentId: "main", workingDirectory: directory, updatedAt: new Date().toISOString() });
 
-    const defaultPreview = kernel.previewContext(restoredSession.id);
+    const defaultPreview = await kernel.previewContext(restoredSession.id);
     assert.equal(defaultPreview.context.agent.id, profile.id);
     assert.ok(defaultPreview.context.systemPrompt.startsWith(oldPromptSentinel));
     assert.equal(defaultPreview.providerResolution.providerProfileId, "fixture-a");
@@ -462,13 +462,13 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
       temperature: 0.3
     });
 
-    const crossProviderPreview = kernel.previewContext(restoredSession.id, { providerProfileId: "fixture-b" });
+    const crossProviderPreview = await kernel.previewContext(restoredSession.id, { providerProfileId: "fixture-b" });
     assert.equal(crossProviderPreview.context.agent.id, profile.id);
     assert.deepEqual(crossProviderPreview.requestedRunOptions, {});
     assert.deepEqual(crossProviderPreview.context.runOptions, { model: "provider-b-model" });
     assert.ok(crossProviderPreview.warnings.some((warning) => warning.includes("different provider profile")));
 
-    const explicitPreview = kernel.previewContext(restoredSession.id, {
+    const explicitPreview = await kernel.previewContext(restoredSession.id, {
       providerProfileId: "fixture-b",
       runOptions: { model: "per-run-model", temperature: 0.8 }
     });
@@ -476,10 +476,10 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
     assert.equal(explicitPreview.providerResolution.providerProfileId, "fixture-b");
     assert.deepEqual(explicitPreview.context.availableTools.map((tool) => tool.id), ["shell.exec"]);
     assert.deepEqual(explicitPreview.context.runOptions, { model: "per-run-model", temperature: 0.8 });
-    const explicitAgentPreview = kernel.previewContext(restoredSession.id, { agentId: "main" });
+    const explicitAgentPreview = await kernel.previewContext(restoredSession.id, { agentId: "main" });
     assert.equal(explicitAgentPreview.context.agent.id, "main", "explicit run agent did not override the session binding");
 
-    const crossProviderRun = kernel.startRun(restoredSession.id, "[complete] cross-provider defaults", {
+    const crossProviderRun = await kernel.startRun(restoredSession.id, "[complete] cross-provider defaults", {
       providerProfileId: "fixture-b"
     });
     await waitForRunStatus(kernel, crossProviderRun.run.id, "completed");
@@ -489,7 +489,7 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
     assert.deepEqual(crossProviderInput.runOptions, { model: "provider-b-model" });
 
     store.setSetting(toolSettingsSettingKey, fixtureToolSettings("ask"), new Date().toISOString());
-    const started = kernel.startRun(restoredSession.id, "[request-tool] preserve the profile snapshot");
+    const started = await kernel.startRun(restoredSession.id, "[request-tool] preserve the profile snapshot");
     assert.equal(started.agentId, profile.id);
     await waitForRunStatus(kernel, started.run.id, "waiting_permission");
     const internalBeforeMutation = store.getRun(started.run.id);
@@ -535,6 +535,20 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
 
     const snapshottedInputs = provider.inputsForRun(started.run.id);
     assert.equal(snapshottedInputs.length, 2);
+    const contextPlanRecords = kernel.getRun(started.run.id).metadata.contextPlanRecords as unknown as Array<{
+      planId: string;
+      providerTurn: number;
+      toolIteration: number;
+      plan: JsonObject;
+    }>;
+    assert.deepEqual(contextPlanRecords.map((record) => [record.providerTurn, record.toolIteration]), [[0, 0], [1, 1]]);
+    assert.equal(kernel.getPublicRun(started.run.id).context?.planId, contextPlanRecords[1].planId);
+    assert.equal(kernel.getPublicRun(started.run.id).context?.providerTurn, 1);
+    assert.equal(JSON.stringify(contextPlanRecords).includes(oldPromptSentinel), false);
+    for (const message of kernel.listMessages(restoredSession.id).filter((message) => message.runId === started.run.id && message.role === "assistant")) {
+      assert.equal("contextSnapshot" in message.metadata, false);
+      assert.equal("contextPlanRecords" in message.metadata, false);
+    }
     assert.equal(snapshottedInputs[0].providerDefaultModel, "provider-a-model");
     assert.equal(snapshottedInputs[1].providerDefaultModel, "provider-a-model-after-restart");
     for (const input of snapshottedInputs) {
@@ -558,14 +572,14 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
     assert.equal(publicSurface.includes("agentSnapshot"), false, "internal agent snapshot metadata leaked through a public run surface");
     assert.equal(publicSurface.includes("executionSnapshot"), false, "internal execution snapshot metadata leaked through a public run surface");
 
-    const futurePreview = kernel.previewContext(restoredSession.id);
+    const futurePreview = await kernel.previewContext(restoredSession.id);
     assert.ok(futurePreview.context.systemPrompt.startsWith("NEW_PROFILE_PROMPT"));
     assert.equal(futurePreview.providerResolution.providerProfileId, "fixture-b");
     assert.deepEqual(futurePreview.context.availableTools, []);
     assert.deepEqual(futurePreview.context.runOptions, { model: "profile-new-model", temperature: 0.6 });
 
     store.setSetting(toolSettingsSettingKey, fixtureToolSettings("allow"), new Date().toISOString());
-    const future = kernel.startRun(restoredSession.id, "[complete] use current profile defaults");
+    const future = await kernel.startRun(restoredSession.id, "[complete] use current profile defaults");
     await waitForRunStatus(kernel, future.run.id, "completed");
     const [futureInput] = provider.inputsForRun(future.run.id);
     assert.ok(futureInput.systemPrompt.startsWith("NEW_PROFILE_PROMPT"));
@@ -588,7 +602,7 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
       agentId: disposable.id
     });
     store.setSetting(toolSettingsSettingKey, fixtureToolSettings("ask"), new Date().toISOString());
-    const disposableRun = kernel.startRun(disposableSession.id, "[request-tool] survive profile deletion");
+    const disposableRun = await kernel.startRun(disposableSession.id, "[request-tool] survive profile deletion");
     await waitForRunStatus(kernel, disposableRun.run.id, "waiting_permission");
     kernel.updateSession(disposableSession.id, { agentId: "main" });
     kernel.deleteAgentDefinition(disposable.id, disposable.revision);
@@ -615,7 +629,7 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
       workingDirectory: directory,
       agentId: unavailableProviderAgent.id
     });
-    const unavailableRun = kernel.startRun(unavailableProviderSession.id, "[request-tool] fail exact provider resume");
+    const unavailableRun = await kernel.startRun(unavailableProviderSession.id, "[request-tool] fail exact provider resume");
     await waitForRunStatus(kernel, unavailableRun.run.id, "waiting_permission");
     providerFixture.setUnavailable("fixture-a", true);
     const unavailablePermission = kernel
@@ -639,7 +653,7 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
       toolIds: []
     });
     const noToolsSession = kernel.createSession({ title: "No tools", workingDirectory: directory, agentId: noTools.id });
-    const denied = kernel.startRun(noToolsSession.id, "[request-tool] provider emitted an unadvertised tool call");
+    const denied = await kernel.startRun(noToolsSession.id, "[request-tool] provider emitted an unadvertised tool call");
     await waitForRunStatus(kernel, denied.run.id, "completed");
     assert.equal(executions.length, 3, "a model tool bypassed the profile hard allowlist");
     const deniedParts = kernel.listMessages(noToolsSession.id).flatMap((message) => message.parts);
@@ -1017,6 +1031,12 @@ function verifyClientMutationLogic(agent: AgentDefinition, session: Session): vo
     model: agent.defaultRunOptions?.model ?? "",
     reasoningEffort: agent.defaultRunOptions?.reasoningEffort ?? "",
     temperature: agent.defaultRunOptions?.temperature === undefined ? "" : String(agent.defaultRunOptions.temperature),
+    contextWindowTokensOverride:
+      agent.contextPolicy?.contextWindowTokensOverride === undefined ? "" : String(agent.contextPolicy.contextWindowTokensOverride),
+    reservedOutputTokens: agent.contextPolicy?.reservedOutputTokens === undefined ? "" : String(agent.contextPolicy.reservedOutputTokens),
+    safetyMarginPercent:
+      agent.contextPolicy?.safetyMarginRatio === undefined ? "" : String(agent.contextPolicy.safetyMarginRatio * 100),
+    automaticCompaction: agent.contextPolicy?.automaticCompaction !== false,
     toolIds: [...agent.toolIds]
   };
   assert.equal(isAgentProfileDraftDirty(agent, cleanDraft), false);

@@ -192,7 +192,7 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
     }
   });
 
-  app.post("/api/context/preview", (req, res, next) => {
+  app.post("/api/context/preview", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
       const body = requestBodyObject(req.body);
@@ -200,7 +200,7 @@ function registerAgentAndProviderRoutes(app: Express, dependencies: ApiRouteDepe
       if (!sessionId) {
         throw new KernelError("Context preview requires body field 'sessionId'.", 400);
       }
-      res.json(buildContextPreview(kernel, sessionId, body));
+      res.json(await buildContextPreview(kernel, sessionId, body));
     } catch (error) {
       next(error);
     }
@@ -349,10 +349,55 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
     }
   });
 
-  app.post("/api/sessions/:id/context/preview", (req, res, next) => {
+  app.post("/api/sessions/:id/context/preview", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
-      res.json(buildContextPreview(kernel, req.params.id, requestBodyObject(req.body)));
+      res.json(await buildContextPreview(kernel, req.params.id, requestBodyObject(req.body)));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/sessions/:id/context/segments", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.listContextSegments(req.params.id));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/sessions/:id/context/segments/:segmentId", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.getContextSegment(req.params.id, req.params.segmentId));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/sessions/:id/context/segments/:segmentId/messages", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.listContextSegmentMessages(req.params.id, req.params.segmentId));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/sessions/:id/context/artifacts/:artifactId", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(kernel.getContextArtifact(req.params.id, req.params.artifactId));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/sessions/:id/context/compact", async (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      res.json(await kernel.compactSession(req.params.id));
     } catch (error) {
       next(error);
     }
@@ -360,7 +405,8 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
 
   app.get("/api/sessions/:id/messages", (req, res, next) => {
     try {
-      res.json(kernel.listMessages(req.params.id));
+      res.setHeader("Cache-Control", "no-store");
+      res.json(kernel.listActiveMessages(req.params.id));
     } catch (error) {
       next(error);
     }
@@ -399,7 +445,7 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
     }
   });
 
-  app.post("/api/sessions/:id/runs", (req, res, next) => {
+  app.post("/api/sessions/:id/runs", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
       const body = req.body as Record<string, unknown> | undefined;
@@ -408,7 +454,7 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
       const provider = typeof body?.provider === "string" ? body.provider : undefined;
       const providerProfileId = typeof body?.providerProfileId === "string" ? body.providerProfileId : undefined;
       const runOptions = parseRunOptionsFromBody(body);
-      res.status(202).json(kernel.startRun(req.params.id, text, { agentId, provider, providerProfileId, runOptions }));
+      res.status(202).json(await kernel.startRun(req.params.id, text, { agentId, provider, providerProfileId, runOptions }));
     } catch (error) {
       next(error);
     }

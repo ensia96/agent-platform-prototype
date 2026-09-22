@@ -328,11 +328,12 @@ export function toolLoopSyntheticMessages(message: Message): BuiltContext["messa
       role: "user",
       content,
       source: "synthetic",
-      messageId: message.id,
+      messageId: `tool:${message.id}:${callId}`,
       metadata: {
         syntheticKind: "tool_result",
         callId,
-        runId: message.runId ?? null
+        runId: message.runId ?? null,
+        sourceMessageId: message.id
       }
     });
   }
@@ -344,6 +345,7 @@ function toolLoopContextText(toolCallPart: MessagePart, relatedParts: MessagePar
     `[tool call · ${partString(toolCallPart, "toolName") || partString(toolCallPart, "toolId") || "unknown"} · ${partString(toolCallPart, "callId")}]`,
     partString(toolCallPart, "inputSummary") || toolCallPart.text
   ].filter(Boolean);
+  const hasCommandOutput = relatedParts.some((part) => part.type === "command_output");
   for (const part of relatedParts.sort(comparePartsForContext)) {
     if (part.type === "command_output") {
       const outputText = partString(part, "text") || part.text;
@@ -354,7 +356,9 @@ function toolLoopContextText(toolCallPart: MessagePart, relatedParts: MessagePar
     }
     if (part.type === "tool_result") {
       const status = partString(part, "status") || "completed";
-      const body = partString(part, "outputSummary") || partString(part, "output") || partString(part, "error") || part.text;
+      const body = hasCommandOutput
+        ? partString(part, "outputSummary") || partString(part, "error")
+        : partString(part, "outputSummary") || partString(part, "output") || partString(part, "error") || part.text;
       lines.push(`[tool result · ${status}]`);
       if (body.trim()) {
         lines.push(body);

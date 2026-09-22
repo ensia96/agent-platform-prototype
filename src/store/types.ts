@@ -1,6 +1,8 @@
 import type {
   ActiveRunStatus,
   AgentDefinition,
+  ContextArtifact,
+  ContextSegment,
   JsonObject,
   JsonValue,
   ISODateString,
@@ -29,6 +31,7 @@ export interface CreateSessionInput {
   title: string;
   workingDirectory: string;
   agentId?: string;
+  activeSegmentId?: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
@@ -44,6 +47,8 @@ export interface CreateRunInput {
   sessionId: string;
   provider: string;
   status: "running";
+  segmentId?: string;
+  expectedActiveSegmentId?: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
   error?: string | null;
@@ -61,6 +66,7 @@ export interface CreateMessageInput {
   id: string;
   sessionId: string;
   runId?: string | null;
+  segmentId?: string;
   role: MessageRole;
   status: MessageStatus;
   createdAt: ISODateString;
@@ -112,6 +118,7 @@ export interface UpdateAgentDefinitionInput {
   systemPrompt?: string;
   modelProfileId?: string | null;
   defaultRunOptions?: RunOptions | null;
+  contextPolicy?: AgentDefinition["contextPolicy"];
   skillIds?: string[];
   toolIds?: string[];
   metadata?: JsonObject;
@@ -136,6 +143,7 @@ export interface CreateAgentDefinitionInput {
   systemPrompt: string;
   modelProfileId: string | null;
   defaultRunOptions: RunOptions | null;
+  contextPolicy: AgentDefinition["contextPolicy"];
   skillIds: string[];
   toolIds: string[];
   metadata?: JsonObject;
@@ -235,6 +243,38 @@ export interface FinalizeRunResult {
   event: RunEvent;
 }
 
+export interface CreateContextArtifactInput extends Omit<ContextArtifact, "targetSegmentId"> {
+  targetSegmentId?: string | null;
+}
+
+export interface RotateContextSegmentInput {
+  sessionId: string;
+  expectedActiveSegmentId: string;
+  newSegmentId: string;
+  preservedMessageIds: string[];
+  sourceRunIds: string[];
+  preservedRunIds: string[];
+  artifact: ContextArtifact;
+  allowedActiveRunId?: string;
+  rotatedAt: ISODateString;
+}
+
+export interface ReplaceInheritedContextArtifactInput {
+  sessionId: string;
+  expectedActiveSegmentId: string;
+  expectedArtifactId: string;
+  artifact: ContextArtifact;
+  updatedAt: ISODateString;
+}
+
+export class ContextSegmentChangedStoreError extends Error {
+  readonly code = "context_segment_changed";
+  constructor(readonly sessionId: string, readonly expectedSegmentId: string, readonly activeSegmentId: string | null) {
+    super(`Session '${sessionId}' active context segment changed during run creation.`);
+    this.name = "ContextSegmentChangedStoreError";
+  }
+}
+
 export interface StoreAdapter {
   listSessions(): Session[];
   getSession(id: string): Session | null;
@@ -243,6 +283,14 @@ export interface StoreAdapter {
   updateSessionWorkingDirectory(id: string, workingDirectory: string, updatedAt: ISODateString): Session | null;
   listSessionsByAgentId(agentId: string): Session[];
   touchSession(id: string, updatedAt: ISODateString): void;
+  listContextSegments(sessionId: string): ContextSegment[];
+  getContextSegment(id: string): ContextSegment | null;
+  listContextArtifacts(sessionId: string): ContextArtifact[];
+  getContextArtifact(id: string): ContextArtifact | null;
+  createContextArtifact(input: CreateContextArtifactInput): ContextArtifact;
+  rotateContextSegment(input: RotateContextSegmentInput): { segment: ContextSegment; artifact: ContextArtifact } | null;
+  replaceInheritedContextArtifact(input: ReplaceInheritedContextArtifactInput): { segment: ContextSegment; artifact: ContextArtifact } | null;
+  listMessagesBySegment(segmentId: string): Message[];
 
   createRun(input: CreateRunInput): Run;
   getRun(id: string): Run | null;

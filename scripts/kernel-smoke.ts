@@ -32,7 +32,7 @@ async function runScenario(scenario: Scenario): Promise<string> {
     store.setSetting(toolSettingsSettingKey, toolSettingsFor(scenario), new Date().toISOString());
 
     const session = kernel.createSession({ title: scenario, workingDirectory });
-    const created = kernel.startRun(session.id, `run ${scenario}`);
+    const created = await kernel.startRun(session.id, `run ${scenario}`);
 
     if (scenario === "allow") {
       await waitForRunStatus(kernel, created.run.id, "completed");

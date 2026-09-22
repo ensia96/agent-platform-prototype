@@ -2,7 +2,17 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { buildContext, defaultAgentId } from "./context-builder";
+import { buildContext, defaultAgentId, projectStoredMessagesForContext, type ContextBuildInput } from "./context-builder";
+import {
+  boundHistoricalContextText,
+  contextBudgetFromMetadata,
+  ContextBudgetExceededError,
+  ContextSummaryExceedsBudgetError,
+  contextEstimatorVersion,
+  estimateTextTokens,
+  InvalidContextPolicyError,
+  resolveContextBudget
+} from "./context-budget";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import {
   booleanField,
@@ -10,6 +20,7 @@ import {
   buildContextRunMetadata,
   buildRunMetadata,
   buildRunOptionPlan,
+  contextPlanRecordToJson,
   effectiveAgentToolIds,
   executionSnapshotFromRunMetadata,
   mergeRunOptions,
@@ -17,7 +28,8 @@ import {
   partString,
   runOptionsFromJson,
   stringField,
-  toProviderMessages
+  toProviderMessages,
+  type RunOptionPlan
 } from "./kernel-metadata";
 import { RunWriter } from "./run-writer";
 import {
@@ -44,8 +56,9 @@ import {
   toolProviderForPart,
   toPublicPermissionRequest
 } from "./tool-execution";
-import type { ProviderAdapter, ProviderRunInput, ProviderToolCall } from "../providers/types";
-import type { ProviderRegistry } from "../providers/registry";
+import type { ProviderAdapter, ProviderRunInput, ProviderRunWriter, ProviderToolCall } from "../providers/types";
+import { ProviderContextLengthError } from "../providers/provider-errors";
+import type { ProviderRegistry, ResolvedProviderRun } from "../providers/registry";
 import type {
   CreateAgentDefinitionInput,
   CreateRunInput,
@@ -53,7 +66,7 @@ import type {
   StoredPermissionRequest,
   UpdateAgentDefinitionInput
 } from "../store/types";
-import { ActiveRunExistsStoreError } from "../store/types";
+import { ActiveRunExistsStoreError, ContextSegmentChangedStoreError } from "../store/types";
 import { providerToolNameToToolId, toModelToolDefinition } from "../shared/model-tools";
 import { hasControlCharacters, maxReasoningEffortLength, normalizeReasoningEffort } from "../shared/run-options";
 import { normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
@@ -62,8 +75,14 @@ import type { ToolRegistry } from "../tools/registry";
 import { ToolExecutionAbortError, ToolInputError, type RegisteredTool } from "../tools/types";
 import type {
   AgentDefinition,
-  BuiltContext,
+  CompactContextResponse,
+  ContextArtifact,
+  ContextArtifactSourceCategory,
   ContextPreviewResponse,
+  ContextSegment,
+  ContextSegmentDetail,
+  ContextPlan,
+  ContextPlanRecord,
   CreateRunResponse,
   InvokeToolResponse,
   JsonObject,
@@ -78,6 +97,7 @@ import type {
   RunEvent,
   RunEventType,
   RunOptions,
+  RunUsage,
   Session,
   ToolDefinition,
   ToolExecutionEvent,
@@ -117,6 +137,7 @@ export interface CreateAgentDefinitionOptions {
   systemPrompt: string;
   modelProfileId?: string | null;
   defaultRunOptions?: RunOptions | null;
+  contextPolicy?: AgentDefinition["contextPolicy"];
   skillIds?: string[];
   toolIds?: string[];
   metadata?: JsonObject;
@@ -147,7 +168,7 @@ interface PreparedToolInvocation {
   execution: RunExecution;
 }
 
-type RunExecutionPhase = "idle" | "provider" | "tool" | "waiting_permission";
+type RunExecutionPhase = "idle" | "provider" | "tool" | "compacting_context" | "waiting_permission";
 type RunTermination = "cancelled" | "interrupted";
 
 interface RunExecution {
@@ -195,6 +216,8 @@ export class Kernel {
   private readonly tools: ToolRegistry;
   private readonly defaultWorkingDirectory: string;
   private readonly executions = new Map<string, RunExecution>();
+  private readonly compactions = new Map<string, Promise<CompactContextResponse>>();
+  private readonly compactionControllers = new Map<string, AbortController>();
   private shuttingDown = false;
 
   constructor(options: KernelOptions) {
@@ -217,6 +240,7 @@ export class Kernel {
     const now = new Date().toISOString();
     return this.store.createSession({
       id: randomUUID(),
+      activeSegmentId: randomUUID(),
       title: input.title?.trim() || "New session",
       workingDirectory: this.normalizeWorkingDirectory(input.workingDirectory, { allowDefault: true }),
       agentId,
@@ -267,6 +291,71 @@ export class Kernel {
   listMessages(sessionId: string): Message[] {
     this.getSession(sessionId);
     return this.store.listMessages(sessionId).map(toPublicMessage);
+  }
+
+  listActiveMessages(sessionId: string): Message[] {
+    const session = this.getSession(sessionId);
+    return this.store.listMessagesBySegment(session.activeSegmentId).map(toPublicMessage);
+  }
+
+  listContextSegments(sessionId: string): ContextSegmentDetail[] {
+    this.getSession(sessionId);
+    const artifactList = this.store.listContextArtifacts(sessionId);
+    const artifacts = new Map(artifactList.map((artifact) => [artifact.id, artifact]));
+    const artifactsBySource = new Map(
+      artifactList.filter((artifact) => artifact.status === "completed").map((artifact) => [artifact.sourceSegmentId, artifact])
+    );
+    return this.store.listContextSegments(sessionId).map((segment) => ({
+      ...segment,
+      artifact:
+        artifactsBySource.get(segment.id) ??
+        (segment.inheritedArtifactId ? artifacts.get(segment.inheritedArtifactId) ?? null : null),
+      recentFailure:
+        [...artifactList].reverse().find(
+          (artifact) => artifact.status === "failed" && (artifact.sourceSegmentId === segment.id || artifact.targetSegmentId === segment.id)
+        ) ?? null
+    }));
+  }
+
+  getContextSegment(sessionId: string, segmentId: string): ContextSegmentDetail {
+    this.getSession(sessionId);
+    const segment = this.store.getContextSegment(segmentId);
+    if (!segment || segment.sessionId !== sessionId) {
+      throw new KernelError("Context segment not found", 404);
+    }
+    return {
+      ...segment,
+      artifact:
+        this.store.listContextArtifacts(sessionId).find((artifact) => artifact.sourceSegmentId === segment.id && artifact.status === "completed") ??
+        (segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null),
+      recentFailure:
+        [...this.store.listContextArtifacts(sessionId)].reverse().find(
+          (artifact) => artifact.status === "failed" && (artifact.sourceSegmentId === segment.id || artifact.targetSegmentId === segment.id)
+        ) ?? null
+    };
+  }
+
+  listContextSegmentMessages(sessionId: string, segmentId: string): Message[] {
+    this.getContextSegment(sessionId, segmentId);
+    return this.store.listMessagesBySegment(segmentId).map(toPublicMessage);
+  }
+
+  getContextArtifact(sessionId: string, artifactId: string): ContextArtifact {
+    this.getSession(sessionId);
+    const artifact = this.store.getContextArtifact(artifactId);
+    if (!artifact || artifact.sessionId !== sessionId) {
+      throw new KernelError("Context artifact not found", 404);
+    }
+    return artifact;
+  }
+
+  async compactSession(sessionId: string): Promise<CompactContextResponse> {
+    this.assertAcceptingWork();
+    const activeRuns = this.store.listRuns({ sessionId, statuses: ACTIVE_RUN_STATUSES });
+    if (activeRuns.length > 0) {
+      throw new KernelError("Context cannot be compacted while the session has an active run or permission request.", 409, "context_compaction_conflict");
+    }
+    return this.coordinateCompaction(sessionId, null);
   }
 
   listTools(): ToolDefinition[] {
@@ -337,6 +426,7 @@ export class Kernel {
       systemPrompt: input.systemPrompt ?? current.systemPrompt,
       modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
       defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
+      contextPolicy: input.contextPolicy !== undefined ? input.contextPolicy : current.contextPolicy,
       skillIds: input.skillIds ?? current.skillIds,
       toolIds: input.toolIds ?? current.toolIds
     }, current.id);
@@ -374,6 +464,7 @@ export class Kernel {
       systemPrompt: source.systemPrompt,
       modelProfileId: source.modelProfileId,
       defaultRunOptions: source.defaultRunOptions,
+      contextPolicy: source.contextPolicy,
       skillIds: source.skillIds,
       toolIds: source.toolIds,
       metadata: source.id === defaultAgentId ? {} : source.metadata
@@ -444,7 +535,7 @@ export class Kernel {
     );
   }
 
-  previewContext(sessionId: string, options: PreviewContextOptions = {}): ContextPreviewResponse {
+  async previewContext(sessionId: string, options: PreviewContextOptions = {}): Promise<ContextPreviewResponse> {
     const session = this.getSession(sessionId);
     const agent = this.resolveAgentForSession(session, options.agentId);
     const resolvedProvider = this.providers.resolveRun({
@@ -457,14 +548,22 @@ export class Kernel {
       ...resolvedProvider.providerResolution,
       model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
     };
-    const contextResult = buildContext({
+    const contextHistory = this.contextHistoryForSession(session);
+    const contextResult = this.buildContext({
       session,
       agent,
-      messages: this.store.listMessages(sessionId),
+      messages: contextHistory.messages,
+      activeSegmentId: session.activeSegmentId,
+      compactionArtifact: contextHistory.artifact,
       currentMessage: options.text?.trim() ? { content: options.text } : undefined,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: optionPlan.runOptions,
-      availableTools: this.getAvailableToolsForAgent(agent)
+      availableTools: this.getAvailableToolsForAgent(agent),
+      providerOverhead: resolvedProvider.adapter.contextPlanning,
+      contextCapability: await this.getModelContextCapability(
+        resolvedProvider.profile.id,
+        optionPlan.runOptions.model ?? resolvedProvider.profile.model
+      )
     });
     if (agent.defaultRunOptions && !agentDefaults) {
       contextResult.warnings.push(
@@ -524,7 +623,11 @@ export class Kernel {
 
   async shutdown(timeoutMs = 5_000): Promise<void> {
     this.shuttingDown = true;
+    for (const controller of this.compactionControllers.values()) {
+      controller.abort(new RunTerminationError("interrupted"));
+    }
     const activePromises: Promise<unknown>[] = [];
+    activePromises.push(...this.compactions.values());
     for (const execution of this.executions.values()) {
       const run = this.store.getRun(execution.runId);
       if (!run || (run.status !== "running" && run.status !== "cancelling")) {
@@ -550,7 +653,16 @@ export class Kernel {
     }
   }
 
-  startRun(sessionId: string, text: string, options: StartRunOptions = {}): CreateRunResponse {
+  async startRun(sessionId: string, text: string, options: StartRunOptions = {}): Promise<CreateRunResponse> {
+    return this.startRunAttempt(sessionId, text, options, true);
+  }
+
+  private async startRunAttempt(
+    sessionId: string,
+    text: string,
+    options: StartRunOptions,
+    allowSegmentRetry: boolean
+  ): Promise<CreateRunResponse> {
     this.assertAcceptingWork();
     const session = this.getSession(sessionId);
     const prompt = text.trim();
@@ -571,22 +683,68 @@ export class Kernel {
       model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
     };
     const now = new Date().toISOString();
-    const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {}, now);
-    const run = this.createRun({
-      id: randomUUID(),
-      sessionId,
-      provider: resolvedProvider.profile.id,
-      status: "running",
-      createdAt: now,
-      updatedAt: now,
-      metadata: runMetadata
+    const runId = randomUUID();
+    const userMessageId = randomUUID();
+    const assistantMessageId = randomUUID();
+    const contextHistory = this.contextHistoryForSession(session);
+    const contextResult = this.buildContext({
+      session,
+      agent,
+      messages: contextHistory.messages,
+      activeSegmentId: session.activeSegmentId,
+      compactionArtifact: contextHistory.artifact,
+      currentMessage: { content: prompt, messageId: userMessageId, metadata: { runId } },
+      currentMessageId: userMessageId,
+      providerProfileId: resolvedProvider.profile.id,
+      runOptions: optionPlan.runOptions,
+      availableTools: this.getAvailableToolsForAgent(agent),
+      providerOverhead: resolvedProvider.adapter.contextPlanning,
+      metadata: { runId },
+      contextCapability: await this.getModelContextCapability(
+        resolvedProvider.profile.id,
+        optionPlan.runOptions.model ?? resolvedProvider.profile.model
+      )
     });
+    if (agent.defaultRunOptions && !agentDefaults) {
+      contextResult.warnings.push(
+        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile."
+      );
+    }
+    const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {}, now);
+    let run: Run;
+    try {
+      run = this.createRun({
+        id: runId,
+        sessionId,
+        provider: resolvedProvider.profile.id,
+        status: "running",
+        segmentId: session.activeSegmentId,
+        expectedActiveSegmentId: session.activeSegmentId,
+        createdAt: now,
+        updatedAt: now,
+        metadata: runMetadata
+      });
+    } catch (error) {
+      if (error instanceof ContextSegmentChangedStoreError) {
+        if (allowSegmentRetry) {
+          return this.startRunAttempt(sessionId, text, options, false);
+        }
+        throw new KernelError(
+          "The active context segment changed while this run was being planned. Retry the request.",
+          409,
+          error.code,
+          { expectedSegmentId: error.expectedSegmentId, activeSegmentId: error.activeSegmentId }
+        );
+      }
+      throw error;
+    }
     this.store.touchSession(sessionId, now);
 
     const userMessage = this.store.createMessage({
-      id: randomUUID(),
+      id: userMessageId,
       sessionId,
       runId: run.id,
+      segmentId: session.activeSegmentId,
       role: "user",
       status: "completed",
       createdAt: now,
@@ -603,34 +761,28 @@ export class Kernel {
 
     const assistantCreatedAt = new Date(Date.parse(now) + 1).toISOString();
     const assistantMessage = this.store.createMessage({
-      id: randomUUID(),
+      id: assistantMessageId,
       sessionId,
       runId: run.id,
+      segmentId: session.activeSegmentId,
       role: "assistant",
       status: "streaming",
       createdAt: assistantCreatedAt,
       updatedAt: assistantCreatedAt,
-      metadata: runMetadata
+      metadata: { runId: run.id, contextMetadataOwner: "run" }
     });
 
-    const sourceMessages = this.store.listMessages(sessionId).filter((message) => message.id !== assistantMessage.id);
-    const contextResult = buildContext({
-      session,
-      agent,
-      messages: sourceMessages,
-      providerProfileId: resolvedProvider.profile.id,
-      runOptions: optionPlan.runOptions,
-      availableTools: this.getAvailableToolsForAgent(agent),
-      metadata: { runId: run.id }
-    });
-    if (agent.defaultRunOptions && !agentDefaults) {
-      contextResult.warnings.push(
-        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile."
-      );
-    }
-    const contextMetadata = buildContextRunMetadata(contextResult.context, contextResult.warnings, contextResult.skippedMessageIds);
+    const sourceMessages = this.store
+      .listMessagesBySegment(session.activeSegmentId)
+      .filter((message) => message.id !== assistantMessage.id);
+    const initialPlanRecord = this.createContextPlanRecord(contextResult.plan, 0, 0, now);
+    const contextMetadata = buildContextRunMetadata(
+      contextResult.context,
+      contextResult.warnings,
+      contextResult.skippedMessageIds,
+      initialPlanRecord
+    );
     this.store.mergeRunMetadata(run.id, contextMetadata, now);
-    this.store.mergeMessageMetadata(assistantMessage.id, contextMetadata, now);
 
     const runWithMetadata = this.store.getRun(run.id)!;
     const userMessageWithParts = this.store.getMessage(userMessage.id)!;
@@ -676,7 +828,7 @@ export class Kernel {
       unsupportedRunOptions: optionPlan.unsupportedRunOptions
     };
 
-    queueMicrotask(() => {
+    setImmediate(() => {
       void this.trackExecution(execution, () =>
         this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, execution, writer)
       ).catch((error) => this.handleQueuedExecutionError(run.id, execution, error));
@@ -913,6 +1065,7 @@ export class Kernel {
       sessionId,
       provider: `tool:${registeredTool.definition.id}`,
       status: "running",
+      segmentId: session.activeSegmentId,
       createdAt: now,
       updatedAt: now,
       metadata: buildToolRunMetadata(registeredTool.definition, publicInput, caller, permission, executionCwd)
@@ -923,6 +1076,7 @@ export class Kernel {
       id: randomUUID(),
       sessionId,
       runId: run.id,
+      segmentId: session.activeSegmentId,
       role: "assistant",
       status: "streaming",
       createdAt: now,
@@ -1536,7 +1690,8 @@ export class Kernel {
       currentPhase: this.publicRunPhase(run),
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
-      error: sanitizedPublicString(run.error, 1_000)
+      error: sanitizedPublicString(run.error, 1_000),
+      context: publicContextPlanSummary(contextPlanRecordObjects(run.metadata).at(-1))
     };
   }
 
@@ -1551,7 +1706,7 @@ export class Kernel {
       return null;
     }
     const phase = this.executions.get(run.id)?.phase;
-    return phase === "provider" || phase === "tool" ? phase : "running";
+    return phase === "provider" || phase === "tool" || phase === "compacting_context" ? phase : "running";
   }
 
   private assertAcceptingWork(): void {
@@ -1815,6 +1970,11 @@ export class Kernel {
         this.finishAbortedWriter(execution, activeWriter);
       } else {
         const runError = toError(error);
+        if (error instanceof ProviderContextLengthError) {
+          this.store.mergeRunMetadata(run.id, { errorCode: error.code, providerContextOverflow: true }, new Date().toISOString());
+        } else if (error instanceof KernelError && error.code === "context_budget_exceeded") {
+          this.store.mergeRunMetadata(run.id, { errorCode: error.code, contextPreflightOverflow: true }, new Date().toISOString());
+        }
         console.error("Provider run failed", {
           runId: run.id,
           provider: provider.id,
@@ -1834,8 +1994,8 @@ export class Kernel {
     onActiveWriterChange: (writer: RunWriter) => void,
     startingIteration = numberField(run.metadata, "toolIterations") ?? 0
   ): Promise<void> {
-    let providerInput = this.withCurrentToolLoopContext(input, run.id);
     let iteration = startingIteration;
+    let providerInput = this.withCurrentToolLoopContext(input, run.id, provider, iteration);
     let currentWriter = writer;
 
     while (true) {
@@ -1853,6 +2013,35 @@ export class Kernel {
 
       const toolCalls = result.toolCalls ?? [];
       if (toolCalls.length === 0) {
+        if (
+          providerInput.context.agent.contextPolicy?.automaticCompaction !== false &&
+          providerInput.context.plan.compactionRecommended &&
+          !execution.controller.signal.aborted
+        ) {
+          try {
+            execution.phase = "compacting_context";
+            await this.coordinateCompaction(run.sessionId, this.store.getRun(run.id) ?? run, execution.controller.signal);
+          } catch (error) {
+            if (!execution.controller.signal.aborted) {
+              this.emit(run, "context_compaction_failed", {
+                runId: run.id,
+                sessionId: run.sessionId,
+                sourceSegmentId: providerInput.context.plan.activeSegmentId,
+                error: sanitizedCompactionError(error)
+              });
+              this.store.mergeRunMetadata(
+                run.id,
+                { contextCompactionWarning: sanitizedCompactionError(error) },
+                new Date().toISOString()
+              );
+            }
+          }
+          execution.phase = "provider";
+        }
+        if (execution.controller.signal.aborted) {
+          this.finishAbortedWriter(execution, currentWriter);
+          return;
+        }
         currentWriter.writeMetadata({ toolIterations: iteration, toolLoopState: "completed" });
         currentWriter.complete();
         return;
@@ -1883,7 +2072,7 @@ export class Kernel {
       iteration = nextIteration;
       currentWriter = this.createFollowUpAssistantWriter(run, iteration, execution);
       onActiveWriterChange(currentWriter);
-      providerInput = this.withCurrentToolLoopContext(input, run.id);
+      providerInput = this.withCurrentToolLoopContext(input, run.id, provider, iteration);
     }
   }
 
@@ -2150,7 +2339,12 @@ export class Kernel {
     };
   }
 
-  private withCurrentToolLoopContext(input: ProviderRunInput, runId: string): ProviderRunInput {
+  private withCurrentToolLoopContext(
+    input: ProviderRunInput,
+    runId: string,
+    provider: ProviderAdapter,
+    toolIteration: number
+  ): ProviderRunInput {
     const assistantMessages = this.listAssistantMessagesForRun(runId);
     if (assistantMessages.length === 0) {
       return input;
@@ -2159,19 +2353,57 @@ export class Kernel {
     if (syntheticToolMessages.length === 0) {
       return input;
     }
-    const context: BuiltContext = {
-      ...input.context,
-      messages: [...input.context.messages, ...syntheticToolMessages],
-      metadata: {
-        ...input.context.metadata,
-        toolLoopSyntheticMessageCount: syntheticToolMessages.length
-      }
-    };
+    const currentUserMessageId = input.sourceMessages.find((message) => message.runId === runId && message.role === "user")?.id;
+    const inheritedArtifact = input.context.plan.inheritedArtifactId
+      ? this.store.getContextArtifact(input.context.plan.inheritedArtifactId)
+      : null;
+    const contextResult = this.buildContext({
+      session: input.session,
+      agent: input.context.agent,
+      messages: input.sourceMessages,
+      providerProfileId: input.profile.id,
+      runOptions: input.runOptions,
+      availableTools: input.context.availableTools,
+      metadata: { runId, toolLoopSyntheticMessageCount: syntheticToolMessages.length },
+      activeSegmentId: input.context.plan.activeSegmentId ?? input.session.activeSegmentId,
+      compactionArtifact: inheritedArtifact,
+      resolvedBudget: contextBudgetFromMetadata(input.context.plan) ?? undefined,
+      currentMessageId: currentUserMessageId,
+      providerOverhead: provider.contextPlanning,
+      syntheticMessages: syntheticToolMessages
+    });
+    const context = contextResult.context;
+    this.appendContextPlanRecord(runId, context.plan, toolIteration);
     return {
       ...input,
       context,
       messages: toProviderMessages(context)
     };
+  }
+
+  private createContextPlanRecord(
+    plan: ContextPlan,
+    providerTurn: number,
+    toolIteration: number,
+    createdAt = new Date().toISOString()
+  ): ContextPlanRecord {
+    return { planId: randomUUID(), providerTurn, toolIteration, createdAt, plan };
+  }
+
+  private appendContextPlanRecord(runId: string, plan: ContextPlan, toolIteration: number): void {
+    const run = this.getRun(runId);
+    const records = contextPlanRecordObjects(run.metadata);
+    const last = records.at(-1);
+    const providerTurn = integerJsonField(last, "providerTurn") + 1;
+    const record = this.createContextPlanRecord(plan, providerTurn, toolIteration);
+    const serializedRecord = contextPlanRecordToJson(record);
+    const boundedRecords =
+      records.length < 128 ? [...records, serializedRecord] : [records[0], ...records.slice(-126), serializedRecord];
+    this.store.mergeRunMetadata(
+      runId,
+      { contextPlanRecords: boundedRecords, latestContextPlanId: record.planId },
+      record.createdAt
+    );
   }
 
   private markRunWaitingForPermission(run: Run, messageId: string, permissionRequestId: string): void {
@@ -2236,12 +2468,14 @@ export class Kernel {
       id: randomUUID(),
       sessionId: runSnapshot.sessionId,
       runId: runSnapshot.id,
+      segmentId: runSnapshot.segmentId,
       role: "assistant",
       status: "streaming",
       createdAt,
       updatedAt: createdAt,
       metadata: {
-        ...runSnapshot.metadata,
+        runId: runSnapshot.id,
+        contextMetadataOwner: "run",
         toolLoopIteration: iteration,
         toolLoopMessageKind: "assistant_followup",
         toolLoopState: "awaiting_model_followup"
@@ -2302,15 +2536,22 @@ export class Kernel {
       (Array.isArray(run.metadata.unsupportedRunOptions)
         ? run.metadata.unsupportedRunOptions.filter((value): value is string => typeof value === "string")
         : []);
-    const sourceMessages = this.store.listMessages(run.sessionId).filter((message) => message.runId !== run.id || message.role !== "assistant");
-    const contextResult = buildContext({
+    const contextHistory = this.contextHistoryForSession(session);
+    const sourceMessages = contextHistory.messages.filter((message) => message.runId !== run.id || message.role !== "assistant");
+    const currentUserMessageId = sourceMessages.find((message) => message.runId === run.id && message.role === "user")?.id;
+    const contextResult = this.buildContext({
       session,
       agent,
       messages: sourceMessages,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: effectiveRunOptions,
       availableTools: this.getAvailableToolsForAgent(agent),
-      metadata: { runId: run.id, resumed: true }
+      metadata: { runId: run.id, resumed: true },
+      activeSegmentId: session.activeSegmentId,
+      compactionArtifact: contextHistory.artifact,
+      resolvedBudget: contextBudgetFromMetadata(contextPlanObject(contextPlanRecordObjects(run.metadata).at(-1))) ?? undefined,
+      currentMessageId: currentUserMessageId,
+      providerOverhead: resolvedProvider.adapter.contextPlanning
     });
     return {
       provider: resolvedProvider.adapter,
@@ -2358,6 +2599,640 @@ export class Kernel {
       const modelTool = toModelToolDefinition(tool);
       return modelTool ? [modelTool] : [];
     });
+  }
+
+  private buildContext(input: ContextBuildInput) {
+    try {
+      return buildContext(input);
+    } catch (error) {
+      if (error instanceof ContextBudgetExceededError) {
+        throw new KernelError(
+          error.message,
+          400,
+          error.code,
+          error instanceof ContextSummaryExceedsBudgetError ? { ...error.details, artifactId: error.artifactId } : error.details
+        );
+      }
+      if (error instanceof InvalidContextPolicyError) {
+        throw new KernelError(error.message, 400, error.code, error.details);
+      }
+      throw error;
+    }
+  }
+
+  private contextHistoryForSession(session: Session) {
+    const segment = this.store.getContextSegment(session.activeSegmentId);
+    if (!segment || segment.status !== "active" || segment.sessionId !== session.id) {
+      throw new KernelError("Session context segment is unavailable or inconsistent.", 409, "context_segment_mismatch");
+    }
+    const artifact = segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null;
+    if (segment.inheritedArtifactId && (!artifact || artifact.status !== "completed" || artifact.targetSegmentId !== segment.id)) {
+      throw new KernelError("Inherited context artifact is unavailable or inconsistent.", 409, "context_artifact_mismatch");
+    }
+    if (artifact) {
+      const sourceSegment = this.store.getContextSegment(artifact.sourceSegmentId);
+      if (
+        !sourceSegment ||
+        sourceSegment.status !== "sealed" ||
+        sourceSegment.firstMessageId !== artifact.sourceFirstMessageId ||
+        sourceSegment.lastMessageId !== artifact.sourceLastMessageId
+      ) {
+        throw new KernelError("Inherited context artifact source boundary is inconsistent.", 409, "context_artifact_mismatch");
+      }
+    }
+    return { messages: this.store.listMessagesBySegment(segment.id), artifact };
+  }
+
+  private coordinateCompaction(
+    sessionId: string,
+    automaticRun: Run | null,
+    parentSignal?: AbortSignal
+  ): Promise<CompactContextResponse> {
+    const existing = this.compactions.get(sessionId);
+    if (existing) {
+      throw new KernelError("Context compaction is already in progress for this session.", 409, "context_compaction_conflict");
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error(`Context compaction timed out after ${compactionTimeoutMs / 1000}s.`)),
+      compactionTimeoutMs
+    );
+    if (parentSignal?.aborted) {
+      controller.abort(parentSignal.reason);
+    } else {
+      parentSignal?.addEventListener("abort", () => controller.abort(parentSignal.reason), { once: true });
+    }
+    this.compactionControllers.set(sessionId, controller);
+    const operation = this.performContextCompaction(sessionId, automaticRun, controller.signal)
+      .catch((error) => this.recordEarlyCompactionFailure(sessionId, automaticRun, error))
+      .finally(() => {
+      if (this.compactions.get(sessionId) === operation) {
+        clearTimeout(timeout);
+        this.compactions.delete(sessionId);
+        this.compactionControllers.delete(sessionId);
+      }
+      });
+    this.compactions.set(sessionId, operation);
+    return operation;
+  }
+
+  private async performContextCompaction(
+    sessionId: string,
+    automaticRun: Run | null,
+    signal: AbortSignal
+  ): Promise<CompactContextResponse> {
+    const session = this.getSession(sessionId);
+    const segment = this.store.getContextSegment(session.activeSegmentId);
+    if (!segment || segment.status !== "active") {
+      throw new KernelError("Active context segment is unavailable.", 409, "context_segment_mismatch");
+    }
+    const allMessages = this.store.listMessagesBySegment(segment.id);
+    const sourcePlan = selectCompactionSource(allMessages, automaticRun?.id ?? null);
+    if (sourcePlan.sourceMessages.length === 0 && !segment.inheritedArtifactId) {
+      return { state: "noop", segment, artifact: null, message: "No eligible finalized prefix is available." };
+    }
+    const agent = automaticRun ? this.getAgentForRun(automaticRun) : this.resolveAgentForSession(session);
+    const executionSnapshot = automaticRun ? executionSnapshotFromRunMetadata(automaticRun.metadata) : null;
+    const recordedProviderProfileId =
+      executionSnapshot?.providerProfileId ?? (automaticRun ? stringField(automaticRun.metadata, "providerProfileId") : "");
+    const providerProfileId = recordedProviderProfileId || agent.modelProfileId || this.providers.list().defaultProviderProfileId;
+    const resolvedProvider = this.resolveSavedProvider(providerProfileId);
+    const optionPlan = buildRunOptionPlan(
+      resolvedProvider.profile,
+      executionSnapshot?.runOptions ?? automaticRun?.runOptions ?? agent.defaultRunOptions ?? {}
+    );
+    const model = optionPlan.runOptions.model ?? resolvedProvider.profile.model ?? null;
+    const capability = await this.getModelContextCapability(resolvedProvider.profile.id, model);
+    const budget = resolveContextBudget(capability, agent.contextPolicy);
+    const previousArtifact = segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null;
+    if (
+      previousArtifact &&
+      this.inheritedSummaryExceedsBudget(
+        session,
+        segment.id,
+        agent,
+        previousArtifact,
+        resolvedProvider.adapter,
+        resolvedProvider.profile.id,
+        optionPlan.runOptions,
+        budget
+      )
+    ) {
+      return this.performSummaryOnlyRecovery({
+        session,
+        segment,
+        previousArtifact,
+        agent,
+        resolvedProvider,
+        optionPlan,
+        budget,
+        signal,
+        automaticRun
+      });
+    }
+    if (sourcePlan.sourceMessages.length === 0) {
+      if (automaticRun) {
+        this.emit(automaticRun, "context_compaction_skipped", {
+          runId: automaticRun.id,
+          sessionId,
+          segmentId: segment.id,
+          reason: "no_finalized_prefix"
+        });
+      }
+      return { state: "noop", segment, artifact: null, message: "No eligible finalized prefix is available." };
+    }
+    const createdAt = new Date().toISOString();
+    const artifactId = randomUUID();
+    if (automaticRun) {
+      this.emit(automaticRun, "context_compaction_started", {
+        runId: automaticRun.id,
+        sessionId,
+        artifactId,
+        sourceSegmentId: segment.id,
+        providerProfileId: resolvedProvider.profile.id,
+        model
+      });
+    }
+
+    let selectedEntries = [...sourcePlan.entries];
+    let selectedMessages = selectedEntries.flatMap((entry) => entry.messages);
+    let contextResult: ReturnType<typeof buildContext> | null = null;
+    while (selectedMessages.length > 0) {
+      const summaryInput = buildCompactionInput(previousArtifact?.summary ?? null, selectedEntries);
+      try {
+        contextResult = this.buildContext({
+          session,
+          agent: {
+            ...agent,
+            systemPrompt: compactionSystemPrompt,
+            toolIds: [],
+            skillIds: [],
+            contextPolicy: agent.contextPolicy
+          },
+          messages: [],
+          currentMessage: { content: summaryInput, messageId: `compaction:${artifactId}` },
+          currentMessageId: `compaction:${artifactId}`,
+          providerProfileId: resolvedProvider.profile.id,
+          runOptions: { ...optionPlan.runOptions, temperature: 0 },
+          availableTools: [],
+          resolvedBudget: budget,
+          providerOverhead: resolvedProvider.adapter.contextPlanning,
+          activeSegmentId: segment.id
+        });
+        break;
+      } catch (error) {
+        if (!(error instanceof KernelError) || error.code !== "context_budget_exceeded") {
+          throw error;
+        }
+        selectedEntries = selectedEntries.slice(0, -1);
+        selectedMessages = selectedEntries.flatMap((entry) => entry.messages);
+      }
+    }
+    if (!contextResult || selectedMessages.length === 0) {
+      return this.recordCompactionFailure({
+        session,
+        segmentId: segment.id,
+        artifactId,
+        previousArtifactId: previousArtifact?.id ?? null,
+        sourceMessages: sourcePlan.sourceMessages,
+        sourceCategories: sourcePlan.entries.map((entry) => entry.category),
+        budget,
+        providerProfileId: resolvedProvider.profile.id,
+        model,
+        error: "No eligible source prefix fits the compaction provider budget.",
+        automaticRun
+      });
+    }
+
+    const selectedIds = new Set(selectedMessages.map((message) => message.id));
+    const preservedMessageIds = allMessages.filter((message) => !selectedIds.has(message.id)).map((message) => message.id);
+    const segmentRuns = this.store.listRuns({ sessionId }).filter((candidate) => candidate.segmentId === segment.id);
+    const sourceRunIds = [...new Set(selectedMessages.flatMap((message) => (message.runId ? [message.runId] : [])))];
+    const sourceRunSet = new Set(sourceRunIds);
+    const preservedRunIds = segmentRuns.filter((candidate) => !sourceRunSet.has(candidate.id)).map((candidate) => candidate.id);
+    const collector = new CompactionCollector();
+    try {
+      if (signal.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Compaction cancelled.");
+      }
+      const providerInput: ProviderRunInput = {
+        session,
+        context: contextResult.context,
+        sourceMessages: selectedMessages,
+        messages: toProviderMessages(contextResult.context),
+        profile: resolvedProvider.profile,
+        credential: resolvedProvider.credential,
+        requestedRunOptions: optionPlan.requestedRunOptions,
+        runOptions: { ...optionPlan.runOptions, temperature: 0 },
+        unsupportedRunOptions: optionPlan.unsupportedRunOptions
+      };
+      const result = await resolvedProvider.adapter.run(providerInput, { signal, writer: collector });
+      if (signal.aborted) {
+        throw signal.reason instanceof Error ? signal.reason : new Error("Compaction cancelled.");
+      }
+      if (result.toolCalls.length > 0) {
+        throw new Error("Compaction provider returned a tool call instead of a summary.");
+      }
+      const summary = validatedCompactionSummary(collector.text, budget.inputBudgetTokens);
+      const sourceMessageIds = selectedMessages.map((message) => message.id);
+      const artifact: ContextArtifact = {
+        id: artifactId,
+        kind: "compaction",
+        sessionId,
+        sourceSegmentId: segment.id,
+        targetSegmentId: null,
+        previousArtifactId: previousArtifact?.id ?? null,
+        sourceMessageIds,
+        sourceCategories: selectedEntries.map((entry) => entry.category),
+        sourceFirstMessageId: sourceMessageIds[0] ?? null,
+        sourceLastMessageId: sourceMessageIds.at(-1) ?? null,
+        summary,
+        strategyVersion: compactionStrategyVersion,
+        estimatorVersion: contextEstimatorVersion,
+        estimatedTokensBefore: estimateTextTokens(buildCompactionInput(previousArtifact?.summary ?? null, selectedEntries)),
+        estimatedTokensAfter: estimateTextTokens(summary),
+        resolvedWindowTokens: budget.windowTokens,
+        windowSource: budget.windowSource,
+        status: "completed",
+        providerProfileId: resolvedProvider.profile.id,
+        model,
+        usage: collector.usage,
+        error: null,
+        createdAt
+      };
+      const rotated = this.store.rotateContextSegment({
+        sessionId,
+        expectedActiveSegmentId: segment.id,
+        newSegmentId: randomUUID(),
+        preservedMessageIds,
+        sourceRunIds,
+        preservedRunIds,
+        artifact,
+        rotatedAt: new Date().toISOString(),
+        ...(automaticRun ? { allowedActiveRunId: automaticRun.id } : {})
+      });
+      if (!rotated) {
+        throw new Error("Context segment rotation lost its concurrency check.");
+      }
+      if (automaticRun) {
+        this.store.mergeRunMetadata(
+          automaticRun.id,
+          { contextCompactionArtifactId: artifact.id, contextCompactionUsage: runUsageToJson(collector.usage) },
+          new Date().toISOString()
+        );
+        this.emit(automaticRun, "context_compaction_completed", {
+          runId: automaticRun.id,
+          sessionId,
+          artifactId: artifact.id,
+          sourceSegmentId: segment.id,
+          targetSegmentId: rotated.segment.id,
+          estimatedTokensBefore: artifact.estimatedTokensBefore,
+          estimatedTokensAfter: artifact.estimatedTokensAfter,
+          providerProfileId: artifact.providerProfileId,
+          model: artifact.model,
+          usage: artifact.usage
+        });
+        this.emit(automaticRun, "segment_rotated", {
+          runId: automaticRun.id,
+          sessionId,
+          artifactId: artifact.id,
+          sourceSegmentId: segment.id,
+          targetSegmentId: rotated.segment.id
+        });
+      }
+      return { state: "completed", segment: rotated.segment, artifact: rotated.artifact };
+    } catch (error) {
+      return this.recordCompactionFailure({
+        session,
+        segmentId: segment.id,
+        artifactId,
+        previousArtifactId: previousArtifact?.id ?? null,
+        sourceMessages: selectedMessages,
+        sourceCategories: selectedEntries.map((entry) => entry.category),
+        budget,
+        providerProfileId: resolvedProvider.profile.id,
+        model,
+        error: sanitizedCompactionError(error),
+        usage: collector.usage,
+        automaticRun
+      });
+    }
+  }
+
+  private recordCompactionFailure(input: {
+    session: Session;
+    segmentId: string;
+    artifactId: string;
+    previousArtifactId: string | null;
+    sourceMessages: Message[];
+    sourceCategories: ContextArtifactSourceCategory[];
+    budget: ReturnType<typeof resolveContextBudget>;
+    providerProfileId: string;
+    model: string | null;
+    error: string;
+    usage?: RunUsage | null;
+    automaticRun: Run | null;
+  }): CompactContextResponse {
+    const sourceMessageIds = input.sourceMessages.map((message) => message.id);
+    const artifact = this.store.createContextArtifact({
+      id: input.artifactId,
+      kind: "compaction",
+      sessionId: input.session.id,
+      sourceSegmentId: input.segmentId,
+      previousArtifactId: input.previousArtifactId,
+      sourceMessageIds,
+      sourceCategories: input.sourceCategories,
+      sourceFirstMessageId: sourceMessageIds[0] ?? null,
+      sourceLastMessageId: sourceMessageIds.at(-1) ?? null,
+      summary: "",
+      strategyVersion: compactionStrategyVersion,
+      estimatorVersion: contextEstimatorVersion,
+      estimatedTokensBefore: estimateTextTokens(buildCompactionInput(null, entriesFromCategories(input.sourceMessages, input.sourceCategories))),
+      estimatedTokensAfter: 0,
+      resolvedWindowTokens: input.budget.windowTokens,
+      windowSource: input.budget.windowSource,
+      status: "failed",
+      providerProfileId: input.providerProfileId,
+      model: input.model,
+      usage: input.usage ?? null,
+      error: input.error,
+      createdAt: new Date().toISOString()
+    });
+    if (input.automaticRun) {
+      this.emit(input.automaticRun, "context_compaction_failed", {
+        runId: input.automaticRun.id,
+        sessionId: input.session.id,
+        artifactId: artifact.id,
+        sourceSegmentId: input.segmentId,
+        providerProfileId: input.providerProfileId,
+        model: input.model,
+        usage: artifact.usage,
+        error: artifact.error
+      });
+    }
+    return { state: "failed", segment: this.store.getContextSegment(input.segmentId)!, artifact, message: input.error };
+  }
+
+  private recordEarlyCompactionFailure(sessionId: string, automaticRun: Run | null, error: unknown): CompactContextResponse {
+    const session = this.getSession(sessionId);
+    const segment = this.store.getContextSegment(session.activeSegmentId);
+    if (!segment || segment.status !== "active") throw error;
+    const previous = segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null;
+    const sourcePlan = selectCompactionSource(this.store.listMessagesBySegment(segment.id), automaticRun?.id ?? null);
+    const sourceMessageIds =
+      sourcePlan.sourceMessages.length > 0 ? sourcePlan.sourceMessages.map((message) => message.id) : previous?.sourceMessageIds ?? [];
+    const sourceCategories =
+      sourcePlan.entries.length > 0
+        ? sourcePlan.entries.map((entry) => entry.category)
+        : previous
+          ? [{ category: "summary_recovery" as const, messageIds: previous.sourceMessageIds, runId: null, status: "resolution_failed" }]
+          : [];
+    const summaryRecoveryAttempt = sourcePlan.sourceMessages.length === 0 && previous !== null;
+    const agent = automaticRun ? this.getAgentForRun(automaticRun) : this.resolveAgentForSession(session);
+    const artifact = this.store.createContextArtifact({
+      id: randomUUID(),
+      kind: "compaction",
+      sessionId,
+      sourceSegmentId: summaryRecoveryAttempt ? previous.sourceSegmentId : segment.id,
+      targetSegmentId: summaryRecoveryAttempt ? segment.id : null,
+      previousArtifactId: previous?.id ?? null,
+      sourceMessageIds,
+      sourceCategories,
+      sourceFirstMessageId: sourceMessageIds[0] ?? null,
+      sourceLastMessageId: sourceMessageIds.at(-1) ?? null,
+      summary: "",
+      strategyVersion: compactionStrategyVersion,
+      estimatorVersion: contextEstimatorVersion,
+      estimatedTokensBefore: 0,
+      estimatedTokensAfter: 0,
+      resolvedWindowTokens: 16_384,
+      windowSource: "assumed",
+      status: "failed",
+      providerProfileId: automaticRun ? stringField(automaticRun.metadata, "providerProfileId") || agent.modelProfileId : agent.modelProfileId,
+      model: automaticRun?.model ?? agent.defaultRunOptions?.model ?? null,
+      usage: null,
+      error: sanitizedCompactionError(error),
+      createdAt: new Date().toISOString()
+    });
+    if (automaticRun) {
+      this.emit(automaticRun, "context_compaction_failed", {
+        runId: automaticRun.id,
+        sessionId,
+        artifactId: artifact.id,
+        sourceSegmentId: artifact.sourceSegmentId,
+        providerProfileId: artifact.providerProfileId,
+        model: artifact.model,
+        error: artifact.error
+      });
+    }
+    return { state: "failed", segment, artifact, message: artifact.error ?? undefined };
+  }
+
+  private inheritedSummaryExceedsBudget(
+    session: Session,
+    activeSegmentId: string,
+    agent: AgentDefinition,
+    artifact: ContextArtifact,
+    adapter: ProviderAdapter,
+    providerProfileId: string,
+    runOptions: RunOptions,
+    budget: ReturnType<typeof resolveContextBudget>
+  ): boolean {
+    try {
+      this.buildContext({
+        session,
+        agent,
+        messages: [],
+        providerProfileId,
+        runOptions,
+        availableTools: this.getAvailableToolsForAgent(agent),
+        resolvedBudget: budget,
+        providerOverhead: adapter.contextPlanning,
+        activeSegmentId,
+        compactionArtifact: artifact
+      });
+      return false;
+    } catch (error) {
+      if (error instanceof KernelError && error.code === "context_summary_exceeds_budget") return true;
+      throw error;
+    }
+  }
+
+  private async performSummaryOnlyRecovery(input: {
+    session: Session;
+    segment: ContextSegment;
+    previousArtifact: ContextArtifact;
+    agent: AgentDefinition;
+    resolvedProvider: ResolvedProviderRun;
+    optionPlan: RunOptionPlan;
+    budget: ReturnType<typeof resolveContextBudget>;
+    signal: AbortSignal;
+    automaticRun: Run | null;
+  }): Promise<CompactContextResponse> {
+    const artifactId = randomUUID();
+    const sourceCategory: ContextArtifactSourceCategory = {
+      category: "summary_recovery",
+      messageIds: input.previousArtifact.sourceMessageIds,
+      runId: null,
+      status: "completed_artifact"
+    };
+    if (input.automaticRun) {
+      this.emit(input.automaticRun, "context_compaction_started", {
+        runId: input.automaticRun.id,
+        sessionId: input.session.id,
+        artifactId,
+        sourceSegmentId: input.previousArtifact.sourceSegmentId,
+        targetSegmentId: input.segment.id,
+        reason: "summary_only_recovery",
+        providerProfileId: input.resolvedProvider.profile.id,
+        model: input.optionPlan.runOptions.model ?? input.resolvedProvider.profile.model ?? null
+      });
+    }
+    let contextResult: ReturnType<typeof buildContext> | null = null;
+    let reducedSource = input.previousArtifact.summary;
+    let maxChars = reducedSource.length;
+    while (maxChars >= 64) {
+      reducedSource = boundHistoricalContextText(input.previousArtifact.summary, maxChars);
+      try {
+        contextResult = this.buildContext({
+          session: input.session,
+          agent: { ...input.agent, systemPrompt: compactionSystemPrompt, toolIds: [], skillIds: [] },
+          messages: [],
+          currentMessage: {
+            content: buildSummaryRecoveryInput(input.previousArtifact.id, reducedSource),
+            messageId: `summary-recovery:${artifactId}`
+          },
+          currentMessageId: `summary-recovery:${artifactId}`,
+          providerProfileId: input.resolvedProvider.profile.id,
+          runOptions: { ...input.optionPlan.runOptions, temperature: 0 },
+          availableTools: [],
+          resolvedBudget: input.budget,
+          providerOverhead: input.resolvedProvider.adapter.contextPlanning,
+          activeSegmentId: input.segment.id
+        });
+        break;
+      } catch (error) {
+        if (!(error instanceof KernelError) || error.code !== "context_budget_exceeded") throw error;
+        maxChars = Math.floor(maxChars * 0.75);
+      }
+    }
+    const collector = new CompactionCollector();
+    try {
+      if (!contextResult) throw new Error("The inherited summary cannot fit the current provider budget even after deterministic reduction.");
+      const providerInput: ProviderRunInput = {
+        session: input.session,
+        context: contextResult.context,
+        sourceMessages: [],
+        messages: toProviderMessages(contextResult.context),
+        profile: input.resolvedProvider.profile,
+        credential: input.resolvedProvider.credential,
+        requestedRunOptions: input.optionPlan.requestedRunOptions,
+        runOptions: { ...input.optionPlan.runOptions, temperature: 0 },
+        unsupportedRunOptions: input.optionPlan.unsupportedRunOptions
+      };
+      const result = await input.resolvedProvider.adapter.run(providerInput, { signal: input.signal, writer: collector });
+      if (input.signal.aborted) throw input.signal.reason instanceof Error ? input.signal.reason : new Error("Summary recovery cancelled.");
+      if (result.toolCalls.length > 0) throw new Error("Summary recovery provider returned a tool call.");
+      const summary = validatedCompactionSummary(collector.text, input.budget.inputBudgetTokens);
+      const artifact: ContextArtifact = {
+        id: artifactId,
+        kind: "compaction",
+        sessionId: input.session.id,
+        sourceSegmentId: input.previousArtifact.sourceSegmentId,
+        targetSegmentId: input.segment.id,
+        previousArtifactId: input.previousArtifact.id,
+        sourceMessageIds: input.previousArtifact.sourceMessageIds,
+        sourceCategories: [sourceCategory],
+        sourceFirstMessageId: input.previousArtifact.sourceFirstMessageId,
+        sourceLastMessageId: input.previousArtifact.sourceLastMessageId,
+        summary,
+        strategyVersion: "continuity-summary-recovery-v1",
+        estimatorVersion: contextEstimatorVersion,
+        estimatedTokensBefore: estimateTextTokens(input.previousArtifact.summary),
+        estimatedTokensAfter: estimateTextTokens(summary),
+        resolvedWindowTokens: input.budget.windowTokens,
+        windowSource: input.budget.windowSource,
+        status: "completed",
+        providerProfileId: input.resolvedProvider.profile.id,
+        model: input.optionPlan.runOptions.model ?? input.resolvedProvider.profile.model ?? null,
+        usage: collector.usage,
+        error: null,
+        createdAt: new Date().toISOString()
+      };
+      const replaced = this.store.replaceInheritedContextArtifact({
+        sessionId: input.session.id,
+        expectedActiveSegmentId: input.segment.id,
+        expectedArtifactId: input.previousArtifact.id,
+        artifact,
+        updatedAt: artifact.createdAt
+      });
+      if (!replaced) throw new Error("Inherited summary recovery lost its segment/artifact CAS.");
+      if (input.automaticRun) {
+        this.emit(input.automaticRun, "context_compaction_completed", {
+          runId: input.automaticRun.id,
+          sessionId: input.session.id,
+          artifactId: artifact.id,
+          sourceSegmentId: artifact.sourceSegmentId,
+          targetSegmentId: input.segment.id,
+          reason: "summary_only_recovery",
+          estimatedTokensBefore: artifact.estimatedTokensBefore,
+          estimatedTokensAfter: artifact.estimatedTokensAfter,
+          providerProfileId: artifact.providerProfileId,
+          model: artifact.model,
+          usage: artifact.usage
+        });
+      }
+      return { state: "completed", segment: replaced.segment, artifact: replaced.artifact };
+    } catch (error) {
+      const failed = this.store.createContextArtifact({
+        id: artifactId,
+        kind: "compaction",
+        sessionId: input.session.id,
+        sourceSegmentId: input.previousArtifact.sourceSegmentId,
+        targetSegmentId: input.segment.id,
+        previousArtifactId: input.previousArtifact.id,
+        sourceMessageIds: input.previousArtifact.sourceMessageIds,
+        sourceCategories: [sourceCategory],
+        sourceFirstMessageId: input.previousArtifact.sourceFirstMessageId,
+        sourceLastMessageId: input.previousArtifact.sourceLastMessageId,
+        summary: "",
+        strategyVersion: "continuity-summary-recovery-v1",
+        estimatorVersion: contextEstimatorVersion,
+        estimatedTokensBefore: estimateTextTokens(input.previousArtifact.summary),
+        estimatedTokensAfter: 0,
+        resolvedWindowTokens: input.budget.windowTokens,
+        windowSource: input.budget.windowSource,
+        status: "failed",
+        providerProfileId: input.resolvedProvider.profile.id,
+        model: input.optionPlan.runOptions.model ?? input.resolvedProvider.profile.model ?? null,
+        usage: collector.usage,
+        error: sanitizedCompactionError(error),
+        createdAt: new Date().toISOString()
+      });
+      if (input.automaticRun) {
+        this.emit(input.automaticRun, "context_compaction_failed", {
+          runId: input.automaticRun.id,
+          sessionId: input.session.id,
+          artifactId: failed.id,
+          sourceSegmentId: failed.sourceSegmentId,
+          targetSegmentId: input.segment.id,
+          reason: "summary_only_recovery",
+          error: failed.error
+        });
+      }
+      return { state: "failed", segment: this.store.getContextSegment(input.segment.id)!, artifact: failed, message: failed.error ?? undefined };
+    }
+  }
+
+  private async getModelContextCapability(providerProfileId: string, modelId: string | null | undefined) {
+    const registry = this.providers as ProviderRegistry & {
+      resolveModelContextCapability?: ProviderRegistry["resolveModelContextCapability"];
+      getModelContextCapability?: ProviderRegistry["getModelContextCapability"];
+    };
+    if (typeof registry.resolveModelContextCapability === "function") {
+      return registry.resolveModelContextCapability.call(this.providers, providerProfileId, modelId);
+    }
+    return registry.getModelContextCapability?.call(this.providers, providerProfileId, modelId) ?? null;
   }
 
   private resolveAgentForSession(session: Session, explicitAgentId?: string): AgentDefinition {
@@ -2415,6 +3290,7 @@ export class Kernel {
     }
 
     const defaultRunOptions = normalizeAgentRunOptions(input.defaultRunOptions);
+    const contextPolicy = normalizeAgentContextPolicy(input.contextPolicy);
     const skillIds = normalizeAgentIdList(input.skillIds ?? [], "skillIds");
     const toolIds = normalizeAgentIdList(input.toolIds ?? [], "toolIds");
     for (const toolId of toolIds) {
@@ -2429,6 +3305,7 @@ export class Kernel {
       systemPrompt,
       modelProfileId,
       defaultRunOptions,
+      contextPolicy,
       skillIds,
       toolIds
     };
@@ -2486,6 +3363,45 @@ function normalizeAgentRunOptions(value: RunOptions | null | undefined): RunOpti
     options.temperature = value.temperature;
   }
   return Object.keys(options).length > 0 ? options : null;
+}
+
+function normalizeAgentContextPolicy(value: AgentDefinition["contextPolicy"] | undefined): AgentDefinition["contextPolicy"] {
+  if (!value) {
+    return null;
+  }
+  const policy: NonNullable<AgentDefinition["contextPolicy"]> = {};
+  if (value.contextWindowTokensOverride !== undefined) {
+    if (!Number.isInteger(value.contextWindowTokensOverride) || value.contextWindowTokensOverride < 1_024 || value.contextWindowTokensOverride > 2_000_000) {
+      throw new KernelError("Agent context window override must be an integer between 1024 and 2000000 tokens.", 400);
+    }
+    policy.contextWindowTokensOverride = value.contextWindowTokensOverride;
+  }
+  if (value.reservedOutputTokens !== undefined) {
+    if (!Number.isInteger(value.reservedOutputTokens) || value.reservedOutputTokens < 128 || value.reservedOutputTokens > 500_000) {
+      throw new KernelError("Agent reserved output tokens must be an integer between 128 and 500000.", 400);
+    }
+    policy.reservedOutputTokens = value.reservedOutputTokens;
+  }
+  if (value.safetyMarginRatio !== undefined) {
+    if (!Number.isFinite(value.safetyMarginRatio) || value.safetyMarginRatio < 0 || value.safetyMarginRatio > 0.5) {
+      throw new KernelError("Agent context safety margin ratio must be between 0 and 0.5.", 400);
+    }
+    policy.safetyMarginRatio = value.safetyMarginRatio;
+  }
+  if (value.automaticCompaction !== undefined) {
+    if (typeof value.automaticCompaction !== "boolean") {
+      throw new KernelError("Agent automatic compaction must be a boolean.", 400);
+    }
+    policy.automaticCompaction = value.automaticCompaction;
+  }
+  if (
+    policy.contextWindowTokensOverride !== undefined &&
+    policy.reservedOutputTokens !== undefined &&
+    policy.reservedOutputTokens >= policy.contextWindowTokensOverride
+  ) {
+    throw new KernelError("Agent reserved output tokens must be smaller than the context window override.", 400);
+  }
+  return Object.keys(policy).length > 0 ? policy : null;
 }
 
 function normalizeAgentIdList(values: string[], field: "skillIds" | "toolIds"): string[] {
@@ -2562,6 +3478,293 @@ function publicRunOptions(options: RunOptions | null): RunOptions | null {
     output.temperature = options.temperature;
   }
   return Object.keys(output).length > 0 ? output : null;
+}
+
+const compactionStrategyVersion = "continuity-summary-v1";
+const compactionSummaryMaxChars = 12_000;
+const compactionSummaryMaxTokens = 3_072;
+const compactionTimeoutMs = 30_000;
+const compactionSummaryHeadings = [
+  "Goals and user intent",
+  "Decisions and constraints",
+  "Current implementation and changed files",
+  "Validation and results",
+  "Open issues and next work",
+  "Important tool results"
+];
+const compactionSystemPrompt = [
+  "Create a cumulative continuity summary for a later model context.",
+  `Return plain text with these headings: ${compactionSummaryHeadings.join("; ")}.`,
+  "Preserve concrete identifiers and unresolved constraints. Do not call tools, include hidden reasoning, credentials, or raw provider payloads.",
+  "The previous summary is authoritative continuity. Merge it with only the supplied new source messages."
+].join("\n");
+
+class CompactionCollector implements ProviderRunWriter {
+  text = "";
+  usage: RunUsage | null = null;
+
+  writeDelta(text: string): void {
+    if (this.text.length <= compactionSummaryMaxChars) {
+      this.text += text.slice(0, compactionSummaryMaxChars + 1 - this.text.length);
+    }
+  }
+
+  writeUsage(usage: RunUsage): void {
+    this.usage = mergeCompactionUsage(this.usage, usage);
+  }
+
+  writeMetadata(): void {}
+}
+
+interface CompactionSourceEntry {
+  messages: Message[];
+  category: ContextArtifactSourceCategory;
+  hardBoundary: boolean;
+}
+
+function selectCompactionSource(messages: Message[], activeRunId: string | null): {
+  entries: CompactionSourceEntry[];
+  sourceMessages: Message[];
+  preservedMessages: Message[];
+} {
+  const grouped: Message[][] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      grouped.push([message]);
+    } else if (
+      grouped.length > 0 &&
+      grouped[grouped.length - 1][0]?.role === "user" &&
+      !(
+        message.role === "assistant" &&
+        grouped[grouped.length - 1].some((item) => item.role === "assistant") &&
+        message.runId !== grouped[grouped.length - 1][0]?.runId
+      )
+    ) {
+      grouped[grouped.length - 1].push(message);
+    } else {
+      grouped.push([message]);
+    }
+  }
+  const entries = grouped.map((group) => classifyCompactionEntry(group, activeRunId));
+  const successfulCount = entries.filter((entry) => entry.category.category === "completed_turn").length;
+  let remainingSuccessful = successfulCount;
+  const selected: CompactionSourceEntry[] = [];
+  for (const entry of entries) {
+    if (entry.hardBoundary) break;
+    if (entry.category.category === "completed_turn" && remainingSuccessful <= 2) break;
+    selected.push(entry);
+    if (entry.category.category === "completed_turn") remainingSuccessful -= 1;
+  }
+  const sourceMessages = selected.flatMap((entry) => entry.messages);
+  const sourceIds = new Set(sourceMessages.map((message) => message.id));
+  return {
+    entries: selected,
+    sourceMessages,
+    preservedMessages: messages.filter((message) => !sourceIds.has(message.id))
+  };
+}
+
+function classifyCompactionEntry(messages: Message[], activeRunId: string | null): CompactionSourceEntry {
+  const first = messages[0];
+  const runId = first?.runId ?? null;
+  const hardBoundary = messages.some(
+    (message) => (activeRunId !== null && message.runId === activeRunId) || message.status === "streaming"
+  );
+  const successfulAssistant = messages.find(
+    (message) => message.role === "assistant" && message.status === "completed" && !message.error
+  );
+  const terminalFailure = messages.find(
+    (message) =>
+      message.status === "failed" || message.status === "cancelled" || message.status === "interrupted" || Boolean(message.error)
+  );
+  let category: ContextArtifactSourceCategory["category"];
+  let status: string;
+  if (first?.role === "user" && successfulAssistant) {
+    category = "completed_turn";
+    status = "completed";
+  } else if (first?.role === "user") {
+    category = "unsuccessful_turn";
+    status = terminalFailure?.status ?? (hardBoundary ? "active" : "terminal_without_completed_assistant");
+  } else if (messages.some((message) => message.parts.some((part) => part.type === "tool_result" || part.type === "command_output"))) {
+    category = "standalone_tool";
+    status = terminalFailure?.status ?? first?.status ?? "completed";
+  } else {
+    category = "orphan_record";
+    status = terminalFailure?.status ?? first?.status ?? "unknown";
+  }
+  return {
+    messages,
+    hardBoundary,
+    category: { category, messageIds: messages.map((message) => message.id), runId, status }
+  };
+}
+
+function buildCompactionInput(previousSummary: string | null, entries: CompactionSourceEntry[]): string {
+  const messageText = entries.map(compactionEntryText).join("\n\n");
+  return [
+    "Previous cumulative summary:",
+    previousSummary?.trim() || "(none)",
+    "",
+    "New finalized source messages:",
+    messageText
+  ].join("\n");
+}
+
+function buildSummaryRecoveryInput(previousArtifactId: string, summary: string): string {
+  return [
+    `Previous completed artifact: ${previousArtifactId}`,
+    "Create a smaller cumulative continuity summary from this previous summary only.",
+    "Do not infer or request sealed raw messages.",
+    "",
+    summary
+  ].join("\n");
+}
+
+function validatedCompactionSummary(raw: string, inputBudgetTokens: number): string {
+  const summary = sanitizeCompactionSummary(raw).trim();
+  if (!summary) throw new Error("Compaction provider returned an empty summary.");
+  if (!compactionSummaryHeadings.every((heading) => summary.toLowerCase().includes(heading.toLowerCase()))) {
+    throw new Error("Compaction provider summary did not contain the required continuity sections.");
+  }
+  const summaryTokenLimit = Math.min(compactionSummaryMaxTokens, Math.max(256, Math.floor(inputBudgetTokens * 0.4)));
+  if (summary.length > compactionSummaryMaxChars || estimateTextTokens(summary) > summaryTokenLimit) {
+    throw new Error("Compaction provider summary exceeded the bounded artifact limit.");
+  }
+  return summary;
+}
+
+function compactionEntryText(entry: CompactionSourceEntry): string {
+  const header = `[${entry.category.category} · ${entry.category.status} · ${entry.category.messageIds.join(",")}]`;
+  if (entry.category.category === "orphan_record") {
+    return `${header}\nAudit-only orphan record; raw content intentionally omitted.`;
+  }
+  if (entry.category.category === "unsuccessful_turn") {
+    const users = projectStoredMessagesForContext(entry.messages.filter((message) => message.role === "user"));
+    const intent = users.map((message) => boundHistoricalContextText(message.content)).join("\n");
+    const error = entry.messages.map((message) => message.error).find(Boolean);
+    return `${header}\nUser intent: ${intent || "(unavailable)"}\nTerminal result: ${entry.category.status}${error ? ` · ${sanitizedCompactionError(error)}` : ""}`;
+  }
+  const projected = projectStoredMessagesForContext(entry.messages);
+  const body = projected
+    .map((message) => `[${message.role} · ${message.messageId ?? "unknown"}]\n${boundHistoricalContextText(message.content)}`)
+    .join("\n\n");
+  return `${header}\n${body || "(no provider-visible content)"}`;
+}
+
+function entriesFromCategories(messages: Message[], categories: ContextArtifactSourceCategory[]): CompactionSourceEntry[] {
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  return categories.map((category) => ({
+    category,
+    hardBoundary: false,
+    messages: category.messageIds.flatMap((id) => {
+      const message = byId.get(id);
+      return message ? [message] : [];
+    })
+  }));
+}
+
+function mergeCompactionUsage(current: RunUsage | null, update: RunUsage): RunUsage {
+  const output: RunUsage = { ...(current ?? {}) };
+  for (const key of ["inputTokens", "outputTokens", "reasoningTokens", "totalTokens"] as const) {
+    if (typeof update[key] === "number") {
+      output[key] = update[key];
+    }
+  }
+  return output;
+}
+
+function runUsageToJson(usage: RunUsage | null): JsonObject {
+  return usage ? { ...usage } : {};
+}
+
+function sanitizedCompactionError(error: unknown): string {
+  return sanitizedPublicString(error instanceof Error ? error.message : String(error), 800) ?? "Context compaction failed.";
+}
+
+function sanitizeCompactionSummary(value: string): string {
+  return value
+    .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED]")
+    .replace(/("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi, "$1[REDACTED]$2")
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_API_KEY]")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+}
+
+function publicContextPlanSummary(value: unknown): PublicRunSummary["context"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as JsonObject;
+  const object = contextPlanObject(record);
+  if (!object) {
+    return null;
+  }
+  const planId = stringField(record, "planId");
+  const providerTurn = numberField(record, "providerTurn");
+  const toolIteration = numberField(record, "toolIteration");
+  const inputBudgetTokens = numberField(object, "inputBudgetTokens");
+  const estimatedInputTokens = numberField(object, "estimatedInputTokens");
+  const providerNeutralTokens = numberField(object, "providerNeutralTokens") ?? estimatedInputTokens;
+  const nativeOverheadTokens = numberField(object, "nativeOverheadTokens") ?? 0;
+  const trimmingApplied = booleanField(object, "trimmingApplied");
+  const capabilityStale = booleanField(object, "capabilityStale") ?? false;
+  const windowSource = stringField(object, "windowSource");
+  if (
+    !planId ||
+    providerTurn === null ||
+    toolIteration === null ||
+    inputBudgetTokens === null ||
+    estimatedInputTokens === null ||
+    providerNeutralTokens === null ||
+    nativeOverheadTokens === null ||
+    trimmingApplied === null ||
+    estimatedInputTokens !== providerNeutralTokens + nativeOverheadTokens ||
+    estimatedInputTokens > inputBudgetTokens ||
+    (windowSource !== "provider" && windowSource !== "adapter" && windowSource !== "user" && windowSource !== "assumed")
+  ) {
+    return null;
+  }
+  return {
+    planId,
+    providerTurn,
+    toolIteration,
+    inputBudgetTokens,
+    estimatedInputTokens,
+    providerNeutralTokens,
+    nativeOverheadTokens,
+    trimmingApplied,
+    windowSource,
+    capabilityStale
+  };
+}
+
+function contextPlanRecordObjects(metadata: JsonObject): JsonObject[] {
+  const records = metadata.contextPlanRecords;
+  if (Array.isArray(records)) {
+    return records.filter((record): record is JsonObject => Boolean(record && typeof record === "object" && !Array.isArray(record)));
+  }
+  const legacyPlan = metadata.contextPlan;
+  return legacyPlan && typeof legacyPlan === "object" && !Array.isArray(legacyPlan)
+    ? [
+        {
+          planId: "legacy-context-plan",
+          providerTurn: 0,
+          toolIteration: 0,
+          createdAt: "1970-01-01T00:00:00.000Z",
+          plan: legacyPlan
+        }
+      ]
+    : [];
+}
+
+function contextPlanObject(record: JsonObject | undefined): JsonObject | null {
+  const plan = record?.plan;
+  return plan && typeof plan === "object" && !Array.isArray(plan) ? (plan as JsonObject) : null;
+}
+
+function integerJsonField(object: JsonObject | undefined, key: string): number {
+  const value = object?.[key];
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : -1;
 }
 
 function sanitizedPublicString(value: string | null | undefined, maxLength: number): string | null {

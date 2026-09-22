@@ -129,6 +129,22 @@ function eventPayload(type: RunEventType, value: unknown): JsonObject {
       riskLevel: payload.riskLevel
     });
   }
+  if (type.startsWith("context_compaction") || type === "segment_rotated") {
+    return compact({
+      runId: payload.runId,
+      sessionId: payload.sessionId,
+      artifactId: payload.artifactId,
+      sourceSegmentId: payload.sourceSegmentId,
+      targetSegmentId: payload.targetSegmentId,
+      reason: payload.reason,
+      estimatedTokensBefore: payload.estimatedTokensBefore,
+      estimatedTokensAfter: payload.estimatedTokensAfter,
+      providerProfileId: payload.providerProfileId,
+      model: payload.model,
+      usage: payload.usage,
+      error: typeof payload.error === "string" ? sanitizePublicText(payload.error, 800) : undefined
+    });
+  }
 
   return compact({
     runId: payload.runId,
