@@ -32,8 +32,12 @@ import {
   type RunOptionPlan
 } from "./kernel-metadata";
 import { RunWriter } from "./run-writer";
+import { currentRunToolTranscript, NativeTranscriptError } from "./tool-transcript";
+import { SubsessionCoordinator } from "./subsession-coordinator";
+import { SubsessionAdmissionError } from "../store/subsessions";
 import {
   toPublicMessage,
+  sanitizePublicText,
   toPublicProviderResolution,
   toPublicRunEvent,
   toPublicToolExecutionResult,
@@ -52,7 +56,6 @@ import {
   permissionPolicySummary,
   summarizeToolInput,
   summarizeToolResult,
-  toolLoopSyntheticMessages,
   toolProviderForPart,
   toPublicPermissionRequest
 } from "./tool-execution";
@@ -160,7 +163,7 @@ interface PreparedToolInvocation {
   invocation: ToolInvocation;
   writer: RunWriter;
   toolCallPart: MessagePart;
-  commandOutputPart: MessagePart;
+  commandOutputPart: MessagePart | null;
   createdAt: string;
   resumeAgentRun: boolean;
   toolLoopIteration?: number;
@@ -210,6 +213,8 @@ export interface KernelOptions {
 }
 
 export class Kernel {
+  private readonly subsessions: SubsessionCoordinator;
+  private readonly unobserveChildren: () => void;
   private readonly store: StoreAdapter;
   private readonly providers: ProviderRegistry;
   private readonly eventBus: RunEventBus;
@@ -225,6 +230,28 @@ export class Kernel {
     this.providers = options.providers;
     this.eventBus = options.eventBus;
     this.tools = options.tools;
+    this.subsessions = new SubsessionCoordinator(this.store, {
+      agent: (id) => {
+        const agent = this.getAgentDefinition(id);
+        const profiles = this.providers.list();
+        const profileId = agent.modelProfileId ?? profiles.defaultProviderProfileId;
+        const profile = profiles.providers.find((item) => item.id === profileId);
+        return { ...agent, modelProfileId: profileId,
+          defaultRunOptions: mergeRunOptions(profile?.defaultRunOptions ?? (profile?.model ? {model:profile.model} : {}),agent.defaultRunOptions ?? {}) };
+      },
+      execute: (runId) => this.executeAdmittedSubsession(runId),
+      fail: (id,error) => {
+        const execution = this.getOrCreateExecution(id);
+        this.handleQueuedExecutionError(id,execution,error);
+        this.releaseTerminalExecution(execution);
+      },
+      cancel: (id) => { this.cancelRun(id); },
+      wake: (id) => this.wakeWaitingParent(id)
+    });
+    this.tools.register(this.subsessions.tool(), true);
+    this.unobserveChildren = this.eventBus.observe((event) => {
+      if (["run_completed", "run_failed", "run_cancelled", "run_interrupted"].includes(event.type)) this.subsessions.changed();
+    });
     this.defaultWorkingDirectory = resolve(options.toolExecutionCwd ?? homedir());
     assertExistingDirectory(this.defaultWorkingDirectory, "Default session workingDirectory");
   }
@@ -399,7 +426,7 @@ export class Kernel {
       run: this.toPublicRunSummary(this.store.getRun(prepared.run.id) ?? prepared.run),
       message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id) ?? prepared.assistantMessage),
       toolCallPartId: prepared.toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart.id
+      commandOutputPartId: prepared.commandOutputPart?.id
     };
   }
 
@@ -538,7 +565,7 @@ export class Kernel {
   async previewContext(sessionId: string, options: PreviewContextOptions = {}): Promise<ContextPreviewResponse> {
     const session = this.getSession(sessionId);
     const agent = this.resolveAgentForSession(session, options.agentId);
-    const resolvedProvider = this.providers.resolveRun({
+    const resolvedProvider = session.parentSessionId ? this.resolveSavedProvider(options.providerProfileId ?? agent.modelProfileId ?? this.providers.list().defaultProviderProfileId) : this.providers.resolveRun({
       provider: options.provider,
       providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
     });
@@ -558,7 +585,7 @@ export class Kernel {
       currentMessage: options.text?.trim() ? { content: options.text } : undefined,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: optionPlan.runOptions,
-      availableTools: this.getAvailableToolsForAgent(agent),
+      availableTools: this.getAvailableToolsForAgent(agent,session),
       providerOverhead: resolvedProvider.adapter.contextPlanning,
       contextCapability: await this.getModelContextCapability(
         resolvedProvider.profile.id,
@@ -608,6 +635,12 @@ export class Kernel {
   /** Call only after the server owns the exclusive database lease and has bound its listening socket. */
   reconcileStartupState(): void {
     const reconciledAt = new Date().toISOString();
+    this.store.subsessions.reconcile(true);
+    for (const run of this.store.listRuns({ statuses: ["running"] })) {
+      if (run.metadata.childWakePending === 1 || this.store.subsessions.list(run.id).some((item) => item.deliveredPartId && !item.acknowledged)) {
+        this.store.transitionRunStatus(run.id, ["running"], "waiting_children", null, reconciledAt);
+      }
+    }
     this.store.expirePendingPermissionsForTerminalRuns(reconciledAt);
     const pendingPermissionRunIds = new Set(this.store.listPermissionRequests({ status: "pending" }).map((request) => request.runId));
     for (const run of this.store.listRuns({ statuses: ["running"] })) {
@@ -619,14 +652,18 @@ export class Kernel {
     for (const run of staleRuns) {
       this.finalizeRunTermination(run, "interrupted", "The daemon restarted before the run reached a terminal state.");
     }
+    this.subsessions.changed();
   }
 
   async shutdown(timeoutMs = 5_000): Promise<void> {
     this.shuttingDown = true;
+    this.subsessions.stop();
+    this.unobserveChildren();
     for (const controller of this.compactionControllers.values()) {
       controller.abort(new RunTerminationError("interrupted"));
     }
     const activePromises: Promise<unknown>[] = [];
+    activePromises.push(...this.subsessions.activePromises());
     activePromises.push(...this.compactions.values());
     for (const execution of this.executions.values()) {
       const run = this.store.getRun(execution.runId);
@@ -661,17 +698,27 @@ export class Kernel {
     sessionId: string,
     text: string,
     options: StartRunOptions,
-    allowSegmentRetry: boolean
+    allowSegmentRetry: boolean,
+    ownedChildRunId?: string
   ): Promise<CreateRunResponse> {
     this.assertAcceptingWork();
-    const session = this.getSession(sessionId);
+    const currentSession = this.getSession(sessionId);
+    const admittedRun = ownedChildRunId ? this.store.getRun(ownedChildRunId) : null;
+    // Match resume: keep admission cwd; legacy Runs without it fall back to current Session cwd.
+    // Only the execution view is changed, never the editable Session row.
+    const session = admittedRun
+      ? { ...currentSession, workingDirectory: stringField(admittedRun.metadata, "workingDirectory") || currentSession.workingDirectory }
+      : currentSession;
+    if (session.parentSessionId && !ownedChildRunId) {
+      throw new KernelError("Child sessions only accept their admitted task; steering and session reuse are not enabled.",409,"child_session_owned");
+    }
     const prompt = text.trim();
     if (!prompt) {
       throw new KernelError("Run text is required", 400);
     }
 
-    const agent = this.resolveAgentForSession(session, options.agentId);
-    const resolvedProvider = this.providers.resolveRun({
+    const agent = admittedRun ? this.getAgentForRun(admittedRun) : this.resolveAgentForSession(session, options.agentId);
+    const resolvedProvider = session.parentSessionId ? this.resolveSavedProvider(options.providerProfileId ?? agent.modelProfileId ?? this.providers.list().defaultProviderProfileId) : this.providers.resolveRun({
       provider: options.provider,
       providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
     });
@@ -683,7 +730,11 @@ export class Kernel {
       model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
     };
     const now = new Date().toISOString();
-    const runId = randomUUID();
+    const admittedChild = ownedChildRunId ? this.store.subsessions.forRun(ownedChildRunId) : null;
+    if (session.parentSessionId && admittedChild?.childRunId !== ownedChildRunId) {
+      throw new KernelError("Child task admission is missing or already started.",409,"child_session_owned");
+    }
+    const runId = admittedChild?.childRunId ?? randomUUID();
     const userMessageId = randomUUID();
     const assistantMessageId = randomUUID();
     const contextHistory = this.contextHistoryForSession(session);
@@ -697,7 +748,7 @@ export class Kernel {
       currentMessageId: userMessageId,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: optionPlan.runOptions,
-      availableTools: this.getAvailableToolsForAgent(agent),
+      availableTools: this.getAvailableToolsForAgent(agent,session),
       providerOverhead: resolvedProvider.adapter.contextPlanning,
       metadata: { runId },
       contextCapability: await this.getModelContextCapability(
@@ -711,6 +762,8 @@ export class Kernel {
       );
     }
     const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {}, now);
+    this.assertAcceptingWork();
+    runMetadata.workingDirectory = session.workingDirectory;
     let run: Run;
     try {
       run = this.createRun({
@@ -727,7 +780,7 @@ export class Kernel {
     } catch (error) {
       if (error instanceof ContextSegmentChangedStoreError) {
         if (allowSegmentRetry) {
-          return this.startRunAttempt(sessionId, text, options, false);
+          return this.startRunAttempt(sessionId, text, options, false, ownedChildRunId);
         }
         throw new KernelError(
           "The active context segment changed while this run was being planned. Retry the request.",
@@ -828,7 +881,9 @@ export class Kernel {
       unsupportedRunOptions: optionPlan.unsupportedRunOptions
     };
 
-    setImmediate(() => {
+    if (ownedChildRunId) {
+      await this.trackExecution(execution, () => this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, execution, writer));
+    } else setImmediate(() => {
       void this.trackExecution(execution, () =>
         this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, execution, writer)
       ).catch((error) => this.handleQueuedExecutionError(run.id, execution, error));
@@ -872,6 +927,7 @@ export class Kernel {
     if (cancellation?.event) {
       this.eventBus.publish(cancellation.event);
     }
+    this.subsessions.cancelOwned(runId);
 
     const execution = this.executions.get(runId);
     if (execution) {
@@ -928,9 +984,12 @@ export class Kernel {
 
   async approvePermissionRequest(id: string): Promise<InvokeToolResponse> {
     this.assertAcceptingWork();
+    const candidate = this.store.getPermissionRequest(id);
+    if (candidate && this.store.getRun(candidate.runId)?.status === "waiting_permission") {
+      await this.executions.get(candidate.runId)?.activePromise;
+    }
     const request = this.getResolvablePermissionRequest(id);
     const run = this.getRun(request.runId);
-    const isAgentToolPermission = booleanField(request.metadata, "agentToolLoop") === true;
     if (run.status !== "waiting_permission") {
       throw new KernelError("Permission request can only be approved while its run is waiting for permission.", 409);
     }
@@ -940,6 +999,14 @@ export class Kernel {
     if (!approvedRequest) {
       throw new KernelError("Permission request or run changed before approval completed.", 409);
     }
+    return this.executeApprovedPermission(approvedRequest);
+  }
+
+  private async executeApprovedPermission(approvedRequest: StoredPermissionRequest): Promise<InvokeToolResponse> {
+    const request = approvedRequest;
+    const run = this.getRun(request.runId);
+    const resolvedAt = approvedRequest.resolvedAt ?? new Date().toISOString();
+    const isAgentToolPermission = booleanField(request.metadata,"agentToolLoop") === true;
     let prepared: PreparedToolInvocation;
     try {
       if (isAgentToolPermission) {
@@ -1145,7 +1212,7 @@ export class Kernel {
       }
     });
 
-    const commandOutputPart = writer.recordCommandOutput({
+    const commandOutputPart = registeredTool.definition.id === "shell.exec" ? writer.recordCommandOutput({
       callId: invocation.id,
       stream: "combined",
       text: "",
@@ -1154,7 +1221,7 @@ export class Kernel {
         invocationId: invocation.id,
         toolId: registeredTool.definition.id
       }
-    });
+    }) : null;
 
     return {
       registeredTool,
@@ -1190,9 +1257,9 @@ export class Kernel {
       throw new KernelError("Tool call part for permission request not found", 404);
     }
     const commandOutputPart = request.commandOutputPartId
-      ? assistantMessage.parts.find((part) => part.id === request.commandOutputPartId)
+      ? assistantMessage.parts.find((part) => part.id === request.commandOutputPartId) ?? null
       : null;
-    if (!commandOutputPart) {
+    if (!commandOutputPart && request.toolId === "shell.exec") {
       throw new KernelError("Command output part for permission request not found", 404);
     }
 
@@ -1263,7 +1330,7 @@ export class Kernel {
       reason: prepared.permission.reason,
       status: "pending",
       toolCallPartId: toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart.id,
+      commandOutputPartId: prepared.commandOutputPart?.id,
       metadata: {
         toolSource: prepared.registeredTool.definition.source,
         executionCwd,
@@ -1306,7 +1373,7 @@ export class Kernel {
       run: this.toPublicRunSummary(this.store.getRun(prepared.run.id)!),
       message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id)!),
       toolCallPartId: toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart.id
+      commandOutputPartId: prepared.commandOutputPart?.id
     };
   }
 
@@ -1314,6 +1381,9 @@ export class Kernel {
     prepared: PreparedToolInvocation,
     responseOptions: { state: "executed"; permissionRequest?: PermissionRequest; finishRun?: boolean }
   ): Promise<InvokeToolResponse> {
+    if (prepared.registeredTool.definition.id !== "shell.exec") {
+      return this.executeGenericTool(prepared, responseOptions);
+    }
     const { registeredTool, executionInput, caller, permission, run, assistantMessage, invocation, writer } = prepared;
     const execution = prepared.execution;
     execution.phase = "tool";
@@ -1321,7 +1391,8 @@ export class Kernel {
     const executionCwd = prepared.executionCwd;
     const commandOutputMaxChars = commandOutputMaxCharsForTool(registeredTool.definition.id, this.getToolSettings());
     let toolCallPart = prepared.toolCallPart;
-    let commandOutputPart = prepared.commandOutputPart;
+    if (!prepared.commandOutputPart) throw new Error("Shell output part is missing.");
+    let commandOutputPart: MessagePart = prepared.commandOutputPart;
     let commandOutputText = partString(commandOutputPart, "text") || commandOutputPart.text || "";
     let commandOutputTruncated = false;
 
@@ -1530,6 +1601,56 @@ export class Kernel {
     };
   }
 
+  private async executeGenericTool(
+    prepared: PreparedToolInvocation,
+    options: { state: "executed"; permissionRequest?: PermissionRequest; finishRun?: boolean }
+  ): Promise<InvokeToolResponse> {
+    const { invocation, writer, run, execution } = prepared;
+    execution.phase = "tool";
+    execution.toolId = prepared.registeredTool.definition.id;
+    this.updateToolCallStatus(prepared.toolCallPart, "running", new Date().toISOString());
+    let output: JsonObject = {}, error: string | null = null;
+    try {
+      if (execution.controller.signal.aborted) throw new ToolExecutionAbortError();
+      if (invocation.toolId === "subsession.start" && !prepared.resumeAgentRun) throw new Error("Delegation requires an owning model run.");
+      output = await prepared.registeredTool.executor.execute(prepared.executionInput, {
+        invocation, cwd: prepared.executionCwd, signal: execution.controller.signal, emit: () => undefined
+      });
+    } catch (failure) {
+      error = sanitizedCompactionError(failure);
+      if (failure instanceof SubsessionAdmissionError) output = {code:failure.code,...failure.details};
+      if (failure instanceof ToolExecutionAbortError) output = failure.output;
+    }
+    const now = new Date().toISOString();
+    const persistedRun = this.store.getRun(run.id);
+    const terminating = execution.controller.signal.aborted ||
+      persistedRun?.status === "cancelling" || persistedRun?.status === "cancelled" || persistedRun?.status === "interrupted";
+    const status = terminating ? "cancelled" : error ? "failed" : "completed";
+    const result: ToolExecutionResult = { invocationId: invocation.id, toolId: invocation.toolId, status,
+      output, error, metadata: {}, startedAt: prepared.createdAt, completedAt: now, durationMs: Math.max(0,Date.parse(now)-Date.parse(prepared.createdAt)) };
+    const response = (toolResultPartId?: string): InvokeToolResponse => ({
+      state: "executed",
+      invocation: toPublicToolInvocation({ ...invocation, status, updatedAt: now }),
+      result: toPublicToolExecutionResult(result),
+      permissionRequest: options.permissionRequest,
+      run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun ?? run),
+      message: toPublicMessage(this.store.getMessage(writer.messageId)!),
+      toolCallPartId: prepared.toolCallPart.id,
+      ...(toolResultPartId ? { toolResultPartId } : {})
+    });
+    // A terminal CAS winner owns final state. Late executors return a public result without further writes/events.
+    if (!persistedRun || isTerminalRunStatus(persistedRun.status)) return response();
+    if (!terminating && persistedRun.status !== "running") return response();
+    const part = writer.recordToolResult({ callId: invocation.id, toolId: invocation.toolId,
+      toolName: invocation.toolName, status, outputSummary: boundHistoricalContextText(JSON.stringify(error ? {error,...output} : output),6000),
+      ...(error ? { error } : {}) }, { allowWhileTerminating: terminating });
+    this.updateToolCallStatus(prepared.toolCallPart, status, now);
+    this.emit(run, status === "completed" ? "tool.completed" : "tool.failed", { runId: run.id, messageId: writer.messageId, toolId: invocation.toolId, callId: invocation.id, status });
+    if (terminating) this.finishAbortedWriter(execution, writer);
+    else if (options.finishRun !== false) { if (error) writer.fail(new Error(error)); else writer.complete(); }
+    return response(part.id);
+  }
+
   private denyPreparedToolInvocation(
     prepared: PreparedToolInvocation,
     request: StoredPermissionRequest | null,
@@ -1554,7 +1675,7 @@ export class Kernel {
       reason: prepared.permission.reason,
       status: "denied",
       toolCallPartId: prepared.toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart.id,
+      commandOutputPartId: prepared.commandOutputPart?.id,
       metadata: {
         toolSource: prepared.registeredTool.definition.source,
         executionCwd,
@@ -1628,7 +1749,7 @@ export class Kernel {
       run: this.toPublicRunSummary(this.store.getRun(prepared.run.id)!),
       message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id)!),
       toolCallPartId: toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart.id,
+      commandOutputPartId: prepared.commandOutputPart?.id,
       toolResultPartId: toolResultPart.id
     };
   }
@@ -1679,7 +1800,10 @@ export class Kernel {
   }
 
   private toPublicRunSummary(run: Run): PublicRunSummary {
+    const children = this.store.subsessions.list(run.id);
     return {
+      children: { unfinished: children.filter((item) => item.result === null).length,
+        pendingResults: children.filter((item) => item.result !== null && !item.acknowledged).length },
       id: run.id,
       sessionId: run.sessionId,
       provider: sanitizedPublicString(run.provider, 160) ?? "unknown",
@@ -1696,6 +1820,7 @@ export class Kernel {
   }
 
   private publicRunPhase(run: Run): PublicRunPhase | null {
+    if (run.status === "waiting_children") return "waiting_children";
     if (run.status === "waiting_permission") {
       return "waiting_permission";
     }
@@ -1749,6 +1874,7 @@ export class Kernel {
       }
       this.finalizeRequestedTermination(execution);
       this.releaseTerminalExecution(execution);
+      this.subsessions.changed();
     }
   }
 
@@ -1799,7 +1925,7 @@ export class Kernel {
     const status = termination === "interrupted" ? "interrupted" : "cancelled";
     const result = this.store.finalizeRun({
       runId: run.id,
-      expectedStatuses: termination === "interrupted" ? ["running", "cancelling"] : ["running", "waiting_permission", "cancelling"],
+      expectedStatuses: termination === "interrupted" ? ["running", "cancelling"] : ["running", "waiting_permission", "waiting_children", "cancelling"],
       status,
       error,
       updatedAt,
@@ -1975,6 +2101,9 @@ export class Kernel {
         } else if (error instanceof KernelError && error.code === "context_budget_exceeded") {
           this.store.mergeRunMetadata(run.id, { errorCode: error.code, contextPreflightOverflow: true }, new Date().toISOString());
         }
+        if (error instanceof NativeTranscriptError) {
+          this.store.mergeRunMetadata(run.id,{errorCode:error.code},new Date().toISOString());
+        }
         console.error("Provider run failed", {
           runId: run.id,
           provider: provider.id,
@@ -1995,16 +2124,22 @@ export class Kernel {
     startingIteration = numberField(run.metadata, "toolIterations") ?? 0
   ): Promise<void> {
     let iteration = startingIteration;
-    let providerInput = this.withCurrentToolLoopContext(input, run.id, provider, iteration);
+    let providerInput = input;
     let currentWriter = writer;
 
     while (true) {
+      this.store.subsessions.reconcile();
+      this.store.subsessions.deliver(run.id, currentWriter.messageId);
+      const deliveredIds = this.store.subsessions.list(run.id).filter((item) => item.deliveredPartId && !item.acknowledged).map((item) => item.id);
+      providerInput = this.withCurrentToolLoopContext(input, run.id, provider, iteration);
       execution.phase = "provider";
       execution.toolId = null;
+      this.store.mergeMessageMetadata(currentWriter.messageId,{providerResponseBatchId:`${run.id}:${iteration+1}`},new Date().toISOString());
       const result = await provider.run(providerInput, {
         signal: execution.controller.signal,
         writer: currentWriter
       });
+      this.store.subsessions.acknowledge(run.id,deliveredIds);
 
       if (execution.controller.signal.aborted) {
         this.finishAbortedWriter(execution, currentWriter);
@@ -2013,6 +2148,14 @@ export class Kernel {
 
       const toolCalls = result.toolCalls ?? [];
       if (toolCalls.length === 0) {
+        const children = this.store.subsessions.list(run.id);
+        if (children.some((item) => item.result === null || !item.acknowledged)) {
+          currentWriter.completeMessage();
+          const waiting = this.store.transitionRunStatus(run.id, ["running"], "waiting_children", null, new Date().toISOString());
+          if (waiting) this.emit(waiting, "run_waiting_children", { runId: run.id, sessionId: run.sessionId, status: "waiting_children", children: this.toPublicRunSummary(waiting).children });
+          this.subsessions.requestWake(run.id);
+          return;
+        }
         if (
           providerInput.context.agent.contextPolicy?.automaticCompaction !== false &&
           providerInput.context.plan.compactionRecommended &&
@@ -2072,7 +2215,6 @@ export class Kernel {
       iteration = nextIteration;
       currentWriter = this.createFollowUpAssistantWriter(run, iteration, execution);
       onActiveWriterChange(currentWriter);
-      providerInput = this.withCurrentToolLoopContext(input, run.id, provider, iteration);
     }
   }
 
@@ -2083,7 +2225,8 @@ export class Kernel {
     toolCalls: ProviderToolCall[],
     iteration: number
   ): Promise<"continue" | "waiting_permission"> {
-    for (const toolCall of toolCalls) {
+    if (toolCalls.length > 16) throw new KernelError("Provider tool batch exceeds the 16-call safety limit.",400);
+    for (const [index, toolCall] of toolCalls.entries()) {
       const prepared = this.prepareModelToolInvocation(run, assistantMessage, writer, toolCall, iteration);
       if (!prepared) {
         continue;
@@ -2098,6 +2241,11 @@ export class Kernel {
       }
 
       if (prepared.permission.decision === "requires_approval") {
+        this.store.mergeRunMetadata(run.id, { queuedModelToolCalls: toolCalls.slice(index+1).map((call) => ({
+          id: call.id, name: call.name, arguments: call.arguments,
+          ...(call.argumentsText !== undefined ? { argumentsText: call.argumentsText } : {}),
+          ...(call.metadata ? { metadata: call.metadata } : {})
+        })) },new Date().toISOString());
         this.createPendingPermissionResponse(prepared);
         return "waiting_permission";
       }
@@ -2119,6 +2267,18 @@ export class Kernel {
     const canonicalToolId = providerToolNameToToolId(providerToolName) ?? providerToolName;
     const registeredTool = this.tools.get(canonicalToolId);
     const callId = normalizeToolCallId(toolCall.id);
+    const nativeToolCall: JsonObject = {
+      id: toolCall.id || callId,
+      name: providerToolName,
+      argumentsText: toolCall.argumentsText ?? JSON.stringify(toolCall.arguments),
+      batchId: `${run.id}:${iteration}`,
+      ...(typeof toolCall.metadata?.nativeItemId === "string" ? { nativeItemId: toolCall.metadata.nativeItemId } : {})
+    };
+    if (this.listAssistantMessagesForRun(run.id).some((message) => message.parts.some((part) =>
+      part.type === "tool_call" && typeof part.metadata.nativeToolCall === "object" &&
+      part.metadata.nativeToolCall !== null && !Array.isArray(part.metadata.nativeToolCall) && part.metadata.nativeToolCall.id === nativeToolCall.id))) {
+      throw new KernelError("Provider repeated a native tool call ID; no duplicate tool was executed.",400,"duplicate_tool_call_id");
+    }
     const toolName = registeredTool?.definition.name ?? providerToolName;
 
     if (!registeredTool) {
@@ -2129,6 +2289,7 @@ export class Kernel {
         provider: "native",
         inputSummary: `Unsupported model tool call: ${providerToolName || "unknown"}`,
         metadata: {
+          nativeToolCall,
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
@@ -2151,8 +2312,10 @@ export class Kernel {
     }
 
     const agent = this.getAgentForRun(run);
-    if (!effectiveAgentToolIds(agent).includes(registeredTool.definition.id)) {
-      const denial = `Agent profile '${agent.name}' does not allow tool '${registeredTool.definition.id}'.`;
+    const rootOnlyDenied = registeredTool.definition.id === "subsession.start" && Boolean(this.getSession(run.sessionId).parentSessionId);
+    if (rootOnlyDenied || !effectiveAgentToolIds(agent).includes(registeredTool.definition.id)) {
+      const denial = rootOnlyDenied ? "Only root Sessions may delegate; child re-delegation is forbidden regardless of Agent profile." :
+        `Agent profile '${agent.name}' does not allow tool '${registeredTool.definition.id}'.`;
       const toolCallPart = writer.recordToolCall({
         callId,
         toolId: registeredTool.definition.id,
@@ -2160,6 +2323,7 @@ export class Kernel {
         provider: toolProviderForPart(registeredTool.definition.id),
         inputSummary: denial,
         metadata: {
+          nativeToolCall,
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
@@ -2174,7 +2338,7 @@ export class Kernel {
         toolName: registeredTool.definition.name,
         status: "failed",
         error: denial,
-        outputSummary: denial,
+        outputSummary: rootOnlyDenied ? JSON.stringify({code:"subsession_root_only",error:denial}) : denial,
         metadata: {
           toolCallPartId: toolCallPart.id,
           toolLoopIteration: iteration,
@@ -2195,6 +2359,7 @@ export class Kernel {
         provider: toolProviderForPart(registeredTool.definition.id),
         inputSummary: `Invalid tool arguments for ${providerToolName}: ${parseError}`,
         metadata: {
+          nativeToolCall,
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
@@ -2216,7 +2381,7 @@ export class Kernel {
       return null;
     }
 
-    const executionCwd = this.getToolExecutionCwd(this.getSession(run.sessionId));
+    const executionCwd = stringField(run.metadata, "workingDirectory") || this.getToolExecutionCwd(this.getSession(run.sessionId));
     const validationContext = { cwd: executionCwd };
     let executionInput: JsonObject;
     let publicInput: JsonObject;
@@ -2232,6 +2397,7 @@ export class Kernel {
         provider: toolProviderForPart(registeredTool.definition.id),
         inputSummary: `Invalid ${registeredTool.definition.id} input: ${validationError.message}`,
         metadata: {
+          nativeToolCall,
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
@@ -2293,6 +2459,7 @@ export class Kernel {
       input: publicInput,
       inputSummary: summarizeToolInput(registeredTool.definition.id, publicInput),
       metadata: {
+        nativeToolCall,
         caller: "model",
         providerToolCallName: providerToolName,
         toolLoopIteration: iteration,
@@ -2304,7 +2471,7 @@ export class Kernel {
         agentToolLoop: true
       }
     });
-    const commandOutputPart = writer.recordCommandOutput({
+    const commandOutputPart = registeredTool.definition.id === "shell.exec" ? writer.recordCommandOutput({
       callId: invocation.id,
       stream: "combined",
       text: "",
@@ -2316,7 +2483,7 @@ export class Kernel {
         toolLoopIteration: iteration,
         agentToolLoop: true
       }
-    });
+    }) : null;
 
     return {
       registeredTool,
@@ -2349,7 +2516,7 @@ export class Kernel {
     if (assistantMessages.length === 0) {
       return input;
     }
-    const syntheticToolMessages = assistantMessages.flatMap((message) => toolLoopSyntheticMessages(message));
+    const syntheticToolMessages = currentRunToolTranscript(assistantMessages);
     if (syntheticToolMessages.length === 0) {
       return input;
     }
@@ -2445,6 +2612,36 @@ export class Kernel {
     });
   }
 
+  private wakeWaitingParent(runId: string): void {
+    if (this.shuttingDown || this.executions.get(runId)?.activePromise) return;
+    const run = this.store.getRun(runId);
+    if (run?.status !== "waiting_children") return;
+    if (!this.store.subsessions.list(runId).some((item) => item.result !== null && !item.acknowledged)) return;
+    if (!this.store.subsessions.wake(runId)) return;
+    this.emit(this.getRun(runId),"child_result_available",{ runId, sessionId: run.sessionId, status: "running", children: this.getPublicRun(runId).children });
+    this.queueResumeAgentRun(runId);
+  }
+
+  private async executeAdmittedSubsession(runId: string): Promise<void> {
+    this.assertAcceptingWork();
+    const run = this.getRun(runId);
+    if (run.status !== "running") return;
+    this.getOrCreateExecution(run.id);
+    await this.startRunAttempt(run.sessionId,this.store.subsessions.task(run.id),{},true,run.id);
+  }
+
+  listSubsessions(sessionId: string) {
+    this.getSession(sessionId);
+    return this.store.subsessions.list().filter((item) => item.parentSessionId === sessionId)
+      .map((item) => {
+        const child = this.store.getRun(item.childRunId);
+        const snapshot = child ? agentFromRunMetadata(child.metadata) : null;
+        return { ...item, status: child?.status ?? item.status,
+          agentName: sanitizePublicText(snapshot?.name ?? item.agentId,120) ?? "Child",
+          taskPreview: sanitizePublicText(this.store.subsessions.task(item.childRunId),240) ?? "" };
+      });
+  }
+
   private async resumeAgentRun(runId: string, execution: RunExecution): Promise<void> {
     const run = this.getRun(runId);
     if (run.status !== "running") {
@@ -2456,7 +2653,24 @@ export class Kernel {
     }
     const { provider, input } = this.buildProviderInputForExistingRun(run);
     this.completeStreamingAssistantMessagesForRun(run);
-    const writer = this.createFollowUpAssistantWriter(run, numberField(run.metadata, "toolIterations") ?? 0, execution);
+    const iteration = numberField(run.metadata, "toolIterations") ?? 0;
+    let writer = this.createFollowUpAssistantWriter(run, iteration, execution);
+    const queued = run.metadata.queuedModelToolCalls;
+    if (Array.isArray(queued) && queued.length > 0) {
+      this.store.mergeRunMetadata(run.id,{ queuedModelToolCalls: [] },new Date().toISOString());
+      const calls = queued as unknown as ProviderToolCall[];
+      const step = await this.handleModelToolCalls(run,writer,this.store.getMessage(writer.messageId)!,calls,numberField(run.metadata,"toolIterations") ?? 0);
+      if (step === "waiting_permission") return;
+      if (execution.controller.signal.aborted) {
+        this.finishAbortedWriter(execution,writer);
+        return;
+      }
+      if (this.store.getRun(run.id)?.status !== "running") return;
+      // This message owns only the remaining calls/results from the preceding provider batch.
+      // The next model response must not append its text or calls to that same message.
+      writer.completeMessage();
+      writer = this.createFollowUpAssistantWriter(run,iteration,execution);
+    }
     await this.executeRun(this.store.getRun(run.id) ?? run, provider, input, execution, writer);
   }
 
@@ -2523,7 +2737,8 @@ export class Kernel {
   }
 
   private buildProviderInputForExistingRun(run: Run): { provider: ProviderAdapter; input: ProviderRunInput } {
-    const session = this.getSession(run.sessionId);
+    const currentSession = this.getSession(run.sessionId);
+    const session = { ...currentSession, workingDirectory: stringField(run.metadata,"workingDirectory") || currentSession.workingDirectory };
     const agent = this.getAgentForRun(run);
     const executionSnapshot = executionSnapshotFromRunMetadata(run.metadata);
     const providerProfileId = executionSnapshot?.providerProfileId ?? (stringField(run.metadata, "providerProfileId") || run.provider);
@@ -2545,7 +2760,7 @@ export class Kernel {
       messages: sourceMessages,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: effectiveRunOptions,
-      availableTools: this.getAvailableToolsForAgent(agent),
+      availableTools: this.getAvailableToolsForAgent(agent,session),
       metadata: { runId: run.id, resumed: true },
       activeSegmentId: session.activeSegmentId,
       compactionArtifact: contextHistory.artifact,
@@ -2592,9 +2807,9 @@ export class Kernel {
     return profileProviderProfileId === resolvedProviderProfileId ? agent.defaultRunOptions : null;
   }
 
-  private getAvailableToolsForAgent(agent: AgentDefinition) {
+  private getAvailableToolsForAgent(agent: AgentDefinition, session: Session) {
     const toolIds = effectiveAgentToolIds(agent);
-    const tools = this.tools.list().filter((tool) => toolIds.includes(tool.id));
+    const tools = this.tools.list().filter((tool) => toolIds.includes(tool.id) && (!session.parentSessionId || tool.id !== "subsession.start"));
     return tools.flatMap((tool) => {
       const modelTool = toModelToolDefinition(tool);
       return modelTool ? [modelTool] : [];
@@ -3045,7 +3260,7 @@ export class Kernel {
         messages: [],
         providerProfileId,
         runOptions,
-        availableTools: this.getAvailableToolsForAgent(agent),
+        availableTools: this.getAvailableToolsForAgent(agent,session),
         resolvedBudget: budget,
         providerOverhead: adapter.contextPlanning,
         activeSegmentId,

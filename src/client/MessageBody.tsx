@@ -31,7 +31,17 @@ type MessageTimelineItem =
   | { kind: "tool"; callId: string; parts: MessagePart[] };
 
 function buildMessageTimeline(parts: MessagePart[]): MessageTimelineItem[] {
-  const sortedParts = [...parts].sort(compareParts);
+  let sortedParts = [...parts].sort(compareParts);
+  const isHandoff = (part: MessagePart) => part.type === "tool_result" && partString(part,"toolId") === "subsession.start" && partString(part,"callId").startsWith("handoff:");
+  if (sortedParts.some(isHandoff)) {
+    // Text owns storage seq 0, but a delivered child notification is input to that text response.
+    // Keep structured source ordering; move only the response text behind its input notifications.
+    const text = sortedParts.filter((part) => part.type === "text");
+    const structured = sortedParts.filter((part) => part.type !== "text");
+    const boundary = structured.reduce((last,part,index) => isHandoff(part) ? index : last,-1);
+    structured.splice(boundary+1,0,...text);
+    sortedParts = structured;
+  }
   const consumedPartIds = new Set<string>();
   const timeline: MessageTimelineItem[] = [];
 

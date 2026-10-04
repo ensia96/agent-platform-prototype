@@ -13,6 +13,8 @@ import type {
   ToolInvocation
 } from "../shared/types";
 import { isTerminalRunEventType } from "../shared/types";
+import { sanitizePublicText } from "../shared/public-text";
+export { sanitizePublicText } from "../shared/public-text";
 
 export function toPublicMessage(message: Message): Message {
   return {
@@ -64,19 +66,6 @@ export function toPublicToolExecutionResult(result: ToolExecutionResult): Public
   };
 }
 
-export function sanitizePublicText(value: string | null | undefined, maxLength: number): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const redacted = value
-    .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED]")
-    .replace(/("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi, "$1[REDACTED]$2")
-    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_API_KEY]");
-  const sanitized = redacted.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLength);
-  return sanitized || null;
-}
-
 export function toPublicRunEvent(event: RunEvent): RunEvent {
   const payload = eventPayload(event.type, event.payload);
   return { ...event, payload };
@@ -84,6 +73,12 @@ export function toPublicRunEvent(event: RunEvent): RunEvent {
 
 function eventPayload(type: RunEventType, value: unknown): JsonObject {
   const payload = jsonObject(value);
+  if (type === "run_waiting_children" || type === "child_result_available") {
+    const children = jsonObject(payload.children);
+    return compact({ runId: payload.runId, sessionId: payload.sessionId, status: payload.status,
+      children: { unfinished: typeof children.unfinished === "number" ? children.unfinished : 0,
+        pendingResults: typeof children.pendingResults === "number" ? children.pendingResults : 0 } });
+  }
   if (type === "run_started") {
     const resolution = providerResolution(payload.providerResolution);
     return compact({

@@ -10,6 +10,7 @@ import type {
   ModelToolDefinition,
   ProviderContextPlanningProfile
 } from "../shared/types";
+import { toolExchangeText } from "./tool-transcript";
 
 export const contextEstimatorVersion = "conservative-utf8-v1";
 export const assumedContextWindowTokens = 16_384;
@@ -211,8 +212,8 @@ export function planContext(input: PlanContextInput): PlannedContext {
   const nativeBaseTokens =
     providerOverhead.fixedWrapperTokens +
     providerOverhead.requiredInstructions.reduce((total, instruction) => total + estimateTextTokens(instruction.content), 0) +
-    providerOverhead.perMessageTokens * currentMessages.length +
-    providerOverhead.perMessageTokens * compactionMessages.length +
+    providerOverhead.perMessageTokens * messageEnvelopeCount(currentMessages) +
+    providerOverhead.perMessageTokens * messageEnvelopeCount(compactionMessages) +
     (input.availableTools.length > 0 ? providerOverhead.toolEnvelopeTokens : 0);
   const neutralWithoutSynthetic =
     systemCandidate.estimatedTokens +
@@ -220,7 +221,7 @@ export function planContext(input: PlanContextInput): PlannedContext {
     (currentCandidate?.candidate.estimatedTokens ?? 0) +
     (compactionCandidate?.estimatedTokens ?? 0);
   const syntheticTokenBudget =
-    input.budget.inputBudgetTokens - neutralWithoutSynthetic - nativeBaseTokens - providerOverhead.perMessageTokens * syntheticMessages.length;
+    input.budget.inputBudgetTokens - neutralWithoutSynthetic - nativeBaseTokens - providerOverhead.perMessageTokens * messageEnvelopeCount(syntheticMessages);
   const fittedSynthetic = fitMessagesToTokenBudget(syntheticMessages, syntheticTokenBudget);
   const syntheticWasBounded = Boolean(
     fittedSynthetic && syntheticMessages.some((message, index) => message.content !== fittedSynthetic[index]?.content)
@@ -239,7 +240,7 @@ export function planContext(input: PlanContextInput): PlannedContext {
     ...(currentCandidate ? [currentCandidate.candidate] : []),
     ...(syntheticCandidate ? [syntheticCandidate.candidate] : [])
   ];
-  const requiredNativeTokens = nativeBaseTokens + providerOverhead.perMessageTokens * syntheticMessages.length;
+  const requiredNativeTokens = nativeBaseTokens + providerOverhead.perMessageTokens * messageEnvelopeCount(syntheticMessages);
   const requiredNeutralTokens = required.reduce((total, candidate) => total + candidate.estimatedTokens, 0);
   const requiredTokens = requiredNeutralTokens + requiredNativeTokens;
   if (requiredTokens > input.budget.inputBudgetTokens) {
@@ -273,7 +274,7 @@ export function planContext(input: PlanContextInput): PlannedContext {
   const omitted: ContextPlanItem[] = [...grouped.omitted];
   let suffixBoundaryReached = false;
   for (const turn of [...turns].reverse()) {
-    const turnNativeTokens = providerOverhead.perMessageTokens * turn.messages.length;
+    const turnNativeTokens = providerOverhead.perMessageTokens * messageEnvelopeCount(turn.messages);
     if (!suffixBoundaryReached && estimatedInputTokens + turn.candidate.estimatedTokens + turnNativeTokens <= input.budget.inputBudgetTokens) {
       includedTurns.add(turn);
       providerNeutralTokens += turn.candidate.estimatedTokens;
@@ -307,7 +308,7 @@ export function planContext(input: PlanContextInput): PlannedContext {
   const historySourceIds = historicalMessages.flatMap(messageSourceIds);
   const selectedHistorySourceIds = selectedTurns.flatMap((turn) => turn.candidate.sourceIds);
   const allHistoryTokens = turns.reduce(
-    (total, turn) => total + turn.candidate.estimatedTokens + providerOverhead.perMessageTokens * turn.messages.length,
+    (total, turn) => total + turn.candidate.estimatedTokens + providerOverhead.perMessageTokens * messageEnvelopeCount(turn.messages),
     0
   );
   const preTrimEstimatedInputTokens = requiredTokens + allHistoryTokens;
@@ -367,6 +368,7 @@ export function boundHistoricalContextText(text: string, maxChars = historicalCo
 }
 
 function boundContextMessage(message: ContextMessage): ContextMessage {
+  if (message.toolExchange) return boundToolExchange(message,historicalContextTextMaxChars);
   const content = boundHistoricalContextText(message.content);
   return content === message.content
     ? message
@@ -437,10 +439,16 @@ function messageCandidate(
 }
 
 function estimateMessagesTokens(messages: ContextMessage[]): number {
-  return messages.reduce((total, message) => total + estimateTextTokens(message.content), 0);
+  return messages.reduce((total, message) => total + (message.toolExchange ? estimateJsonTokens(message.toolExchange) : estimateTextTokens(message.content)), 0);
+}
+
+function messageEnvelopeCount(messages: ContextMessage[]): number {
+  return messages.reduce((total,message) => total + (message.toolExchange
+    ? message.toolExchange.calls.length + message.toolExchange.results.length + 1 : 1),0);
 }
 
 function messageSourceIds(message: ContextMessage): string[] {
+  if (message.toolExchange) return message.toolExchange.sourceIds;
   if (message.messageId) {
     return [message.messageId];
   }
@@ -459,12 +467,30 @@ function fitMessagesToTokenBudget(messages: ContextMessage[], tokenBudget: numbe
     return messages;
   }
   const perMessageBudget = Math.max(1, Math.floor(tokenBudget / messages.length));
-  const fitted = messages.map((message) => ({
-    ...message,
-    content: fitTextToTokenBudget(message.content, perMessageBudget),
-    metadata: { ...(message.metadata ?? {}), contextTextBounded: true, activeToolBudgetBounded: true }
-  }));
+  const fitted = messages.map((message) => {
+    if (message.toolExchange) {
+      let low = 1, high = historicalContextTextMaxChars;
+      let best = boundToolExchange(message,1);
+      while (low <= high) {
+        const middle = Math.floor((low+high)/2);
+        const candidate = boundToolExchange(message,middle);
+        if (estimateMessagesTokens([candidate]) <= perMessageBudget) { best=candidate; low=middle+1; }
+        else high=middle-1;
+      }
+      return best;
+    }
+    return { ...message, content: fitTextToTokenBudget(message.content, perMessageBudget),
+      metadata: { ...(message.metadata ?? {}), contextTextBounded: true, activeToolBudgetBounded: true } };
+  });
   return fitted.every((message) => message.content.length > 0) && estimateMessagesTokens(fitted) <= tokenBudget ? fitted : null;
+}
+
+function boundToolExchange(message: ContextMessage, maxOutputChars: number): ContextMessage {
+  const original = message.toolExchange!;
+  const toolExchange = {...original,results:original.results.map((result) => ({...result,output:boundHistoricalContextText(result.output,maxOutputChars)}))};
+  const bounded = toolExchange.results.some((result,index) => result.output !== original.results[index].output);
+  return {...message,toolExchange,content:toolExchangeText(toolExchange),
+    ...(bounded ? {metadata:{...(message.metadata??{}),contextTextBounded:true,activeToolBudgetBounded:true}} : {})};
 }
 
 function fitTextToTokenBudget(text: string, tokenBudget: number): string {

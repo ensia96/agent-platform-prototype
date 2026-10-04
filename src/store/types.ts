@@ -25,6 +25,7 @@ import type {
   ToolInvocationCaller,
   ToolPermissionDecision
 } from "../shared/types";
+import type { SubsessionStore } from "./subsessions";
 
 export interface CreateSessionInput {
   id: string;
@@ -276,6 +277,7 @@ export class ContextSegmentChangedStoreError extends Error {
 }
 
 export interface StoreAdapter {
+  readonly subsessions: SubsessionStore;
   listSessions(): Session[];
   getSession(id: string): Session | null;
   createSession(input: CreateSessionInput): Session;

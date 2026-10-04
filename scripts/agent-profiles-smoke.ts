@@ -90,7 +90,7 @@ async function migrationScenario(): Promise<void> {
     assert.equal(migrated.getSession("legacy-session")?.workingDirectory, directory);
     const migratedMain = migrated.getAgentDefinition("main");
     assert.equal(migratedMain?.revision, 1);
-    assert.deepEqual(migratedMain?.toolIds, ["shell.exec"], "legacy main did not receive its one-time explicit allowlist");
+    assert.deepEqual(migratedMain?.toolIds, ["shell.exec", "subsession.start"], "legacy main did not receive its default tools");
     assert.equal(migratedMain?.metadata.explicitToolAllowlistVersion, undefined);
     assert.equal(migratedMain?.metadata.legacyLabel, "preserve");
     const emptiedMainResult = migrated.updateAgentDefinition({
@@ -180,7 +180,7 @@ async function profileRuntimeAndApiScenario(): Promise<void> {
     const tools = createFixtureToolRegistry(executions);
     let store = new SQLiteStore({ dbPath, defaultWorkingDirectory: directory });
     let kernel = createKernel(store, providers, tools, directory);
-    assert.deepEqual(kernel.getAgentDefinition("main").toolIds, ["shell.exec"]);
+    assert.deepEqual(kernel.getAgentDefinition("main").toolIds, ["shell.exec", "subsession.start"]);
     assert.equal(kernel.getAgentDefinition("main").metadata.explicitToolAllowlistVersion, undefined);
 
     const api = await startFixtureApi(kernel, providers, store, dbPath);

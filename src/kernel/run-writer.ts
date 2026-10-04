@@ -444,7 +444,7 @@ function terminalPayload(messageId: string, usage: RunUsage | null): JsonObject 
 
 function expectedRunStatuses(status: TerminalRunStatus): readonly RunStatus[] {
   if (status === "cancelled") {
-    return ["running", "waiting_permission", "cancelling"];
+    return ["running", "waiting_permission", "waiting_children", "cancelling"];
   }
   if (status === "interrupted") {
     return ["running", "cancelling"];

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { StoredPermissionRequest } from "../store/types";
 import { normalizeShellToolSettings } from "../shared/tool-settings";
 import type {
@@ -147,6 +147,9 @@ export function permissionPolicySummary(permission: ToolPermissionEvaluation): J
 }
 
 export function summarizeToolInput(toolId: string, input: JsonObject): string {
+  if (toolId === "subsession.start") {
+    return `Delegate to ${input.agentId} revision ${input.agentRevision}\nTarget tools: ${JSON.stringify(input.targetTools)}\nTask: ${String(input.task).slice(0,12000)}`;
+  }
   if (toolId === "shell.exec") {
     const command = stringField(input, "command");
     const cwd = stringField(input, "cwd");
@@ -308,11 +311,15 @@ export function normalizeToolCallId(value: string | undefined): string {
   if (!trimmed) {
     return randomUUID();
   }
-  return trimmed.length > 160 ? trimmed.slice(0, 160) : trimmed;
+  return trimmed.length > 160 ? `native_${createHash("sha256").update(trimmed).digest("hex")}` : trimmed;
 }
 
 export function toolLoopSyntheticMessages(message: Message): BuiltContext["messages"] {
   const output: BuiltContext["messages"] = [];
+  for (const part of message.parts.filter((part) => part.metadata.subsessionHandoff === true)) {
+    output.push({ role: "user", source: "synthetic", messageId: part.id,
+      content: `[child result handoff]\n${partString(part,"outputSummary") || part.text}` });
+  }
   const toolCallParts = message.parts.filter((part) => part.type === "tool_call");
   for (const toolCallPart of toolCallParts) {
     const callId = partString(toolCallPart, "callId");

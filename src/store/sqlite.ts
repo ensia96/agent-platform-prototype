@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { SubsessionStore } from "./subsessions";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -63,6 +64,7 @@ import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 
 type SessionRow = {
+  parent_session_id?: string | null;
   id: string;
   title: string;
   working_directory: string | null;
@@ -218,6 +220,7 @@ export interface SQLiteStoreOptions {
 }
 
 export class SQLiteStore implements StoreAdapter {
+  readonly subsessions: SubsessionStore;
   private readonly db: Database.Database;
   private readonly defaultWorkingDirectory: string;
 
@@ -228,18 +231,19 @@ export class SQLiteStore implements StoreAdapter {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.ensureSchema();
+    this.subsessions = new SubsessionStore(this.db);
   }
 
   listSessions(): Session[] {
     const rows = this.db
-      .prepare("SELECT id, title, working_directory, agent_id, active_segment_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC, created_at DESC")
+      .prepare("SELECT * FROM sessions ORDER BY updated_at DESC, created_at DESC")
       .all() as SessionRow[];
     return rows.map((row) => rowToSession(row, this.defaultWorkingDirectory));
   }
 
   getSession(id: string): Session | null {
     const row = this.db
-      .prepare("SELECT id, title, working_directory, agent_id, active_segment_id, created_at, updated_at FROM sessions WHERE id = ?")
+      .prepare("SELECT * FROM sessions WHERE id = ?")
       .get(id) as SessionRow | undefined;
     return row ? rowToSession(row, this.defaultWorkingDirectory) : null;
   }
@@ -364,7 +368,7 @@ export class SQLiteStore implements StoreAdapter {
       }
       const activeRun = this.db
         .prepare(
-          `SELECT id FROM runs WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'cancelling')
+          `SELECT id FROM runs WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'waiting_children', 'cancelling')
            AND (? IS NULL OR id <> ?) LIMIT 1`
         )
         .get(input.sessionId, input.allowedActiveRunId ?? null, input.allowedActiveRunId ?? null) as { id: string } | undefined;
@@ -592,11 +596,25 @@ export class SQLiteStore implements StoreAdapter {
       ) {
         throw new ContextSegmentChangedStoreError(input.sessionId, expectedSegmentId, sessionRow?.active_segment_id ?? null);
       }
+      const delegation = this.subsessions.forRun(input.id);
+      if (delegation) {
+        const parent = this.getRun(delegation.parentRunId);
+        if (delegation.childSessionId !== input.sessionId || !parent || !['running','waiting_children','waiting_permission'].includes(parent.status)) {
+          throw new Error('Child admission lost its owning parent run.');
+        }
+        const admitted = this.getRun(input.id);
+        if (admitted?.status !== "running" || admitted.metadata.admissionPending !== true) {
+          throw new Error("Child admission was cancelled or already executed.");
+        }
+        this.db.prepare("UPDATE runs SET provider=?,metadata_json=?,updated_at=? WHERE id=? AND status='running'")
+          .run(input.provider,JSON.stringify(input.metadata ?? {}),input.updatedAt,input.id);
+        return;
+      }
       const activeRow = this.db
         .prepare(
           `SELECT id, session_id, segment_id, provider, status, created_at, updated_at, error, metadata_json
            FROM runs
-           WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'cancelling')
+           WHERE session_id = ? AND status IN ('running', 'waiting_permission', 'waiting_children', 'cancelling')
            ORDER BY updated_at DESC, created_at DESC, id DESC
            LIMIT 1`
         )
@@ -714,6 +732,7 @@ export class SQLiteStore implements StoreAdapter {
     }
 
     const finalize = this.db.transaction((): RunEvent | null => {
+      if (input.status === "completed" && this.subsessions.list(input.runId).some((item) => item.result === null || !item.acknowledged)) return null;
       const placeholders = input.expectedStatuses.map(() => "?").join(", ");
       const runUpdate = this.db
         .prepare(`UPDATE runs SET status = ?, error = ?, updated_at = ? WHERE id = ? AND status IN (${placeholders})`)
@@ -752,6 +771,7 @@ export class SQLiteStore implements StoreAdapter {
         sessionId: run.sessionId,
         createdAt: input.updatedAt
       });
+      this.subsessions.reconcile();
       return event;
     });
 
@@ -1552,6 +1572,7 @@ export class SQLiteStore implements StoreAdapter {
     this.ensureContextArtifactCategoryColumn();
     this.seedDefaultAgents();
     this.migrateMainAgentExplicitToolAllowlist();
+    this.migrateMainDelegationDefault();
     this.ensureAgentReferenceTriggers();
   }
 
@@ -1717,6 +1738,21 @@ export class SQLiteStore implements StoreAdapter {
       this.db.prepare("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(migrationName, appliedAt);
     });
     migrate.immediate();
+  }
+
+  private migrateMainDelegationDefault(): void {
+    this.db.transaction(() => {
+      const name = "main_subsession_default_v1";
+      if (this.db.prepare("SELECT 1 FROM schema_migrations WHERE name=?").get(name)) return;
+      const row = this.db.prepare("SELECT tool_ids_json FROM agent_definitions WHERE id='main'").get() as { tool_ids_json: string } | undefined;
+      // Revision records all profile edits, not which tool list was explicitly chosen.
+      // Only the exact old default is eligible; empty/custom lists and other profiles are preserved.
+      if (row && isDeepStrictEqual(parseStringArray(row.tool_ids_json), ["shell.exec"])) {
+        this.db.prepare("UPDATE agent_definitions SET tool_ids_json=?,revision=revision+1,updated_at=? WHERE id='main'")
+          .run(JSON.stringify(defaultMainAgentToolIds),new Date().toISOString());
+      }
+      this.db.prepare("INSERT INTO schema_migrations(name,applied_at) VALUES (?,?)").run(name,new Date().toISOString());
+    }).immediate();
   }
 
   private ensureAgentReferenceTriggers(): void {
@@ -1896,6 +1932,7 @@ function rowToSession(row: SessionRow, defaultWorkingDirectory: string): Session
     workingDirectory: normalizeStoredWorkingDirectory(row.working_directory, defaultWorkingDirectory),
     agentId: row.agent_id || "main",
     activeSegmentId: row.active_segment_id,
+    parentSessionId: row.parent_session_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };

@@ -3,9 +3,17 @@ import type { RunEvent } from "../shared/types";
 export type RunEventListener = (event: RunEvent) => void;
 
 export class RunEventBus {
+  private readonly observers = new Set<RunEventListener>();
+  observe(listener: RunEventListener): () => void {
+    this.observers.add(listener);
+    return () => this.observers.delete(listener);
+  }
   private readonly listeners = new Map<string, Set<RunEventListener>>();
 
   publish(event: RunEvent): void {
+    for (const observer of this.observers) {
+      try { observer(event); } catch { console.error("Run lifecycle observer failed; durable state will be reconciled on restart."); }
+    }
     const listeners = this.listeners.get(event.runId);
     if (!listeners) {
       return;

@@ -391,6 +391,7 @@ export function RunInspector({ onClose, modal, returnFocusRef, setup, sessionCon
                   <dd>{runStatus.connectionState}</dd>
                   <dt>Phase</dt>
                   <dd>{runStatus.activeRun.currentPhase ?? runStatus.activeRun.status}</dd>
+                  {runStatus.activeRun.children && <><dt>Child work</dt><dd>{runStatus.activeRun.children.unfinished} unfinished · {runStatus.activeRun.children.pendingResults} pending results</dd></>}
                   {runStatus.activeRun.context && (
                     <>
                       <dt>Context estimate</dt>

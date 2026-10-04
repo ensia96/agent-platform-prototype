@@ -36,6 +36,9 @@ export interface ToolPermissionInput {
 
 export function evaluateToolPermission(input: ToolPermissionInput): ToolPermissionEvaluation {
   const policy = createPermissionPolicy(input.executionCwd, input.settings);
+  if (input.tool.id === "subsession.start") {
+    return evaluation("ask", "subsession.target.approval", "Approve this exact target Agent revision, task, and tool authority. Child tool approvals are separate.", "high", policy);
+  }
 
   if (input.tool.id !== "shell.exec") {
     return evaluation("ask", "tool.unknown", "Unknown or future tools require explicit approval.", "medium", policy);

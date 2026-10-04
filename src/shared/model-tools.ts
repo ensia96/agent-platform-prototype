@@ -1,10 +1,11 @@
 import type { ModelToolDefinition, ToolDefinition } from "./types";
 
 export const shellExecProviderToolName = "shell_exec";
-export const defaultMainAgentToolIds = ["shell.exec"];
+export const defaultMainAgentToolIds = ["shell.exec", "subsession.start"];
 
 const providerToolNamesById: Record<string, string> = {
-  "shell.exec": shellExecProviderToolName
+  "shell.exec": shellExecProviderToolName,
+  "subsession.start": "subsession_start"
 };
 
 const toolIdsByProviderToolName = Object.fromEntries(

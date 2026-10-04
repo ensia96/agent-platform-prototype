@@ -14,11 +14,11 @@ export type MessagePartType =
   | "command_output"
   | "file_ref";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed" | "interrupted";
-export type RunStatus = "running" | "waiting_permission" | "cancelling" | "completed" | "cancelled" | "failed" | "interrupted";
-export type ActiveRunStatus = Extract<RunStatus, "running" | "waiting_permission" | "cancelling">;
+export type RunStatus = "running" | "waiting_permission" | "waiting_children" | "cancelling" | "completed" | "cancelled" | "failed" | "interrupted";
+export type ActiveRunStatus = Extract<RunStatus, "running" | "waiting_permission" | "waiting_children" | "cancelling">;
 export type TerminalRunStatus = Extract<RunStatus, "completed" | "cancelled" | "failed" | "interrupted">;
 
-export const ACTIVE_RUN_STATUSES: readonly ActiveRunStatus[] = ["running", "waiting_permission", "cancelling"];
+export const ACTIVE_RUN_STATUSES: readonly ActiveRunStatus[] = ["running", "waiting_permission", "waiting_children", "cancelling"];
 export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = ["completed", "cancelled", "failed", "interrupted"];
 
 export function isActiveRunStatus(status: RunStatus): status is ActiveRunStatus {
@@ -34,9 +34,9 @@ export function canTransitionRunStatus(from: RunStatus, to: RunStatus): boolean 
     return false;
   }
   if (from === "running") {
-    return to === "waiting_permission" || to === "cancelling" || isTerminalRunStatus(to);
+    return to === "waiting_permission" || to === "waiting_children" || to === "cancelling" || isTerminalRunStatus(to);
   }
-  if (from === "waiting_permission") {
+  if (from === "waiting_permission" || from === "waiting_children") {
     return to === "running" || to === "cancelling" || to === "failed" || to === "cancelled" || to === "interrupted";
   }
   return from === "cancelling" && (to === "cancelled" || to === "interrupted");
@@ -140,6 +140,15 @@ export interface ContextMessage {
   messageId?: string;
   parts?: ContextMessagePart[];
   metadata?: JsonObject;
+  /** A complete native tool batch. content is a readable projection, not a second transport message. */
+  toolExchange?: ContextToolExchange;
+}
+
+export interface ContextToolExchange {
+  assistantText: string;
+  calls: Array<{ id: string; name: string; argumentsText: string; nativeItemId?: string }>;
+  results: Array<{ callId: string; status: ToolResultStatus; output: string }>;
+  sourceIds: string[];
 }
 
 export interface ContextMessagePart {
@@ -371,6 +380,7 @@ export interface Session {
   workingDirectory: string;
   agentId: string;
   activeSegmentId: string;
+  parentSessionId?: string | null;
   createdAt: ISODateString;
   updatedAt: ISODateString;
 }
@@ -550,9 +560,29 @@ export interface CompactContextResponse {
   message?: string;
 }
 
-export type PublicRunPhase = "running" | "provider" | "tool" | "compacting_context" | "waiting_permission" | "cancelling";
+export type PublicRunPhase = "running" | "provider" | "tool" | "compacting_context" | "waiting_permission" | "waiting_children" | "cancelling";
+
+export interface SubsessionDelegation {
+  agentName?: string;
+  taskPreview?: string;
+  rootRunId: string;
+  id: string;
+  parentSessionId: string;
+  parentRunId: string;
+  invocationId: string;
+  childSessionId: string;
+  childRunId: string;
+  agentId: string;
+  agentRevision: number;
+  status: "starting" | RunStatus;
+  result: string | null;
+  deliveredPartId: string | null;
+  acknowledged: boolean;
+  createdAt: string;
+}
 
 export interface PublicRunSummary {
+  children?: { unfinished: number; pendingResults: number };
   id: string;
   sessionId: string;
   provider: string;
@@ -590,6 +620,8 @@ export const CORE_RUN_EVENT_TYPES = [
   "run_cancelled",
   "run_failed",
   "run_interrupted",
+  "run_waiting_children",
+  "child_result_available",
   "context_compaction_started",
   "context_compaction_completed",
   "context_compaction_failed",

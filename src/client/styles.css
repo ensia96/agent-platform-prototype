@@ -1392,6 +1392,13 @@ body {
   min-width: 0;
 }
 
+.childStatusPanel { flex: 0 0 auto; padding: 6px 16px; border-bottom: 1px solid #cbd5e1; background: #fff; }
+.childStatusToggle { width: 100%; text-align: left; }
+.childStatusBody { max-height: 32vh; overflow: auto; overflow-wrap: anywhere; }
+.childStatusCard { padding: 8px 0; border-top: 1px solid #e2e8f0; }
+.childPermission { padding: 8px; background: #f8fafc; }
+.childPermission pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .chatHeader {
   background: rgba(255, 255, 255, 0.96);
   min-height: 70px;

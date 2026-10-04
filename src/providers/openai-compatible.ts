@@ -459,9 +459,10 @@ function finalizeToolCalls(states: Map<number, OpenAIToolCallState>): ProviderTo
     .sort((a, b) => a.index - b.index)
     .filter((state) => Boolean(state.name?.trim()))
     .map((state) => {
+      if (!state.id?.trim()) throw new Error("OpenAI-compatible tool call is missing its native id; execution was not attempted.");
       const parsed = parseToolArguments(state.argumentsText);
       return {
-        id: state.id?.trim() || `tool_call_${state.index}`,
+        id: state.id.trim(),
         name: state.name!.trim(),
         arguments: parsed.value,
         argumentsText: state.argumentsText,
@@ -523,14 +524,23 @@ function getRunModel(input: ProviderRunInput): string {
 
 export function buildOpenAICompatibleRequestMessages(
   context: BuiltContext
-): Array<{ role: "system" | "user" | "assistant"; content: string }> {
-  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+): Array<{ role: "system" | "user" | "assistant" | "tool"; content: string | null;
+  tool_calls?: Array<{id:string;type:"function";function:{name:string;arguments:string}}>;
+  tool_call_id?: string }> {
+  const messages: ReturnType<typeof buildOpenAICompatibleRequestMessages> = [];
   const systemPrompt = context.systemPrompt.trim();
   if (systemPrompt) {
     messages.push({ role: "system", content: systemPrompt });
   }
 
   for (const message of context.messages) {
+    if (message.toolExchange) {
+      const exchange = message.toolExchange;
+      messages.push({role:"assistant",content:exchange.assistantText || null,
+        tool_calls:exchange.calls.map((call) => ({id:call.id,type:"function",function:{name:call.name,arguments:call.argumentsText}}))});
+      for (const result of exchange.results) messages.push({role:"tool",tool_call_id:result.callId,content:result.output});
+      continue;
+    }
     const content = message.content.trim();
     if (!content) {
       continue;

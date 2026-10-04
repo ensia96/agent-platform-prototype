@@ -26,6 +26,8 @@ import type {
 import { isActiveRunStatus, isTerminalRunStatus } from "../shared/types";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 import { ChatHeader } from "./ChatHeader";
+import { SubsessionPanel } from "./SubsessionPanel";
+import { navigateToRelatedSession } from "./session-navigation";
 import { MessageBody } from "./MessageBody";
 import {
   profileDefaultsApplyToProvider,
@@ -122,6 +124,7 @@ export function App() {
   const runEventCursorRef = useRef(0);
   const sessionRecoveryIdRef = useRef(0);
   const sessionGenerationRef = useRef(0);
+  const relatedSessionNavigationRef = useRef(0);
   const cancelRequestRunIdRef = useRef<string | null>(null);
   const pendingPermissionsLoadIdRef = useRef(0);
   const shellRequestIdRef = useRef(0);
@@ -288,8 +291,9 @@ export function App() {
     try {
       const nextSessions = await requestJson<Session[]>("/api/sessions");
       setSessions(nextSessions);
-      if (!selectedSessionIdRef.current && nextSessions[0]) {
-        selectSession(nextSessions[0].id);
+      const root = nextSessions.find((session) => !session.parentSessionId);
+      if (!selectedSessionIdRef.current && root) {
+        selectSession(root.id);
       }
       setLoadState("idle");
     } catch (requestError) {
@@ -534,6 +538,23 @@ export function App() {
       setPermissionActionId(null);
     }
     setSelectedSessionId(sessionId);
+  }
+
+  function openRelatedSession(targetId: string) {
+    const sourceId = selectedSessionIdRef.current;
+    const generation = sessionGenerationRef.current;
+    const requestId = ++relatedSessionNavigationRef.current;
+    const agentMutationId = sessionAgentRequestIdRef.current;
+    const cwdMutationId = workingDirectoryRequestIdRef.current;
+    void navigateToRelatedSession({
+      targetId,
+      load: () => requestJson<Session[]>("/api/sessions"),
+      isCurrent: () => sourceId === selectedSessionIdRef.current && generation === sessionGenerationRef.current &&
+        requestId === relatedSessionNavigationRef.current && agentMutationId === sessionAgentRequestIdRef.current &&
+        cwdMutationId === workingDirectoryRequestIdRef.current,
+      apply: (nextSessions, id) => { setSessions(nextSessions); selectSession(id); },
+      onError: (requestError) => setError(toErrorMessage(requestError))
+    });
   }
 
   function changeTab(nextTab: Tab) {
@@ -1273,7 +1294,7 @@ export function App() {
     if (response.run.provider.startsWith("tool:")) {
       return false;
     }
-    if (response.run.status === "running" || response.run.status === "waiting_permission" || response.run.status === "cancelling") {
+    if (isActiveRunStatus(response.run.status)) {
       beginRunTracking(response.run, true);
       return true;
     }
@@ -1285,6 +1306,7 @@ export function App() {
     ? { label: "checking active runs", tone: "reconnecting" as const }
     : runDisplayStatus(activeRun, runConnectionState, runTerminalNotice, Boolean(selectedSession));
   const runControlsDisabled =
+    Boolean(selectedSession?.parentSessionId) ||
     Boolean(activeRun) ||
     runDiscoveryPending ||
     runStartPending ||
@@ -1317,11 +1339,11 @@ export function App() {
           <section className="sidebarSessions" aria-label="Sessions">
             <div className="sidebarSectionHeading">
               <strong>Sessions</strong>
-              <span>{sessions.length}</span>
+              <span>{sessions.filter((session) => !session.parentSessionId).length}</span>
             </div>
             {loadState === "loading" && <p className="muted">Loading sessions...</p>}
             <div className="sessionList">
-              {sessions.map((session) => (
+               {sessions.filter((session) => !session.parentSessionId).map((session) => (
                 <button
                   className={session.id === selectedSessionId ? "session active" : "session"}
                   key={session.id}
@@ -1361,6 +1383,14 @@ export function App() {
               inspectorToggleRef={inspectorToggleRef}
               onToggleInspector={() => setInspectorOpen((current) => !current)}
             />
+
+            {selectedSession && <SubsessionPanel key={`${selectedSession.id}:${sessionGenerationRef.current}:${activeRunId ?? "latest"}`}
+              session={selectedSession} parentRunId={activeRunId} generation={sessionGenerationRef.current}
+              isCurrent={(() => {
+                const sessionId = selectedSession.id, generation = sessionGenerationRef.current, owner = activeRunId;
+                return () => selectedSessionIdRef.current === sessionId && sessionGenerationRef.current === generation && trackedRunIdRef.current === owner;
+              })()}
+              onOpen={openRelatedSession} />}
 
             {error && (
               <div className="chatAlertArea">

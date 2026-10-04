@@ -9,12 +9,12 @@ export interface DefaultToolRegistryOptions {
 export class ToolRegistry {
   private readonly tools = new Map<string, RegisteredTool>();
 
-  register(tool: RegisteredTool): void {
+  register(tool: RegisteredTool, replace = false): void {
     const id = tool.definition.id.trim();
     if (!id) {
       throw new Error("Tool id is required.");
     }
-    if (this.tools.has(id)) {
+    if (this.tools.has(id) && !replace) {
       throw new Error(`Tool '${id}' is already registered.`);
     }
     this.tools.set(id, tool);

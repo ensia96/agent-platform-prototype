@@ -527,10 +527,8 @@ async function waitingCancelRegistryScenario(): Promise<void> {
       waitingSnapshot.parts.find((part) => part.id === response.toolCallPartId)?.content.status,
       "pending_permission"
     );
-    assert.ok(
-      waitingSnapshot.parts.some((part) => part.id === response.commandOutputPartId && part.type === "command_output"),
-      "waiting permission snapshot omitted the command output part"
-    );
+    assert.equal(response.commandOutputPartId, undefined, "non-shell tools must not synthesize a command output part");
+    assert.equal(waitingSnapshot.parts.some((part) => part.type === "command_output"), false);
     let replayedWaitingMessages: Message[] = [];
     for (const event of waitingEvents) {
       replayedWaitingMessages = applyRunEventToMessages(replayedWaitingMessages, event);

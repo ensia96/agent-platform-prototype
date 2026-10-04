@@ -301,7 +301,8 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
   app.post("/api/permissions/:id/approve", async (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     try {
-      res.json(await kernel.approvePermissionRequest(req.params.id));
+      const response = await kernel.approvePermissionRequest(req.params.id);
+      res.json(response);
     } catch (error) {
       next(error);
     }
@@ -365,6 +366,11 @@ function registerToolAndSessionRoutes(app: Express, dependencies: ApiRouteDepend
     } catch (error) {
       next(error);
     }
+  });
+
+  app.get("/api/sessions/:id/subsessions", (req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    try { res.json(kernel.listSubsessions(req.params.id)); } catch (error) { next(error); }
   });
 
   app.get("/api/sessions/:id/context/segments/:segmentId", (req, res, next) => {

@@ -162,8 +162,13 @@ export function applyRunEventToMessages(messages: readonly Message[], event: Run
 }
 
 export function updateRunFromEvent(run: PublicRunSummary, event: RunEvent): PublicRunSummary {
-  if (run.id !== event.runId) {
-    return run;
+  if (run.id !== event.runId) return run;
+  // Preserve legacy queue-v2 events as audit data without restoring the removed runtime state.
+  if (["run_queued", "run_resumed"].includes(String(event.type))) return run;
+  if (event.type === "run_waiting_children" || event.type === "child_result_available") {
+    const waiting = event.type === "run_waiting_children";
+    return { ...run, status: waiting ? "waiting_children" : "running", currentPhase: waiting ? "waiting_children" : "running",
+      children: (event.payload as { children?: PublicRunSummary["children"] }).children ?? run.children, updatedAt: event.createdAt };
   }
   if (event.type === "run_waiting_permission") {
     return { ...run, status: "waiting_permission", currentPhase: "waiting_permission", updatedAt: event.createdAt };
@@ -194,7 +199,7 @@ export function updateRunFromEvent(run: PublicRunSummary, event: RunEvent): Publ
       error: payload.error ?? run.error
     };
   }
-  if (run.status === "waiting_permission") {
+  if (run.status === "waiting_permission" || run.status === "waiting_children") {
     return { ...run, updatedAt: event.createdAt };
   }
   const currentPhase: PublicRunPhase = event.type.startsWith("context_compaction") || event.type === "segment_rotated"
@@ -232,6 +237,7 @@ export function runDisplayStatus(
 ): { label: string; tone: RunStatusTone } {
   if (activeRun) {
     const reconnecting = connection === "reconnecting";
+    if (activeRun.status === "waiting_children") return { label: reconnecting ? "waiting for children · reconnecting" : "waiting for children", tone: "waiting" };
     if (activeRun.status === "waiting_permission") {
       return { label: reconnecting ? "waiting for approval · reconnecting" : "waiting for approval", tone: "waiting" };
     }

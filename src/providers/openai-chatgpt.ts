@@ -63,11 +63,12 @@ interface ChatGPTCodexRequestPayload {
     parameters: JsonObject;
   }>;
   tool_choice?: "auto";
-  input: Array<{
-    role: "user" | "assistant";
-    content: string;
-  }>;
+  input: CodexInputItem[];
 }
+
+type CodexInputItem = { role: "user" | "assistant"; content: string }
+  | { type: "function_call"; call_id: string; name: string; arguments: string; id?: string }
+  | { type: "function_call_output"; call_id: string; output: string };
 
 interface ProviderErrorDiagnostic {
   status?: number;
@@ -526,14 +527,19 @@ export function buildCodexRequestPayload(input: ProviderRunInput): ChatGPTCodexR
   return payload;
 }
 
-function buildCodexInputMessages(context: BuiltContext): Array<{ role: "user" | "assistant"; content: string }> {
-  return context.messages
-    .filter((message) => message.role !== "system")
-    .map((message) => ({
-      role: normalizeInputRole(message.role),
-      content: message.content.trim()
-    }))
-    .filter((message) => message.content.length > 0);
+function buildCodexInputMessages(context: BuiltContext): CodexInputItem[] {
+  const output: CodexInputItem[] = [];
+  for (const message of context.messages) {
+    if (message.role === "system") continue;
+    const exchange = message.toolExchange;
+    if (exchange) {
+      if (exchange.assistantText.trim()) output.push({role:"assistant",content:exchange.assistantText});
+      for (const call of exchange.calls) output.push({type:"function_call",call_id:call.id,name:call.name,arguments:call.argumentsText,
+        ...(call.nativeItemId ? {id:call.nativeItemId} : {})});
+      for (const result of exchange.results) output.push({type:"function_call_output",call_id:result.callId,output:result.output});
+    } else if (message.content.trim()) output.push({role:normalizeInputRole(message.role),content:message.content.trim()});
+  }
+  return output;
 }
 
 export async function parseOpenAIChatGPTStream(
@@ -640,6 +646,7 @@ async function handleStreamEvent(
 
 interface ChatGPTToolCallState {
   key: string;
+  outputIndex?: number;
   id?: string;
   callId?: string;
   name?: string;
@@ -936,6 +943,7 @@ function collectChatGPTToolCallEvent(value: unknown, states: Map<string, ChatGPT
   if (item && isFunctionCallRecord(item)) {
     const stateKey = key ?? stringValue(item.id) ?? stringValue(item.call_id) ?? `tool:${states.size}`;
     const state = states.get(stateKey) ?? { key: stateKey, argumentsText: "" };
+    if (typeof value.output_index === "number") state.outputIndex = value.output_index;
     state.id = stringValue(item.id) ?? state.id;
     state.callId = stringValue(item.call_id) ?? state.callId;
     state.name = stringValue(item.name) ?? state.name;
@@ -951,6 +959,7 @@ function collectChatGPTToolCallEvent(value: unknown, states: Map<string, ChatGPT
   }
 
   const state = states.get(key) ?? { key, argumentsText: "" };
+  if (typeof value.output_index === "number") state.outputIndex = value.output_index;
   const delta = stringValue(value.delta) ?? stringValue(value.arguments_delta);
   if (delta) {
     state.argumentsText += delta;
@@ -968,16 +977,19 @@ function collectChatGPTToolCallEvent(value: unknown, states: Map<string, ChatGPT
 
 function finalizeChatGPTToolCalls(states: Map<string, ChatGPTToolCallState>): ProviderToolCall[] {
   return [...states.values()]
+    .sort((a,b) => (a.outputIndex ?? Number.MAX_SAFE_INTEGER) - (b.outputIndex ?? Number.MAX_SAFE_INTEGER))
     .filter((state) => Boolean(state.name?.trim()))
-    .map((state, index) => {
+    .map((state) => {
+      if (!state.callId?.trim()) throw new Error("ChatGPT tool call is missing its native call_id; execution was not attempted.");
       const parsed = parseToolArguments(state.argumentsText);
       return {
-        id: state.callId?.trim() || state.id?.trim() || `chatgpt_tool_call_${index}`,
+        id: state.callId.trim(),
         name: state.name!.trim(),
         arguments: parsed.value,
         argumentsText: state.argumentsText,
         metadata: {
           provider: "openai-chatgpt",
+          ...(state.id ? { nativeItemId: state.id } : {}),
           experimental: true,
           key: state.key,
           ...(parsed.error ? { argumentsParseError: parsed.error } : {})
