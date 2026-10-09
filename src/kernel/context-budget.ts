@@ -11,6 +11,7 @@ import type {
   ProviderContextPlanningProfile
 } from "../shared/types";
 import { toolExchangeText } from "./tool-transcript";
+import { MessageVO } from "@/message/vo";
 
 export const contextEstimatorVersion = "conservative-utf8-v1";
 export const assumedContextWindowTokens = 16_384;
@@ -408,7 +409,7 @@ function groupAtomicTurns(messages: ContextMessage[]): GroupedTurns {
     const hasCompletedAssistant = turnMessages.some(
       (message) =>
         message.role === "assistant" &&
-        (message.metadata?.status === undefined || message.metadata.status === "completed")
+        (message.metadata?.status === undefined || new MessageVO.Status(message.metadata.status).isCompleted())
     );
     if (!hasCompletedAssistant) {
       omitted.push({ ...candidate, retention: "discardable", reason: "unfinished_user_turn_excluded" });

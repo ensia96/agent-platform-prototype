@@ -1,4 +1,5 @@
 import { RunType } from "@/run/type";
+import { MessageType } from "@/message/type";
 
 export type ISODateString = string;
 
@@ -15,7 +16,6 @@ export type MessagePartType =
   | "tool_result"
   | "command_output"
   | "file_ref";
-export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed" | "interrupted";
 
 /** Provider-defined opaque value, validated at runtime before persistence or use. */
 export type ReasoningEffort = string;
@@ -448,7 +448,7 @@ export interface Message {
   runId: string | null;
   segmentId: string;
   role: MessageRole;
-  status: MessageStatus;
+  status: MessageType.Status;
   error: string | null;
   metadata: JsonObject;
   model: string | null;

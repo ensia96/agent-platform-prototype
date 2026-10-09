@@ -17,7 +17,7 @@ import {
   resolveContextBudget,
   type ResolvedContextBudget
 } from "../src/kernel/context-budget";
-import { buildContext } from "../src/kernel/context-builder";
+import { buildContext, projectStoredMessagesForContext } from "../src/kernel/context-builder";
 import { RunEventBus } from "../src/kernel/event-bus";
 import { Kernel, KernelError } from "../src/kernel/kernel";
 import { contextPlanToJson } from "../src/kernel/kernel-metadata";
@@ -468,6 +468,9 @@ function historicalOutputAndSyntheticScenario(): void {
     }
   ]);
   const agent = agentFixture({ contextPolicy: { contextWindowTokensOverride: 16_384 } });
+  const completedWithError = { ...message, error: "fixture message error" };
+  assert.deepEqual(projectStoredMessagesForContext([completedWithError]), [], "completed assistant with an error entered context");
+  assert.deepEqual(projectStoredMessagesForContext([{ ...completedWithError, role: "user" }]).map((item) => item.messageId), [message.id], "assistant eligibility policy was applied to another role");
   const context = buildContext({
     session: sessionFixture(agent.id),
     agent,

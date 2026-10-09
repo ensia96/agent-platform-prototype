@@ -1,4 +1,5 @@
 import { RunType } from "@/run/type";
+import { MessageType } from "@/message/type";
 import type {
   AgentDefinition,
   ContextArtifact,
@@ -10,7 +11,6 @@ import type {
   MessagePart,
   MessagePartType,
   MessageRole,
-  MessageStatus,
   PermissionRequest,
   PermissionRequestStatus,
   PermissionRiskLevel,
@@ -67,7 +67,7 @@ export interface CreateMessageInput {
   runId?: string | null;
   segmentId?: string;
   role: MessageRole;
-  status: MessageStatus;
+  status: MessageType.Status;
   createdAt: ISODateString;
   updatedAt: ISODateString;
   metadata?: JsonObject;
@@ -316,8 +316,8 @@ export interface StoreAdapter {
   updateMessagePart(input: UpdateMessagePartInput): MessagePart | null;
   transitionMessageStatus(
     id: string,
-    expectedStatuses: readonly MessageStatus[],
-    status: MessageStatus,
+    expectedStatuses: readonly MessageType.Status[],
+    status: MessageType.Status,
     updatedAt: ISODateString,
     error?: string | null
   ): Message | null;

@@ -10,6 +10,8 @@ import type {
 import { isTerminalRunEventType } from "../shared/types";
 import { RunType } from "@/run/type";
 import { RunVO } from "@/run/vo";
+import { MessageType } from "@/message/type";
+import { MessageVO } from "@/message/vo";
 
 export type RunConnectionState = "idle" | "connecting" | "connected" | "reconnecting";
 export type RunStatusTone = "idle" | "running" | "waiting" | "reconnecting" | "cancelling" | "terminal" | "error";
@@ -222,9 +224,9 @@ export function terminalNoticeFromEvent(event: RunEvent): RunTerminalNotice | nu
 export function terminalNoticeFromMessages(messages: readonly Message[]): RunTerminalNotice | null {
   const message = messages
     .filter(
-      (item): item is Message & { status: RunType.TerminalStatus } =>
+      (item): item is Message & { status: MessageType.TerminalStatus } =>
         item.role === "assistant" &&
-        (item.status === "completed" || item.status === "cancelled" || item.status === "failed" || item.status === "interrupted")
+        new MessageVO.Status(item.status).isTerminal()
     )
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id))[0];
   return message ? { status: message.status, error: message.error } : null;
@@ -287,7 +289,7 @@ function applyTerminalEvent(messages: readonly Message[], event: RunEvent): Mess
       metadata: payload.metadata ? { ...message.metadata, ...payload.metadata } : message.metadata,
       usage: payload.usage ?? message.usage ?? null,
       parts:
-        new RunVO.Status(status).isStopped()
+        new MessageVO.Status(status).isStopped()
           ? message.parts.map((part) => cancelActiveToolCallPart(part, event.createdAt))
           : message.parts
     };

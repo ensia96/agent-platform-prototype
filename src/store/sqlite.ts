@@ -44,7 +44,6 @@ import type {
   MessagePart,
   MessagePartType,
   MessageRole,
-  MessageStatus,
   PermissionRequestStatus,
   PermissionRiskLevel,
   Run,
@@ -59,6 +58,8 @@ import type {
 import { isTerminalRunEventType } from "../shared/types";
 import { RunType } from "@/run/type";
 import { RunVO } from "@/run/vo";
+import { MessageType } from "@/message/type";
+import { MessageVO } from "@/message/vo";
 import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 
@@ -91,7 +92,7 @@ type MessageRow = {
   run_id: string | null;
   segment_id: string;
   role: MessageRole;
-  status: MessageStatus;
+  status: MessageType.Status;
   created_at: string;
   updated_at: string;
   metadata_json: string;
@@ -970,8 +971,8 @@ export class SQLiteStore implements StoreAdapter {
 
   transitionMessageStatus(
     id: string,
-    expectedStatuses: readonly MessageStatus[],
-    status: MessageStatus,
+    expectedStatuses: readonly MessageType.Status[],
+    status: MessageType.Status,
     updatedAt: string,
     error?: string | null
   ): Message | null {
@@ -1979,7 +1980,7 @@ function rowToRun(row: RunRow): Run {
 function rowToMessage(row: MessageRow, parts: MessagePart[]): Message {
   const metadata = parseJsonObject(row.metadata_json);
   const metadataError = typeof metadata.error === "string" && metadata.error.trim() ? metadata.error : null;
-  const error = row.status === "failed" ? metadataError ?? row.run_error ?? null : metadataError;
+  const error = new MessageVO.Status(row.status).isFailed() ? metadataError ?? row.run_error ?? null : metadataError;
   return {
     id: row.id,
     sessionId: row.session_id,

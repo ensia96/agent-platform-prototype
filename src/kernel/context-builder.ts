@@ -16,6 +16,7 @@ import type {
   Session
 } from "../shared/types";
 import { normalizeReasoningEffort } from "../shared/run-options";
+import { MessageVO } from "@/message/vo";
 import { boundHistoricalContextText, planContext, resolveContextBudget, type ResolvedContextBudget } from "./context-budget";
 
 export const defaultAgentId = "main";
@@ -178,7 +179,7 @@ function singleLine(value: string): string {
 }
 
 function messageToContextMessage(message: Message, warnings: string[], skippedMessageIds: string[]): ContextMessage | null {
-  if (message.role === "assistant" && (message.status !== "completed" || message.error)) {
+  if (message.role === "assistant" && (!new MessageVO.Status(message.status).isCompleted() || message.error)) {
     skippedMessageIds.push(message.id);
     warnings.push(`Skipped assistant message ${message.id} because it is ${message.status}${message.error ? " with an error" : ""}.`);
     return null;

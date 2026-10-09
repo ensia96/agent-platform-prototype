@@ -149,6 +149,7 @@ import type {
 } from "../shared/types";
 import { RUN_CONSTANT } from "@/run/constant";
 import { RunVO } from "@/run/vo";
+import { MessageVO } from "@/message/vo";
 
 export interface StartRunOptions {
   agentId?: string;
@@ -3616,7 +3617,7 @@ export class Kernel {
 
   private completeStreamingAssistantMessagesForRun(run: Run): void {
     for (const message of this.listAssistantMessagesForRun(run.id)) {
-      if (message.status !== "streaming") {
+      if (!new MessageVO.Status(message.status).isStreaming()) {
         continue;
       }
       new RunWriter({
@@ -5126,21 +5127,18 @@ function classifyCompactionEntry(
   const hardBoundary = messages.some(
     (message) =>
       (activeRunId !== null && message.runId === activeRunId) ||
-      message.status === "streaming",
+      new MessageVO.Status(message.status).isStreaming(),
   );
   const successfulAssistant = messages.find(
     (message) =>
       message.role === "assistant" &&
-      message.status === "completed" &&
+      new MessageVO.Status(message.status).isCompleted() &&
       !message.error,
   );
-  const terminalFailure = messages.find(
-    (message) =>
-      message.status === "failed" ||
-      message.status === "cancelled" ||
-      message.status === "interrupted" ||
-      Boolean(message.error),
-  );
+  const terminalFailure = messages.find((message) => {
+    const status = new MessageVO.Status(message.status);
+    return status.isFailed() || status.isStopped() || Boolean(message.error);
+  });
   let category: ContextArtifactSourceCategory["category"];
   let status: string;
   if (first?.role === "user" && successfulAssistant) {

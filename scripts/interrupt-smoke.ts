@@ -709,7 +709,10 @@ function usageSnapshotReplayScenario(): void {
     const usage = { inputTokens: 13, outputTokens: 8, reasoningTokens: 3, totalTokens: 21 };
     const writer = new RunWriter({ store, eventBus, run, assistantMessageId: message.id });
     writer.writeUsage(usage);
-    writer.complete();
+    assert.equal(writer.completeMessage()?.status, "completed");
+    assert.equal(kernel.getRun(run.id).status, "running", "message completion terminated its run");
+    assert.equal(kernel.listRunEvents(run.id).some((event) => isTerminalRunEventType(event.type)), false);
+    new RunWriter({ store, eventBus, run: kernel.getRun(run.id), assistantMessageId: message.id }).complete();
 
     const events = kernel.listRunEvents(run.id);
     const update = events.find((event) => event.type === "assistant_message_updated");
