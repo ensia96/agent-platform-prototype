@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PermissionRequest, Session, SubsessionDelegation } from "../shared/types";
-import { isTerminalRunStatus } from "../shared/types";
+import { RunVO } from "@/run/vo";
 import { ChildActionsController, type ChildActionView } from "./child-actions";
 
 export function SubsessionPanel({ session, onOpen, parentRunId = null, generation = 0, isCurrent = () => true }: {
@@ -61,7 +61,7 @@ export function SubsessionLinks({ parentSessionId, children, onOpen, error = fal
           <button type="button" disabled={busy[`permission:${p.id}`]} aria-label={`${child.agentName ?? child.agentId} ${child.childRunId.slice(0,8)} ${p.toolName} 거부`} onClick={() => onDeny?.(p.id)}>자식 실행 거부</button>
           {errors[`permission:${p.id}`] && <p role="alert">{errors[`permission:${p.id}`]}</p>}
         </div>)}
-        {(child.status === "starting" || !isTerminalRunStatus(child.status)) && <button type="button" disabled={busy[`cancel:${child.childRunId}`] || child.status === "cancelling"}
+        {(child.status === "starting" || !new RunVO.Status(child.status).isTerminal()) && <button type="button" disabled={busy[`cancel:${child.childRunId}`] || child.status === "cancelling"}
           aria-label={`${child.agentName ?? child.agentId} ${child.childRunId.slice(0,8)} 자식 작업 취소`} onClick={() => onCancel?.(child.childRunId)}>이 자식만 취소</button>}
         {errors[`cancel:${child.childRunId}`] && <p role="alert">{errors[`cancel:${child.childRunId}`]}</p>}
       </article>)}

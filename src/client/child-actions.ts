@@ -1,5 +1,5 @@
 import type { InvokeToolResponse, PermissionListResponse, PermissionRequest, PublicRunSummary, SubsessionDelegation } from "../shared/types";
-import { isTerminalRunStatus } from "../shared/types";
+import { RunVO } from "@/run/vo";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 
 export interface ChildActionView {
@@ -71,7 +71,7 @@ export class ChildActionsController {
 
   async cancel(childRunId: string): Promise<void> {
     const child = this.view.children.find((c) => c.childRunId === childRunId);
-    if (!child || child.status !== "starting" && isTerminalRunStatus(child.status)) return;
+    if (!child || child.status !== "starting" && new RunVO.Status(child.status).isTerminal()) return;
     await this.act(`cancel:${childRunId}`,child,async () => {
       const response = await this.request<PublicRunSummary>(`/api/runs/${encodeURIComponent(childRunId)}/cancel`,{method:"POST"});
       if (response.id !== childRunId || response.sessionId !== child.childSessionId) throw new Error("Child cancellation response ownership mismatch.");

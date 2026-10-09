@@ -12,6 +12,7 @@
     "stop": "node scripts/daemon.mjs stop",
     "status": "node scripts/daemon.mjs status",
     "smoke:kernel": "tsx scripts/kernel-smoke.ts",
+    "smoke:run-status": "tsx scripts/run-status-smoke.ts",
     "smoke:agent-profiles": "tsx scripts/agent-profiles-smoke.ts",
     "smoke:context-budget": "tsx scripts/context-budget-smoke.ts",
     "smoke:context-compaction": "tsx scripts/context-compaction-smoke.ts",

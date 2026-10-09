@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { RunType } from "@/run/type";
 import Database from "better-sqlite3";
 import { type ChildProcess, type spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -44,7 +45,6 @@ import {
   type ProviderProfile,
   type ProviderTestResponse,
   type RunEvent,
-  type RunStatus,
   type ToolInvocation
 } from "../src/shared/types";
 import { SQLiteStore } from "../src/store/sqlite";
@@ -1396,7 +1396,7 @@ function createStoredRun(
   return { runId, messageId };
 }
 
-function publicRunFixture(id: string, status: RunStatus, updatedAt: string): PublicRunSummary {
+function publicRunFixture(id: string, status: RunType.Status, updatedAt: string): PublicRunSummary {
   return {
     id,
     sessionId: "recovery-session",
@@ -1587,7 +1587,7 @@ function terminalEventTypes(kernel: Kernel, runId: string): string[] {
     .filter(isTerminalRunEventType);
 }
 
-async function waitForRunStatus(kernel: Kernel, runId: string, status: RunStatus): Promise<void> {
+async function waitForRunStatus(kernel: Kernel, runId: string, status: RunType.Status): Promise<void> {
   await waitFor(() => kernel.getRun(runId).status === status, `run ${runId} status ${status}`);
 }
 

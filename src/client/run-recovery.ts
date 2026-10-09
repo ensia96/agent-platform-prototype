@@ -5,16 +5,17 @@ import type {
   PermissionRequest,
   PublicRunPhase,
   PublicRunSummary,
-  RunEvent,
-  TerminalRunStatus
+  RunEvent
 } from "../shared/types";
-import { isTerminalRunEventType, isTerminalRunStatus } from "../shared/types";
+import { isTerminalRunEventType } from "../shared/types";
+import { RunType } from "@/run/type";
+import { RunVO } from "@/run/vo";
 
 export type RunConnectionState = "idle" | "connecting" | "connected" | "reconnecting";
 export type RunStatusTone = "idle" | "running" | "waiting" | "reconnecting" | "cancelling" | "terminal" | "error";
 
 export interface RunTerminalNotice {
-  status: TerminalRunStatus;
+  status: RunType.TerminalStatus;
   error: string | null;
 }
 
@@ -85,7 +86,7 @@ export function isCurrentTrackedRunRequest(
 
 export function selectRecoveredRun(runs: readonly PublicRunSummary[]): RecoveredRunSelection {
   const activeRuns = runs
-    .filter((run) => !isTerminalRunStatus(run.status))
+    .filter((run) => !new RunVO.Status(run.status).isTerminal())
     .sort(compareRunsNewestFirst);
   const run = activeRuns[0] ?? null;
   return {
@@ -199,7 +200,7 @@ export function updateRunFromEvent(run: PublicRunSummary, event: RunEvent): Publ
       error: payload.error ?? run.error
     };
   }
-  if (run.status === "waiting_permission" || run.status === "waiting_children") {
+  if (new RunVO.Status(run.status).isWaiting()) {
     return { ...run, updatedAt: event.createdAt };
   }
   const currentPhase: PublicRunPhase = event.type.startsWith("context_compaction") || event.type === "segment_rotated"
@@ -221,7 +222,7 @@ export function terminalNoticeFromEvent(event: RunEvent): RunTerminalNotice | nu
 export function terminalNoticeFromMessages(messages: readonly Message[]): RunTerminalNotice | null {
   const message = messages
     .filter(
-      (item): item is Message & { status: TerminalRunStatus } =>
+      (item): item is Message & { status: RunType.TerminalStatus } =>
         item.role === "assistant" &&
         (item.status === "completed" || item.status === "cancelled" || item.status === "failed" || item.status === "interrupted")
     )
@@ -286,7 +287,7 @@ function applyTerminalEvent(messages: readonly Message[], event: RunEvent): Mess
       metadata: payload.metadata ? { ...message.metadata, ...payload.metadata } : message.metadata,
       usage: payload.usage ?? message.usage ?? null,
       parts:
-        status === "cancelled" || status === "interrupted"
+        new RunVO.Status(status).isStopped()
           ? message.parts.map((part) => cancelActiveToolCallPart(part, event.createdAt))
           : message.parts
     };
@@ -371,7 +372,7 @@ function cancelActiveToolCallPart(part: MessagePart, updatedAt: string): Message
     : part;
 }
 
-function terminalStatusFromEvent(event: RunEvent): TerminalRunStatus {
+function terminalStatusFromEvent(event: RunEvent): RunType.TerminalStatus {
   if (event.type === "run_completed") {
     return "completed";
   }

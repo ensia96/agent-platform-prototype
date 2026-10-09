@@ -34,7 +34,6 @@ import type {
 } from "./types";
 import { ActiveRunExistsStoreError, ContextSegmentChangedStoreError } from "./types";
 import type {
-  ActiveRunStatus,
   AgentDefinition,
   ContextArtifact,
   ContextArtifactSourceCategory,
@@ -52,14 +51,14 @@ import type {
   RunEvent,
   RunEventType,
   RunOptions,
-  RunStatus,
   RunUsage,
   Session,
-  TerminalRunStatus,
   ToolInvocationCaller,
   ToolPermissionDecision
 } from "../shared/types";
-import { canTransitionRunStatus, isActiveRunStatus, isTerminalRunEventType, isTerminalRunStatus } from "../shared/types";
+import { isTerminalRunEventType } from "../shared/types";
+import { RunType } from "@/run/type";
+import { RunVO } from "@/run/vo";
 import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 
@@ -78,7 +77,7 @@ type RunRow = {
   id: string;
   session_id: string;
   provider: string;
-  status: RunStatus;
+  status: RunType.Status;
   segment_id: string;
   created_at: string;
   updated_at: string;
@@ -599,7 +598,7 @@ export class SQLiteStore implements StoreAdapter {
       const delegation = this.subsessions.forRun(input.id);
       if (delegation) {
         const parent = this.getRun(delegation.parentRunId);
-        if (delegation.childSessionId !== input.sessionId || !parent || !['running','waiting_children','waiting_permission'].includes(parent.status)) {
+        if (delegation.childSessionId !== input.sessionId || !parent || !(parent.status === "running" || new RunVO.Status(parent.status).isWaiting())) {
           throw new Error('Child admission lost its owning parent run.');
         }
         const admitted = this.getRun(input.id);
@@ -670,12 +669,12 @@ export class SQLiteStore implements StoreAdapter {
 
   transitionRunStatus(
     id: string,
-    expectedStatuses: readonly RunStatus[],
-    status: ActiveRunStatus,
+    expectedStatuses: readonly RunType.Status[],
+    status: RunType.ActiveStatus,
     error: string | null,
     updatedAt: string
   ): Run | null {
-    if (!isActiveRunStatus(status)) {
+    if (!new RunVO.Status(status).isActive()) {
       throw new Error(`Terminal run status '${status}' must be written through finalizeRun().`);
     }
     assertValidRunTransition(expectedStatuses, status);
@@ -693,7 +692,7 @@ export class SQLiteStore implements StoreAdapter {
   requestRunCancellation(input: RequestRunCancellationInput): RunCancellationResult | null {
     const requestCancellation = this.db.transaction((): RunCancellationResult | null => {
       const current = this.getRun(input.runId);
-      if (!current || isTerminalRunStatus(current.status)) {
+      if (!current || new RunVO.Status(current.status).isTerminal()) {
         return null;
       }
 
@@ -1013,7 +1012,7 @@ export class SQLiteStore implements StoreAdapter {
         throw new Error(`Terminal event '${input.type}' must be written through finalizeRun().`);
       }
       const run = this.getRun(input.runId);
-      if (!run || !isActiveRunStatus(run.status)) {
+      if (!run || !new RunVO.Status(run.status).isActive()) {
         throw new Error(`Cannot append non-terminal event '${input.type}' to inactive run '${input.runId}'.`);
       }
       return this.insertEvent(input);
@@ -1943,15 +1942,16 @@ function normalizeStoredWorkingDirectory(value: string | null | undefined, defau
   return trimmed ? resolve(trimmed) : defaultWorkingDirectory;
 }
 
-function assertValidRunTransition(expectedStatuses: readonly RunStatus[], status: RunStatus): void {
+function assertValidRunTransition(expectedStatuses: readonly RunType.Status[], status: RunType.Status): void {
+  const target = new RunVO.Status(status);
   for (const expectedStatus of expectedStatuses) {
-    if (!canTransitionRunStatus(expectedStatus, status)) {
+    if (!new RunVO.Status(expectedStatus).canTransitionTo(target)) {
       throw new Error(`Invalid run status transition: ${expectedStatus} -> ${status}`);
     }
   }
 }
 
-function assertMatchingTerminalEvent(status: TerminalRunStatus, eventType: RunEventType): void {
+function assertMatchingTerminalEvent(status: RunType.TerminalStatus, eventType: RunEventType): void {
   const expectedEventType = `run_${status}`;
   if (eventType !== expectedEventType) {
     throw new Error(`Terminal run status '${status}' requires event '${expectedEventType}', received '${eventType}'.`);

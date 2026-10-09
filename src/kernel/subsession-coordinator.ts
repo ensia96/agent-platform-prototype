@@ -2,6 +2,7 @@ import type { StoreAdapter } from "../store/types";
 import type { AgentDefinition, JsonObject, SubsessionDelegation } from "../shared/types";
 import type { RegisteredTool } from "../tools/types";
 import { ToolInputError } from "../tools/types";
+import { RunVO } from "@/run/vo";
 import { agentRunSnapshotToJson } from "./kernel-metadata";
 
 export const subsessionToolId = "subsession.start";
@@ -68,7 +69,7 @@ export class SubsessionCoordinator {
         const parent = this.store.getRun(item.parentRunId);
         if (parent && ["completed", "failed", "cancelled", "interrupted", "cancelling"].includes(parent.status)) {
           const child = this.store.getRun(item.childRunId);
-          if (child && ["running", "waiting_permission", "waiting_children"].includes(child.status)) this.cancelOwned(item.parentRunId);
+          if (child && (child.status === "running" || new RunVO.Status(child.status).isWaiting())) this.cancelOwned(item.parentRunId);
           if (!child) this.store.subsessions.failStart(item.id);
           continue;
         }

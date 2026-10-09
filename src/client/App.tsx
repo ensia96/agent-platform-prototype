@@ -23,7 +23,7 @@ import type {
   ToolDefinition,
   ToolListResponse
 } from "../shared/types";
-import { isActiveRunStatus, isTerminalRunStatus } from "../shared/types";
+import { RunVO } from "@/run/vo";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 import { ChatHeader } from "./ChatHeader";
 import { SubsessionPanel } from "./SubsessionPanel";
@@ -915,7 +915,7 @@ export function App() {
       setLastShellResponse(response);
       setShellToolState(shellToolStateFromResponse(response));
       upsertMessage(response.message);
-      if (isTerminalRunStatus(response.run.status)) {
+      if (new RunVO.Status(response.run.status).isTerminal()) {
         void loadMessages(sessionId);
       } else {
         beginRunTracking(response.run, true);
@@ -1033,7 +1033,7 @@ export function App() {
   }
 
   function beginRunTracking(run: PublicRunSummary, resetMessages: boolean) {
-    if (run.sessionId !== selectedSessionIdRef.current || isTerminalRunStatus(run.status)) {
+    if (run.sessionId !== selectedSessionIdRef.current || new RunVO.Status(run.status).isTerminal()) {
       return;
     }
     detachRunEvents();
@@ -1201,8 +1201,9 @@ export function App() {
     }
     setLastRunOptions(snapshot.runOptions);
     setLastRunUsage(snapshot.usage);
-    if (isTerminalRunStatus(snapshot.status)) {
-      finishTrackedRun({ status: snapshot.status, error: snapshot.error }, snapshot.sessionId);
+    const status = new RunVO.Status(snapshot.status);
+    if (status.isTerminal()) {
+      finishTrackedRun({ status: status.value, error: snapshot.error }, snapshot.sessionId);
       return;
     }
     setActiveRun(snapshot);
@@ -1294,7 +1295,7 @@ export function App() {
     if (response.run.provider.startsWith("tool:")) {
       return false;
     }
-    if (isActiveRunStatus(response.run.status)) {
+    if (new RunVO.Status(response.run.status).isActive()) {
       beginRunTracking(response.run, true);
       return true;
     }
@@ -1756,7 +1757,7 @@ function activeRunFromError(error: unknown): PublicRunSummary | null {
     return null;
   }
   const run = value as Partial<PublicRunSummary>;
-  return typeof run.id === "string" && typeof run.sessionId === "string" && run.status && isActiveRunStatus(run.status)
+  return typeof run.id === "string" && typeof run.sessionId === "string" && run.status && new RunVO.Status(run.status).isActive()
     ? (run as PublicRunSummary)
     : null;
 }

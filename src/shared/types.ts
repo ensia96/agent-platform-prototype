@@ -1,3 +1,5 @@
+import { RunType } from "@/run/type";
+
 export type ISODateString = string;
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
@@ -14,33 +16,6 @@ export type MessagePartType =
   | "command_output"
   | "file_ref";
 export type MessageStatus = "completed" | "streaming" | "cancelled" | "failed" | "interrupted";
-export type RunStatus = "running" | "waiting_permission" | "waiting_children" | "cancelling" | "completed" | "cancelled" | "failed" | "interrupted";
-export type ActiveRunStatus = Extract<RunStatus, "running" | "waiting_permission" | "waiting_children" | "cancelling">;
-export type TerminalRunStatus = Extract<RunStatus, "completed" | "cancelled" | "failed" | "interrupted">;
-
-export const ACTIVE_RUN_STATUSES: readonly ActiveRunStatus[] = ["running", "waiting_permission", "waiting_children", "cancelling"];
-export const TERMINAL_RUN_STATUSES: readonly TerminalRunStatus[] = ["completed", "cancelled", "failed", "interrupted"];
-
-export function isActiveRunStatus(status: RunStatus): status is ActiveRunStatus {
-  return (ACTIVE_RUN_STATUSES as readonly RunStatus[]).includes(status);
-}
-
-export function isTerminalRunStatus(status: RunStatus): status is TerminalRunStatus {
-  return (TERMINAL_RUN_STATUSES as readonly RunStatus[]).includes(status);
-}
-
-export function canTransitionRunStatus(from: RunStatus, to: RunStatus): boolean {
-  if (isTerminalRunStatus(from) || from === to) {
-    return false;
-  }
-  if (from === "running") {
-    return to === "waiting_permission" || to === "waiting_children" || to === "cancelling" || isTerminalRunStatus(to);
-  }
-  if (from === "waiting_permission" || from === "waiting_children") {
-    return to === "running" || to === "cancelling" || to === "failed" || to === "cancelled" || to === "interrupted";
-  }
-  return from === "cancelling" && (to === "cancelled" || to === "interrupted");
-}
 
 /** Provider-defined opaque value, validated at runtime before persistence or use. */
 export type ReasoningEffort = string;
@@ -488,7 +463,7 @@ export interface Run {
   id: string;
   sessionId: string;
   provider: string;
-  status: RunStatus;
+  status: RunType.Status;
   segmentId: string;
   metadata: JsonObject;
   model: string | null;
@@ -574,7 +549,7 @@ export interface SubsessionDelegation {
   childRunId: string;
   agentId: string;
   agentRevision: number;
-  status: "starting" | RunStatus;
+  status: "starting" | RunType.Status;
   result: string | null;
   deliveredPartId: string | null;
   acknowledged: boolean;
@@ -586,7 +561,7 @@ export interface PublicRunSummary {
   id: string;
   sessionId: string;
   provider: string;
-  status: RunStatus;
+  status: RunType.Status;
   model: string | null;
   runOptions: RunOptions | null;
   usage: RunUsage | null;

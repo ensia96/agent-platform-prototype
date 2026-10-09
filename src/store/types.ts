@@ -1,5 +1,5 @@
+import { RunType } from "@/run/type";
 import type {
-  ActiveRunStatus,
   AgentDefinition,
   ContextArtifact,
   ContextSegment,
@@ -18,10 +18,8 @@ import type {
   RunEvent,
   RunEventType,
   RunOptions,
-  RunStatus,
   Session,
   TerminalRunEventType,
-  TerminalRunStatus,
   ToolInvocationCaller,
   ToolPermissionDecision
 } from "../shared/types";
@@ -208,7 +206,7 @@ export interface ListPermissionRequestsFilter {
 
 export interface ListRunsFilter {
   sessionId?: string;
-  statuses?: readonly RunStatus[];
+  statuses?: readonly RunType.Status[];
 }
 
 export interface DaemonLeaseRecord {
@@ -232,8 +230,8 @@ export interface RequestRunCancellationInput {
 
 export interface FinalizeRunInput {
   runId: string;
-  expectedStatuses: readonly RunStatus[];
-  status: TerminalRunStatus;
+  expectedStatuses: readonly RunType.Status[];
+  status: RunType.TerminalStatus;
   error: string | null;
   updatedAt: ISODateString;
   event: Pick<AppendEventInput, "id" | "payload"> & { type: TerminalRunEventType };
@@ -299,8 +297,8 @@ export interface StoreAdapter {
   listRuns(filter?: ListRunsFilter): Run[];
   transitionRunStatus(
     id: string,
-    expectedStatuses: readonly RunStatus[],
-    status: ActiveRunStatus,
+    expectedStatuses: readonly RunType.Status[],
+    status: RunType.ActiveStatus,
     error: string | null,
     updatedAt: ISODateString
   ): Run | null;

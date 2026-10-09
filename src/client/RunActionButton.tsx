@@ -1,5 +1,5 @@
 import type { PublicRunSummary } from "../shared/types";
-import { isTerminalRunStatus } from "../shared/types";
+import { RunVO } from "@/run/vo";
 
 export function RunActionButton({
   activeRun,
@@ -12,7 +12,7 @@ export function RunActionButton({
   runDisabled: boolean;
   onCancel: () => void;
 }) {
-  if (!activeRun || isTerminalRunStatus(activeRun.status)) {
+  if (!activeRun || new RunVO.Status(activeRun.status).isTerminal()) {
     return (
       <button type="submit" disabled={runDisabled}>
         Run

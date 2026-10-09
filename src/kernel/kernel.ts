@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { buildContext, defaultAgentId, projectStoredMessagesForContext, type ContextBuildInput } from "./context-builder";
+import {
+  buildContext,
+  defaultAgentId,
+  projectStoredMessagesForContext,
+  type ContextBuildInput,
+} from "./context-builder";
 import {
   boundHistoricalContextText,
   contextBudgetFromMetadata,
@@ -11,7 +16,7 @@ import {
   contextEstimatorVersion,
   estimateTextTokens,
   InvalidContextPolicyError,
-  resolveContextBudget
+  resolveContextBudget,
 } from "./context-budget";
 import type { RunEventBus, RunEventListener } from "./event-bus";
 import {
@@ -29,10 +34,13 @@ import {
   runOptionsFromJson,
   stringField,
   toProviderMessages,
-  type RunOptionPlan
+  type RunOptionPlan,
 } from "./kernel-metadata";
 import { RunWriter } from "./run-writer";
-import { currentRunToolTranscript, NativeTranscriptError } from "./tool-transcript";
+import {
+  currentRunToolTranscript,
+  NativeTranscriptError,
+} from "./tool-transcript";
 import { SubsessionCoordinator } from "./subsession-coordinator";
 import { SubsessionAdmissionError } from "../store/subsessions";
 import {
@@ -41,7 +49,7 @@ import {
   toPublicProviderResolution,
   toPublicRunEvent,
   toPublicToolExecutionResult,
-  toPublicToolInvocation
+  toPublicToolInvocation,
 } from "./public-projection";
 import {
   appendLimitedText,
@@ -57,25 +65,53 @@ import {
   summarizeToolInput,
   summarizeToolResult,
   toolProviderForPart,
-  toPublicPermissionRequest
+  toPublicPermissionRequest,
 } from "./tool-execution";
-import type { ProviderAdapter, ProviderRunInput, ProviderRunWriter, ProviderToolCall } from "../providers/types";
+import type {
+  ProviderAdapter,
+  ProviderRunInput,
+  ProviderRunWriter,
+  ProviderToolCall,
+} from "../providers/types";
 import { ProviderContextLengthError } from "../providers/provider-errors";
-import type { ProviderRegistry, ResolvedProviderRun } from "../providers/registry";
+import type {
+  ProviderRegistry,
+  ResolvedProviderRun,
+} from "../providers/registry";
 import type {
   CreateAgentDefinitionInput,
   CreateRunInput,
   StoreAdapter,
   StoredPermissionRequest,
-  UpdateAgentDefinitionInput
+  UpdateAgentDefinitionInput,
 } from "../store/types";
-import { ActiveRunExistsStoreError, ContextSegmentChangedStoreError } from "../store/types";
-import { providerToolNameToToolId, toModelToolDefinition } from "../shared/model-tools";
-import { hasControlCharacters, maxReasoningEffortLength, normalizeReasoningEffort } from "../shared/run-options";
-import { normalizeToolSettings, toolSettingsSettingKey } from "../shared/tool-settings";
-import { evaluateToolPermission, type ToolPermissionEvaluation } from "../tools/permission-policy";
+import {
+  ActiveRunExistsStoreError,
+  ContextSegmentChangedStoreError,
+} from "../store/types";
+import {
+  providerToolNameToToolId,
+  toModelToolDefinition,
+} from "../shared/model-tools";
+import {
+  hasControlCharacters,
+  maxReasoningEffortLength,
+  normalizeReasoningEffort,
+} from "../shared/run-options";
+import {
+  normalizeToolSettings,
+  toolSettingsSettingKey,
+} from "../shared/tool-settings";
+import {
+  evaluateToolPermission,
+  type ToolPermissionEvaluation,
+} from "../tools/permission-policy";
 import type { ToolRegistry } from "../tools/registry";
-import { ToolExecutionAbortError, ToolInputError, type RegisteredTool } from "../tools/types";
+import {
+  ToolExecutionAbortError,
+  ToolInputError,
+  type RegisteredTool,
+} from "../tools/types";
 import type {
   AgentDefinition,
   CompactContextResponse,
@@ -109,9 +145,10 @@ import type {
   ToolInvocationCaller,
   ToolInvocationStatus,
   ToolSettings,
-  ToolResultStatus
+  ToolResultStatus,
 } from "../shared/types";
-import { ACTIVE_RUN_STATUSES, isTerminalRunStatus } from "../shared/types";
+import { RUN_CONSTANT } from "@/run/constant";
+import { RunVO } from "@/run/vo";
 
 export interface StartRunOptions {
   agentId?: string;
@@ -171,7 +208,12 @@ interface PreparedToolInvocation {
   execution: RunExecution;
 }
 
-type RunExecutionPhase = "idle" | "provider" | "tool" | "compacting_context" | "waiting_permission";
+type RunExecutionPhase =
+  | "idle"
+  | "provider"
+  | "tool"
+  | "compacting_context"
+  | "waiting_permission";
 type RunTermination = "cancelled" | "interrupted";
 
 interface RunExecution {
@@ -189,7 +231,7 @@ export class KernelError extends Error {
     message: string,
     readonly statusCode = 500,
     readonly code?: string,
-    readonly details?: Record<string, unknown>
+    readonly details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = "KernelError";
@@ -221,7 +263,10 @@ export class Kernel {
   private readonly tools: ToolRegistry;
   private readonly defaultWorkingDirectory: string;
   private readonly executions = new Map<string, RunExecution>();
-  private readonly compactions = new Map<string, Promise<CompactContextResponse>>();
+  private readonly compactions = new Map<
+    string,
+    Promise<CompactContextResponse>
+  >();
   private readonly compactionControllers = new Map<string, AbortController>();
   private shuttingDown = false;
 
@@ -234,26 +279,51 @@ export class Kernel {
       agent: (id) => {
         const agent = this.getAgentDefinition(id);
         const profiles = this.providers.list();
-        const profileId = agent.modelProfileId ?? profiles.defaultProviderProfileId;
-        const profile = profiles.providers.find((item) => item.id === profileId);
-        return { ...agent, modelProfileId: profileId,
-          defaultRunOptions: mergeRunOptions(profile?.defaultRunOptions ?? (profile?.model ? {model:profile.model} : {}),agent.defaultRunOptions ?? {}) };
+        const profileId =
+          agent.modelProfileId ?? profiles.defaultProviderProfileId;
+        const profile = profiles.providers.find(
+          (item) => item.id === profileId,
+        );
+        return {
+          ...agent,
+          modelProfileId: profileId,
+          defaultRunOptions: mergeRunOptions(
+            profile?.defaultRunOptions ??
+              (profile?.model ? { model: profile.model } : {}),
+            agent.defaultRunOptions ?? {},
+          ),
+        };
       },
       execute: (runId) => this.executeAdmittedSubsession(runId),
-      fail: (id,error) => {
+      fail: (id, error) => {
         const execution = this.getOrCreateExecution(id);
-        this.handleQueuedExecutionError(id,execution,error);
+        this.handleQueuedExecutionError(id, execution, error);
         this.releaseTerminalExecution(execution);
       },
-      cancel: (id) => { this.cancelRun(id); },
-      wake: (id) => this.wakeWaitingParent(id)
+      cancel: (id) => {
+        this.cancelRun(id);
+      },
+      wake: (id) => this.wakeWaitingParent(id),
     });
     this.tools.register(this.subsessions.tool(), true);
     this.unobserveChildren = this.eventBus.observe((event) => {
-      if (["run_completed", "run_failed", "run_cancelled", "run_interrupted"].includes(event.type)) this.subsessions.changed();
+      if (
+        [
+          "run_completed",
+          "run_failed",
+          "run_cancelled",
+          "run_interrupted",
+        ].includes(event.type)
+      )
+        this.subsessions.changed();
     });
-    this.defaultWorkingDirectory = resolve(options.toolExecutionCwd ?? homedir());
-    assertExistingDirectory(this.defaultWorkingDirectory, "Default session workingDirectory");
+    this.defaultWorkingDirectory = resolve(
+      options.toolExecutionCwd ?? homedir(),
+    );
+    assertExistingDirectory(
+      this.defaultWorkingDirectory,
+      "Default session workingDirectory",
+    );
   }
 
   listSessions(): Session[] {
@@ -269,10 +339,12 @@ export class Kernel {
       id: randomUUID(),
       activeSegmentId: randomUUID(),
       title: input.title?.trim() || "New session",
-      workingDirectory: this.normalizeWorkingDirectory(input.workingDirectory, { allowDefault: true }),
+      workingDirectory: this.normalizeWorkingDirectory(input.workingDirectory, {
+        allowDefault: true,
+      }),
       agentId,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     });
   }
 
@@ -293,22 +365,24 @@ export class Kernel {
     const workingDirectory =
       patch.workingDirectory === undefined
         ? undefined
-        : this.normalizeWorkingDirectory(patch.workingDirectory, { allowDefault: false });
+        : this.normalizeWorkingDirectory(patch.workingDirectory, {
+            allowDefault: false,
+          });
     const agentId = patch.agentId?.trim();
     if (patch.agentId !== undefined) {
       if (!agentId) {
-        throw new KernelError("Session agentId must be a non-empty string.", 400);
+        throw new KernelError(
+          "Session agentId must be a non-empty string.",
+          400,
+        );
       }
       this.getAgentDefinition(agentId);
     }
-    const updated = this.store.updateSession(
-      id,
-      {
-        ...(workingDirectory ? { workingDirectory } : {}),
-        ...(agentId ? { agentId } : {}),
-        updatedAt: new Date().toISOString()
-      }
-    );
+    const updated = this.store.updateSession(id, {
+      ...(workingDirectory ? { workingDirectory } : {}),
+      ...(agentId ? { agentId } : {}),
+      updatedAt: new Date().toISOString(),
+    });
     if (!updated) {
       throw new KernelError("Session not found", 404);
     }
@@ -322,29 +396,45 @@ export class Kernel {
 
   listActiveMessages(sessionId: string): Message[] {
     const session = this.getSession(sessionId);
-    return this.store.listMessagesBySegment(session.activeSegmentId).map(toPublicMessage);
+    return this.store
+      .listMessagesBySegment(session.activeSegmentId)
+      .map(toPublicMessage);
   }
 
   listContextSegments(sessionId: string): ContextSegmentDetail[] {
     this.getSession(sessionId);
     const artifactList = this.store.listContextArtifacts(sessionId);
-    const artifacts = new Map(artifactList.map((artifact) => [artifact.id, artifact]));
+    const artifacts = new Map(
+      artifactList.map((artifact) => [artifact.id, artifact]),
+    );
     const artifactsBySource = new Map(
-      artifactList.filter((artifact) => artifact.status === "completed").map((artifact) => [artifact.sourceSegmentId, artifact])
+      artifactList
+        .filter((artifact) => artifact.status === "completed")
+        .map((artifact) => [artifact.sourceSegmentId, artifact]),
     );
     return this.store.listContextSegments(sessionId).map((segment) => ({
       ...segment,
       artifact:
         artifactsBySource.get(segment.id) ??
-        (segment.inheritedArtifactId ? artifacts.get(segment.inheritedArtifactId) ?? null : null),
+        (segment.inheritedArtifactId
+          ? (artifacts.get(segment.inheritedArtifactId) ?? null)
+          : null),
       recentFailure:
-        [...artifactList].reverse().find(
-          (artifact) => artifact.status === "failed" && (artifact.sourceSegmentId === segment.id || artifact.targetSegmentId === segment.id)
-        ) ?? null
+        [...artifactList]
+          .reverse()
+          .find(
+            (artifact) =>
+              artifact.status === "failed" &&
+              (artifact.sourceSegmentId === segment.id ||
+                artifact.targetSegmentId === segment.id),
+          ) ?? null,
     }));
   }
 
-  getContextSegment(sessionId: string, segmentId: string): ContextSegmentDetail {
+  getContextSegment(
+    sessionId: string,
+    segmentId: string,
+  ): ContextSegmentDetail {
     this.getSession(sessionId);
     const segment = this.store.getContextSegment(segmentId);
     if (!segment || segment.sessionId !== sessionId) {
@@ -353,12 +443,25 @@ export class Kernel {
     return {
       ...segment,
       artifact:
-        this.store.listContextArtifacts(sessionId).find((artifact) => artifact.sourceSegmentId === segment.id && artifact.status === "completed") ??
-        (segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null),
+        this.store
+          .listContextArtifacts(sessionId)
+          .find(
+            (artifact) =>
+              artifact.sourceSegmentId === segment.id &&
+              artifact.status === "completed",
+          ) ??
+        (segment.inheritedArtifactId
+          ? this.store.getContextArtifact(segment.inheritedArtifactId)
+          : null),
       recentFailure:
-        [...this.store.listContextArtifacts(sessionId)].reverse().find(
-          (artifact) => artifact.status === "failed" && (artifact.sourceSegmentId === segment.id || artifact.targetSegmentId === segment.id)
-        ) ?? null
+        [...this.store.listContextArtifacts(sessionId)]
+          .reverse()
+          .find(
+            (artifact) =>
+              artifact.status === "failed" &&
+              (artifact.sourceSegmentId === segment.id ||
+                artifact.targetSegmentId === segment.id),
+          ) ?? null,
     };
   }
 
@@ -378,9 +481,16 @@ export class Kernel {
 
   async compactSession(sessionId: string): Promise<CompactContextResponse> {
     this.assertAcceptingWork();
-    const activeRuns = this.store.listRuns({ sessionId, statuses: ACTIVE_RUN_STATUSES });
+    const activeRuns = this.store.listRuns({
+      sessionId,
+      statuses: RUN_CONSTANT.ACTIVE_STATUS,
+    });
     if (activeRuns.length > 0) {
-      throw new KernelError("Context cannot be compacted while the session has an active run or permission request.", 409, "context_compaction_conflict");
+      throw new KernelError(
+        "Context cannot be compacted while the session has an active run or permission request.",
+        409,
+        "context_compaction_conflict",
+      );
     }
     return this.coordinateCompaction(sessionId, null);
   }
@@ -389,11 +499,23 @@ export class Kernel {
     return this.tools.list();
   }
 
-  async invokeTool(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions = {}): Promise<InvokeToolResponse> {
+  async invokeTool(
+    sessionId: string,
+    toolId: string,
+    input: JsonObject,
+    options: InvokeToolOptions = {},
+  ): Promise<InvokeToolResponse> {
     this.assertAcceptingWork();
-    const prepared = this.prepareToolInvocation(sessionId, toolId, input, options);
+    const prepared = this.prepareToolInvocation(
+      sessionId,
+      toolId,
+      input,
+      options,
+    );
     if (prepared.permission.decision === "allowed") {
-      return this.trackExecution(prepared.execution, () => this.executePreparedToolInvocation(prepared, { state: "executed" }));
+      return this.trackExecution(prepared.execution, () =>
+        this.executePreparedToolInvocation(prepared, { state: "executed" }),
+      );
     }
     if (prepared.permission.decision === "requires_approval") {
       return this.createPendingPermissionResponse(prepared);
@@ -403,9 +525,19 @@ export class Kernel {
     return response;
   }
 
-  startToolInvocation(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions = {}): InvokeToolResponse {
+  startToolInvocation(
+    sessionId: string,
+    toolId: string,
+    input: JsonObject,
+    options: InvokeToolOptions = {},
+  ): InvokeToolResponse {
     this.assertAcceptingWork();
-    const prepared = this.prepareToolInvocation(sessionId, toolId, input, options);
+    const prepared = this.prepareToolInvocation(
+      sessionId,
+      toolId,
+      input,
+      options,
+    );
     if (prepared.permission.decision === "requires_approval") {
       return this.createPendingPermissionResponse(prepared);
     }
@@ -416,17 +548,28 @@ export class Kernel {
     }
 
     queueMicrotask(() => {
-      void this.trackExecution(prepared.execution, () => this.executePreparedToolInvocation(prepared, { state: "executed" })).catch((error) =>
-        this.handleQueuedExecutionError(prepared.run.id, prepared.execution, error)
+      void this.trackExecution(prepared.execution, () =>
+        this.executePreparedToolInvocation(prepared, { state: "executed" }),
+      ).catch((error) =>
+        this.handleQueuedExecutionError(
+          prepared.run.id,
+          prepared.execution,
+          error,
+        ),
       );
     });
     return {
       state: "running",
       invocation: toPublicToolInvocation(prepared.invocation),
-      run: this.toPublicRunSummary(this.store.getRun(prepared.run.id) ?? prepared.run),
-      message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id) ?? prepared.assistantMessage),
+      run: this.toPublicRunSummary(
+        this.store.getRun(prepared.run.id) ?? prepared.run,
+      ),
+      message: toPublicMessage(
+        this.store.getMessage(prepared.assistantMessage.id) ??
+          prepared.assistantMessage,
+      ),
       toolCallPartId: prepared.toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart?.id
+      commandOutputPartId: prepared.commandOutputPart?.id,
     };
   }
 
@@ -447,16 +590,31 @@ export class Kernel {
     if (current.revision !== input.expectedRevision) {
       throw this.agentRevisionConflict(current);
     }
-    const candidate = this.normalizeAgentDefinition({
-      name: input.name ?? current.name,
-      description: input.description !== undefined ? input.description : current.description,
-      systemPrompt: input.systemPrompt ?? current.systemPrompt,
-      modelProfileId: input.modelProfileId !== undefined ? input.modelProfileId : current.modelProfileId,
-      defaultRunOptions: input.defaultRunOptions !== undefined ? input.defaultRunOptions : current.defaultRunOptions,
-      contextPolicy: input.contextPolicy !== undefined ? input.contextPolicy : current.contextPolicy,
-      skillIds: input.skillIds ?? current.skillIds,
-      toolIds: input.toolIds ?? current.toolIds
-    }, current.id);
+    const candidate = this.normalizeAgentDefinition(
+      {
+        name: input.name ?? current.name,
+        description:
+          input.description !== undefined
+            ? input.description
+            : current.description,
+        systemPrompt: input.systemPrompt ?? current.systemPrompt,
+        modelProfileId:
+          input.modelProfileId !== undefined
+            ? input.modelProfileId
+            : current.modelProfileId,
+        defaultRunOptions:
+          input.defaultRunOptions !== undefined
+            ? input.defaultRunOptions
+            : current.defaultRunOptions,
+        contextPolicy:
+          input.contextPolicy !== undefined
+            ? input.contextPolicy
+            : current.contextPolicy,
+        skillIds: input.skillIds ?? current.skillIds,
+        toolIds: input.toolIds ?? current.toolIds,
+      },
+      current.id,
+    );
     const result = this.store.updateAgentDefinition({ ...input, ...candidate });
     if (result.status === "not_found") {
       throw new KernelError("Agent definition not found", 404);
@@ -475,7 +633,7 @@ export class Kernel {
       ...candidate,
       metadata: input.metadata ?? {},
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     };
     return this.store.createAgentDefinition(createInput);
   }
@@ -494,7 +652,7 @@ export class Kernel {
       contextPolicy: source.contextPolicy,
       skillIds: source.skillIds,
       toolIds: source.toolIds,
-      metadata: source.id === defaultAgentId ? {} : source.metadata
+      metadata: source.id === defaultAgentId ? {} : source.metadata,
     });
     const now = new Date().toISOString();
     const result = this.store.cloneAgentDefinition({
@@ -504,7 +662,7 @@ export class Kernel {
       ...candidate,
       metadata: source.id === defaultAgentId ? {} : source.metadata,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     });
     if (result.status === "not_found") {
       throw new KernelError("Agent definition not found", 404);
@@ -518,12 +676,19 @@ export class Kernel {
   deleteAgentDefinition(id: string, expectedRevision: number): void {
     const agent = this.getAgentDefinition(id);
     if (agent.id === defaultAgentId) {
-      throw new KernelError("The main agent profile cannot be deleted.", 409, "main_agent_protected");
+      throw new KernelError(
+        "The main agent profile cannot be deleted.",
+        409,
+        "main_agent_protected",
+      );
     }
     if (agent.revision !== expectedRevision) {
       throw this.agentRevisionConflict(agent);
     }
-    const result = this.store.deleteAgentDefinitionIfUnused(agent.id, expectedRevision);
+    const result = this.store.deleteAgentDefinitionIfUnused(
+      agent.id,
+      expectedRevision,
+    );
     if (result.status === "revision_conflict") {
       throw this.agentRevisionConflict(result.agent);
     }
@@ -536,9 +701,11 @@ export class Kernel {
         {
           usage: {
             sessionCount: sessions.length,
-            sessions: sessions.slice(0, 20).map((session) => ({ id: session.id, title: session.title }))
-          }
-        }
+            sessions: sessions
+              .slice(0, 20)
+              .map((session) => ({ id: session.id, title: session.title })),
+          },
+        },
       );
     }
     if (result.status === "not_found") {
@@ -556,24 +723,43 @@ export class Kernel {
           id: latest.id,
           name: latest.name,
           revision: latest.revision,
-          updatedAt: latest.updatedAt
-        }
-      }
+          updatedAt: latest.updatedAt,
+        },
+      },
     );
   }
 
-  async previewContext(sessionId: string, options: PreviewContextOptions = {}): Promise<ContextPreviewResponse> {
+  async previewContext(
+    sessionId: string,
+    options: PreviewContextOptions = {},
+  ): Promise<ContextPreviewResponse> {
     const session = this.getSession(sessionId);
     const agent = this.resolveAgentForSession(session, options.agentId);
-    const resolvedProvider = session.parentSessionId ? this.resolveSavedProvider(options.providerProfileId ?? agent.modelProfileId ?? this.providers.list().defaultProviderProfileId) : this.providers.resolveRun({
-      provider: options.provider,
-      providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
-    });
-    const agentDefaults = this.agentDefaultsForProvider(agent, resolvedProvider.profile.id, options);
-    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, mergeRunOptions(agentDefaults, options.runOptions));
+    const resolvedProvider = session.parentSessionId
+      ? this.resolveSavedProvider(
+          options.providerProfileId ??
+            agent.modelProfileId ??
+            this.providers.list().defaultProviderProfileId,
+        )
+      : this.providers.resolveRun({
+          provider: options.provider,
+          providerProfileId:
+            options.providerProfileId ?? agent.modelProfileId ?? undefined,
+        });
+    const agentDefaults = this.agentDefaultsForProvider(
+      agent,
+      resolvedProvider.profile.id,
+      options,
+    );
+    const optionPlan = buildRunOptionPlan(
+      resolvedProvider.profile,
+      mergeRunOptions(agentDefaults, options.runOptions),
+    );
     const providerResolution: ProviderResolution = {
       ...resolvedProvider.providerResolution,
-      model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
+      model:
+        optionPlan.runOptions.model ??
+        resolvedProvider.providerResolution.model,
     };
     const contextHistory = this.contextHistoryForSession(session);
     const contextResult = this.buildContext({
@@ -582,19 +768,21 @@ export class Kernel {
       messages: contextHistory.messages,
       activeSegmentId: session.activeSegmentId,
       compactionArtifact: contextHistory.artifact,
-      currentMessage: options.text?.trim() ? { content: options.text } : undefined,
+      currentMessage: options.text?.trim()
+        ? { content: options.text }
+        : undefined,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: optionPlan.runOptions,
-      availableTools: this.getAvailableToolsForAgent(agent,session),
+      availableTools: this.getAvailableToolsForAgent(agent, session),
       providerOverhead: resolvedProvider.adapter.contextPlanning,
       contextCapability: await this.getModelContextCapability(
         resolvedProvider.profile.id,
-        optionPlan.runOptions.model ?? resolvedProvider.profile.model
-      )
+        optionPlan.runOptions.model ?? resolvedProvider.profile.model,
+      ),
     });
     if (agent.defaultRunOptions && !agentDefaults) {
       contextResult.warnings.push(
-        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile."
+        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile.",
       );
     }
 
@@ -602,7 +790,7 @@ export class Kernel {
       ...contextResult,
       providerResolution: toPublicProviderResolution(providerResolution),
       requestedRunOptions: optionPlan.requestedRunOptions,
-      unsupportedRunOptions: optionPlan.unsupportedRunOptions
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions,
     };
   }
 
@@ -620,7 +808,7 @@ export class Kernel {
     }
     return this.store.listRuns({
       ...(sessionId ? { sessionId } : {}),
-      ...(activeOnly ? { statuses: ACTIVE_RUN_STATUSES } : {})
+      ...(activeOnly ? { statuses: RUN_CONSTANT.ACTIVE_STATUS } : {}),
     });
   }
 
@@ -629,7 +817,9 @@ export class Kernel {
   }
 
   listPublicRuns(sessionId?: string, activeOnly = false): PublicRunSummary[] {
-    return this.listRuns(sessionId, activeOnly).map((run) => this.toPublicRunSummary(run));
+    return this.listRuns(sessionId, activeOnly).map((run) =>
+      this.toPublicRunSummary(run),
+    );
   }
 
   /** Call only after the server owns the exclusive database lease and has bound its listening socket. */
@@ -637,20 +827,47 @@ export class Kernel {
     const reconciledAt = new Date().toISOString();
     this.store.subsessions.reconcile(true);
     for (const run of this.store.listRuns({ statuses: ["running"] })) {
-      if (run.metadata.childWakePending === 1 || this.store.subsessions.list(run.id).some((item) => item.deliveredPartId && !item.acknowledged)) {
-        this.store.transitionRunStatus(run.id, ["running"], "waiting_children", null, reconciledAt);
+      if (
+        run.metadata.childWakePending === 1 ||
+        this.store.subsessions
+          .list(run.id)
+          .some((item) => item.deliveredPartId && !item.acknowledged)
+      ) {
+        this.store.transitionRunStatus(
+          run.id,
+          ["running"],
+          "waiting_children",
+          null,
+          reconciledAt,
+        );
       }
     }
     this.store.expirePendingPermissionsForTerminalRuns(reconciledAt);
-    const pendingPermissionRunIds = new Set(this.store.listPermissionRequests({ status: "pending" }).map((request) => request.runId));
+    const pendingPermissionRunIds = new Set(
+      this.store
+        .listPermissionRequests({ status: "pending" })
+        .map((request) => request.runId),
+    );
     for (const run of this.store.listRuns({ statuses: ["running"] })) {
       if (pendingPermissionRunIds.has(run.id)) {
-        this.store.transitionRunStatus(run.id, ["running"], "waiting_permission", null, reconciledAt);
+        this.store.transitionRunStatus(
+          run.id,
+          ["running"],
+          "waiting_permission",
+          null,
+          reconciledAt,
+        );
       }
     }
-    const staleRuns = this.store.listRuns({ statuses: ["running", "cancelling"] });
+    const staleRuns = this.store.listRuns({
+      statuses: ["running", "cancelling"],
+    });
     for (const run of staleRuns) {
-      this.finalizeRunTermination(run, "interrupted", "The daemon restarted before the run reached a terminal state.");
+      this.finalizeRunTermination(
+        run,
+        "interrupted",
+        "The daemon restarted before the run reached a terminal state.",
+      );
     }
     this.subsessions.changed();
   }
@@ -670,19 +887,28 @@ export class Kernel {
       if (!run || (run.status !== "running" && run.status !== "cancelling")) {
         continue;
       }
-      execution.termination ??= run.status === "cancelling" ? "cancelled" : "interrupted";
-      execution.controller.abort(new RunTerminationError(execution.termination));
+      execution.termination ??=
+        run.status === "cancelling" ? "cancelled" : "interrupted";
+      execution.controller.abort(
+        new RunTerminationError(execution.termination),
+      );
       if (execution.activePromise) {
         activePromises.push(execution.activePromise);
       }
     }
 
     await settleWithin(activePromises, timeoutMs);
-    for (const run of this.store.listRuns({ statuses: ["running", "cancelling"] })) {
+    for (const run of this.store.listRuns({
+      statuses: ["running", "cancelling"],
+    })) {
       if (run.status === "cancelling") {
         this.finalizeRunTermination(run, "cancelled");
       } else {
-        this.finalizeRunTermination(run, "interrupted", "The daemon stopped before the run reached a terminal state.");
+        this.finalizeRunTermination(
+          run,
+          "interrupted",
+          "The daemon stopped before the run reached a terminal state.",
+        );
       }
     }
     for (const execution of this.executions.values()) {
@@ -690,7 +916,11 @@ export class Kernel {
     }
   }
 
-  async startRun(sessionId: string, text: string, options: StartRunOptions = {}): Promise<CreateRunResponse> {
+  async startRun(
+    sessionId: string,
+    text: string,
+    options: StartRunOptions = {},
+  ): Promise<CreateRunResponse> {
     return this.startRunAttempt(sessionId, text, options, true);
   }
 
@@ -699,40 +929,81 @@ export class Kernel {
     text: string,
     options: StartRunOptions,
     allowSegmentRetry: boolean,
-    ownedChildRunId?: string
+    ownedChildRunId?: string,
   ): Promise<CreateRunResponse> {
     this.assertAcceptingWork();
     const currentSession = this.getSession(sessionId);
-    const admittedRun = ownedChildRunId ? this.store.getRun(ownedChildRunId) : null;
+    const admittedRun = ownedChildRunId
+      ? this.store.getRun(ownedChildRunId)
+      : null;
     // Match resume: keep admission cwd; legacy Runs without it fall back to current Session cwd.
     // Only the execution view is changed, never the editable Session row.
     const session = admittedRun
-      ? { ...currentSession, workingDirectory: stringField(admittedRun.metadata, "workingDirectory") || currentSession.workingDirectory }
+      ? {
+          ...currentSession,
+          workingDirectory:
+            stringField(admittedRun.metadata, "workingDirectory") ||
+            currentSession.workingDirectory,
+        }
       : currentSession;
     if (session.parentSessionId && !ownedChildRunId) {
-      throw new KernelError("Child sessions only accept their admitted task; steering and session reuse are not enabled.",409,"child_session_owned");
+      throw new KernelError(
+        "Child sessions only accept their admitted task; steering and session reuse are not enabled.",
+        409,
+        "child_session_owned",
+      );
     }
     const prompt = text.trim();
     if (!prompt) {
       throw new KernelError("Run text is required", 400);
     }
 
-    const agent = admittedRun ? this.getAgentForRun(admittedRun) : this.resolveAgentForSession(session, options.agentId);
-    const resolvedProvider = session.parentSessionId ? this.resolveSavedProvider(options.providerProfileId ?? agent.modelProfileId ?? this.providers.list().defaultProviderProfileId) : this.providers.resolveRun({
-      provider: options.provider,
-      providerProfileId: options.providerProfileId ?? agent.modelProfileId ?? undefined
-    });
-    const agentDefaults = this.agentDefaultsForProvider(agent, resolvedProvider.profile.id, options);
-    const requestedRunOptions = mergeRunOptions(agentDefaults, options.runOptions);
-    const optionPlan = buildRunOptionPlan(resolvedProvider.profile, requestedRunOptions);
+    const agent = admittedRun
+      ? this.getAgentForRun(admittedRun)
+      : this.resolveAgentForSession(session, options.agentId);
+    const resolvedProvider = session.parentSessionId
+      ? this.resolveSavedProvider(
+          options.providerProfileId ??
+            agent.modelProfileId ??
+            this.providers.list().defaultProviderProfileId,
+        )
+      : this.providers.resolveRun({
+          provider: options.provider,
+          providerProfileId:
+            options.providerProfileId ?? agent.modelProfileId ?? undefined,
+        });
+    const agentDefaults = this.agentDefaultsForProvider(
+      agent,
+      resolvedProvider.profile.id,
+      options,
+    );
+    const requestedRunOptions = mergeRunOptions(
+      agentDefaults,
+      options.runOptions,
+    );
+    const optionPlan = buildRunOptionPlan(
+      resolvedProvider.profile,
+      requestedRunOptions,
+    );
     const providerResolution: ProviderResolution = {
       ...resolvedProvider.providerResolution,
-      model: optionPlan.runOptions.model ?? resolvedProvider.providerResolution.model
+      model:
+        optionPlan.runOptions.model ??
+        resolvedProvider.providerResolution.model,
     };
     const now = new Date().toISOString();
-    const admittedChild = ownedChildRunId ? this.store.subsessions.forRun(ownedChildRunId) : null;
-    if (session.parentSessionId && admittedChild?.childRunId !== ownedChildRunId) {
-      throw new KernelError("Child task admission is missing or already started.",409,"child_session_owned");
+    const admittedChild = ownedChildRunId
+      ? this.store.subsessions.forRun(ownedChildRunId)
+      : null;
+    if (
+      session.parentSessionId &&
+      admittedChild?.childRunId !== ownedChildRunId
+    ) {
+      throw new KernelError(
+        "Child task admission is missing or already started.",
+        409,
+        "child_session_owned",
+      );
     }
     const runId = admittedChild?.childRunId ?? randomUUID();
     const userMessageId = randomUUID();
@@ -744,24 +1015,34 @@ export class Kernel {
       messages: contextHistory.messages,
       activeSegmentId: session.activeSegmentId,
       compactionArtifact: contextHistory.artifact,
-      currentMessage: { content: prompt, messageId: userMessageId, metadata: { runId } },
+      currentMessage: {
+        content: prompt,
+        messageId: userMessageId,
+        metadata: { runId },
+      },
       currentMessageId: userMessageId,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: optionPlan.runOptions,
-      availableTools: this.getAvailableToolsForAgent(agent,session),
+      availableTools: this.getAvailableToolsForAgent(agent, session),
       providerOverhead: resolvedProvider.adapter.contextPlanning,
       metadata: { runId },
       contextCapability: await this.getModelContextCapability(
         resolvedProvider.profile.id,
-        optionPlan.runOptions.model ?? resolvedProvider.profile.model
-      )
+        optionPlan.runOptions.model ?? resolvedProvider.profile.model,
+      ),
     });
     if (agent.defaultRunOptions && !agentDefaults) {
       contextResult.warnings.push(
-        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile."
+        "Agent Profile model, reasoning, and temperature defaults were not inherited because the explicit provider override uses a different provider profile.",
       );
     }
-    const runMetadata = buildRunMetadata(providerResolution, optionPlan, agent, options.runOptions ?? {}, now);
+    const runMetadata = buildRunMetadata(
+      providerResolution,
+      optionPlan,
+      agent,
+      options.runOptions ?? {},
+      now,
+    );
     this.assertAcceptingWork();
     runMetadata.workingDirectory = session.workingDirectory;
     let run: Run;
@@ -775,18 +1056,27 @@ export class Kernel {
         expectedActiveSegmentId: session.activeSegmentId,
         createdAt: now,
         updatedAt: now,
-        metadata: runMetadata
+        metadata: runMetadata,
       });
     } catch (error) {
       if (error instanceof ContextSegmentChangedStoreError) {
         if (allowSegmentRetry) {
-          return this.startRunAttempt(sessionId, text, options, false, ownedChildRunId);
+          return this.startRunAttempt(
+            sessionId,
+            text,
+            options,
+            false,
+            ownedChildRunId,
+          );
         }
         throw new KernelError(
           "The active context segment changed while this run was being planned. Retry the request.",
           409,
           error.code,
-          { expectedSegmentId: error.expectedSegmentId, activeSegmentId: error.activeSegmentId }
+          {
+            expectedSegmentId: error.expectedSegmentId,
+            activeSegmentId: error.activeSegmentId,
+          },
         );
       }
       throw error;
@@ -801,7 +1091,7 @@ export class Kernel {
       role: "user",
       status: "completed",
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     });
     this.store.addMessagePart({
       id: randomUUID(),
@@ -809,7 +1099,7 @@ export class Kernel {
       seq: 0,
       text: prompt,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     });
 
     const assistantCreatedAt = new Date(Date.parse(now) + 1).toISOString();
@@ -822,24 +1112,31 @@ export class Kernel {
       status: "streaming",
       createdAt: assistantCreatedAt,
       updatedAt: assistantCreatedAt,
-      metadata: { runId: run.id, contextMetadataOwner: "run" }
+      metadata: { runId: run.id, contextMetadataOwner: "run" },
     });
 
     const sourceMessages = this.store
       .listMessagesBySegment(session.activeSegmentId)
       .filter((message) => message.id !== assistantMessage.id);
-    const initialPlanRecord = this.createContextPlanRecord(contextResult.plan, 0, 0, now);
+    const initialPlanRecord = this.createContextPlanRecord(
+      contextResult.plan,
+      0,
+      0,
+      now,
+    );
     const contextMetadata = buildContextRunMetadata(
       contextResult.context,
       contextResult.warnings,
       contextResult.skippedMessageIds,
-      initialPlanRecord
+      initialPlanRecord,
     );
     this.store.mergeRunMetadata(run.id, contextMetadata, now);
 
     const runWithMetadata = this.store.getRun(run.id)!;
     const userMessageWithParts = this.store.getMessage(userMessage.id)!;
-    const assistantMessageWithParts = this.store.getMessage(assistantMessage.id)!;
+    const assistantMessageWithParts = this.store.getMessage(
+      assistantMessage.id,
+    )!;
 
     this.emit(run, "run_started", {
       runId: run.id,
@@ -855,10 +1152,12 @@ export class Kernel {
       requestedRunOptions: optionPlan.requestedRunOptions,
       runOptions: optionPlan.runOptions,
       unsupportedRunOptions: optionPlan.unsupportedRunOptions,
-      model: optionPlan.runOptions.model ?? null
+      model: optionPlan.runOptions.model ?? null,
     });
     this.emit(run, "user_message_created", { message: userMessageWithParts });
-    this.emit(run, "assistant_message_created", { message: assistantMessageWithParts });
+    this.emit(run, "assistant_message_created", {
+      message: assistantMessageWithParts,
+    });
 
     const execution = this.getOrCreateExecution(run.id);
     const writer = new RunWriter({
@@ -866,7 +1165,7 @@ export class Kernel {
       eventBus: this.eventBus,
       run: runWithMetadata,
       assistantMessageId: assistantMessage.id,
-      signal: execution.controller.signal
+      signal: execution.controller.signal,
     });
 
     const providerInput: ProviderRunInput = {
@@ -878,16 +1177,33 @@ export class Kernel {
       credential: resolvedProvider.credential,
       requestedRunOptions: optionPlan.requestedRunOptions,
       runOptions: optionPlan.runOptions,
-      unsupportedRunOptions: optionPlan.unsupportedRunOptions
+      unsupportedRunOptions: optionPlan.unsupportedRunOptions,
     };
 
     if (ownedChildRunId) {
-      await this.trackExecution(execution, () => this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, execution, writer));
-    } else setImmediate(() => {
-      void this.trackExecution(execution, () =>
-        this.executeRun(runWithMetadata, resolvedProvider.adapter, providerInput, execution, writer)
-      ).catch((error) => this.handleQueuedExecutionError(run.id, execution, error));
-    });
+      await this.trackExecution(execution, () =>
+        this.executeRun(
+          runWithMetadata,
+          resolvedProvider.adapter,
+          providerInput,
+          execution,
+          writer,
+        ),
+      );
+    } else
+      setImmediate(() => {
+        void this.trackExecution(execution, () =>
+          this.executeRun(
+            runWithMetadata,
+            resolvedProvider.adapter,
+            providerInput,
+            execution,
+            writer,
+          ),
+        ).catch((error) =>
+          this.handleQueuedExecutionError(run.id, execution, error),
+        );
+      });
 
     return {
       run: this.toPublicRunSummary(runWithMetadata),
@@ -901,13 +1217,13 @@ export class Kernel {
       requestedRunOptions: optionPlan.requestedRunOptions,
       unsupportedRunOptions: optionPlan.unsupportedRunOptions,
       usage: null,
-      assistantMessageId: assistantMessage.id
+      assistantMessageId: assistantMessage.id,
     };
   }
 
   cancelRun(runId: string): Run {
     const run = this.getRun(runId);
-    if (isTerminalRunStatus(run.status)) {
+    if (new RunVO.Status(run.status).isTerminal()) {
       return run;
     }
 
@@ -917,11 +1233,11 @@ export class Kernel {
       event: {
         id: randomUUID(),
         type: "run_cancelling",
-        payload: { runId, status: "cancelling" }
-      }
+        payload: { runId, status: "cancelling" },
+      },
     });
     const cancellingRun = cancellation?.run ?? this.getRun(runId);
-    if (isTerminalRunStatus(cancellingRun.status)) {
+    if (new RunVO.Status(cancellingRun.status).isTerminal()) {
       return cancellingRun;
     }
     if (cancellation?.event) {
@@ -949,16 +1265,31 @@ export class Kernel {
     if (run.status !== "waiting_permission") {
       throw new KernelError("Run is not waiting for permission.", 409);
     }
-    const pendingForRun = this.store.listPermissionRequests({ status: "pending" }).some((request) => request.runId === run.id);
+    const pendingForRun = this.store
+      .listPermissionRequests({ status: "pending" })
+      .some((request) => request.runId === run.id);
     if (pendingForRun) {
-      throw new KernelError("Run still has pending permissions. Approve or deny them before resuming.", 409);
+      throw new KernelError(
+        "Run still has pending permissions. Approve or deny them before resuming.",
+        409,
+      );
     }
     const now = new Date().toISOString();
-    const resumed = this.store.transitionRunStatus(run.id, ["waiting_permission"], "running", null, now);
+    const resumed = this.store.transitionRunStatus(
+      run.id,
+      ["waiting_permission"],
+      "running",
+      null,
+      now,
+    );
     if (!resumed) {
       throw new KernelError("Run changed before it could be resumed.", 409);
     }
-    this.store.mergeRunMetadata(run.id, { toolLoopState: "manual_resume_requested" }, now);
+    this.store.mergeRunMetadata(
+      run.id,
+      { toolLoopState: "manual_resume_requested" },
+      now,
+    );
     this.queueResumeAgentRun(run.id);
     return this.getRun(run.id)!;
   }
@@ -975,38 +1306,60 @@ export class Kernel {
 
   subscribeRunEvents(runId: string, listener: RunEventListener): () => void {
     this.getRun(runId);
-    return this.eventBus.subscribe(runId, (event) => listener(toPublicRunEvent(event)));
+    return this.eventBus.subscribe(runId, (event) =>
+      listener(toPublicRunEvent(event)),
+    );
   }
 
-  listPermissionRequests(status?: PermissionRequestStatus): PermissionRequest[] {
-    return this.store.listPermissionRequests(status ? { status } : {}).map(toPublicPermissionRequest);
+  listPermissionRequests(
+    status?: PermissionRequestStatus,
+  ): PermissionRequest[] {
+    return this.store
+      .listPermissionRequests(status ? { status } : {})
+      .map(toPublicPermissionRequest);
   }
 
   async approvePermissionRequest(id: string): Promise<InvokeToolResponse> {
     this.assertAcceptingWork();
     const candidate = this.store.getPermissionRequest(id);
-    if (candidate && this.store.getRun(candidate.runId)?.status === "waiting_permission") {
+    if (
+      candidate &&
+      this.store.getRun(candidate.runId)?.status === "waiting_permission"
+    ) {
       await this.executions.get(candidate.runId)?.activePromise;
     }
     const request = this.getResolvablePermissionRequest(id);
     const run = this.getRun(request.runId);
     if (run.status !== "waiting_permission") {
-      throw new KernelError("Permission request can only be approved while its run is waiting for permission.", 409);
+      throw new KernelError(
+        "Permission request can only be approved while its run is waiting for permission.",
+        409,
+      );
     }
 
     const resolvedAt = new Date().toISOString();
-    const approvedRequest = this.store.resolvePermissionRequest(request.id, "approved", resolvedAt);
+    const approvedRequest = this.store.resolvePermissionRequest(
+      request.id,
+      "approved",
+      resolvedAt,
+    );
     if (!approvedRequest) {
-      throw new KernelError("Permission request or run changed before approval completed.", 409);
+      throw new KernelError(
+        "Permission request or run changed before approval completed.",
+        409,
+      );
     }
     return this.executeApprovedPermission(approvedRequest);
   }
 
-  private async executeApprovedPermission(approvedRequest: StoredPermissionRequest): Promise<InvokeToolResponse> {
+  private async executeApprovedPermission(
+    approvedRequest: StoredPermissionRequest,
+  ): Promise<InvokeToolResponse> {
     const request = approvedRequest;
     const run = this.getRun(request.runId);
     const resolvedAt = approvedRequest.resolvedAt ?? new Date().toISOString();
-    const isAgentToolPermission = booleanField(request.metadata,"agentToolLoop") === true;
+    const isAgentToolPermission =
+      booleanField(request.metadata, "agentToolLoop") === true;
     let prepared: PreparedToolInvocation;
     try {
       if (isAgentToolPermission) {
@@ -1014,9 +1367,9 @@ export class Kernel {
           run.id,
           {
             toolLoopState: "resuming_after_permission",
-            resolvedPermissionRequestId: request.id
+            resolvedPermissionRequestId: request.id,
           },
-          resolvedAt
+          resolvedAt,
         );
       }
       const resumedRun = this.getRun(run.id);
@@ -1025,7 +1378,7 @@ export class Kernel {
         status: "approved",
         reason: approvedRequest.reason,
         riskLevel: approvedRequest.riskLevel,
-        request: toPublicPermissionRequest(approvedRequest)
+        request: toPublicPermissionRequest(approvedRequest),
       });
       prepared = this.prepareToolInvocationFromPermission(approvedRequest);
     } catch (error) {
@@ -1036,10 +1389,13 @@ export class Kernel {
       this.executePreparedToolInvocation(prepared, {
         state: "executed",
         permissionRequest: toPublicPermissionRequest(approvedRequest),
-        finishRun: !isAgentToolPermission
-      })
+        finishRun: !isAgentToolPermission,
+      }),
     );
-    if (isAgentToolPermission && this.store.getRun(approvedRequest.runId)?.status === "running") {
+    if (
+      isAgentToolPermission &&
+      this.store.getRun(approvedRequest.runId)?.status === "running"
+    ) {
       this.queueResumeAgentRun(approvedRequest.runId);
     }
     return response;
@@ -1049,15 +1405,26 @@ export class Kernel {
     this.assertAcceptingWork();
     const request = this.getResolvablePermissionRequest(id);
     const run = this.getRun(request.runId);
-    const isAgentToolPermission = booleanField(request.metadata, "agentToolLoop") === true;
+    const isAgentToolPermission =
+      booleanField(request.metadata, "agentToolLoop") === true;
     if (run.status !== "waiting_permission") {
-      throw new KernelError("Permission request can only be denied while its run is waiting for permission.", 409);
+      throw new KernelError(
+        "Permission request can only be denied while its run is waiting for permission.",
+        409,
+      );
     }
 
     const resolvedAt = new Date().toISOString();
-    const deniedRequest = this.store.resolvePermissionRequest(request.id, "denied", resolvedAt);
+    const deniedRequest = this.store.resolvePermissionRequest(
+      request.id,
+      "denied",
+      resolvedAt,
+    );
     if (!deniedRequest) {
-      throw new KernelError("Permission request or run changed before denial completed.", 409);
+      throw new KernelError(
+        "Permission request or run changed before denial completed.",
+        409,
+      );
     }
     let prepared: PreparedToolInvocation;
     try {
@@ -1066,9 +1433,9 @@ export class Kernel {
           run.id,
           {
             toolLoopState: "resuming_after_permission_denial",
-            resolvedPermissionRequestId: request.id
+            resolvedPermissionRequestId: request.id,
           },
-          resolvedAt
+          resolvedAt,
         );
       }
       const resumedRun = this.getRun(run.id);
@@ -1077,7 +1444,7 @@ export class Kernel {
         status: "denied",
         reason: deniedRequest.reason,
         riskLevel: deniedRequest.riskLevel,
-        request: toPublicPermissionRequest(deniedRequest)
+        request: toPublicPermissionRequest(deniedRequest),
       });
       prepared = this.prepareToolInvocationFromPermission(deniedRequest);
     } catch (error) {
@@ -1085,9 +1452,12 @@ export class Kernel {
       throw error;
     }
     const response = this.denyPreparedToolInvocation(prepared, deniedRequest, {
-      finishRun: !isAgentToolPermission
+      finishRun: !isAgentToolPermission,
     });
-    if (isAgentToolPermission && this.store.getRun(deniedRequest.runId)?.status === "running") {
+    if (
+      isAgentToolPermission &&
+      this.store.getRun(deniedRequest.runId)?.status === "running"
+    ) {
       this.queueResumeAgentRun(deniedRequest.runId);
     } else {
       this.releaseTerminalExecution(prepared.execution);
@@ -1095,7 +1465,12 @@ export class Kernel {
     return response;
   }
 
-  private prepareToolInvocation(sessionId: string, toolId: string, input: JsonObject, options: InvokeToolOptions): PreparedToolInvocation {
+  private prepareToolInvocation(
+    sessionId: string,
+    toolId: string,
+    input: JsonObject,
+    options: InvokeToolOptions,
+  ): PreparedToolInvocation {
     const session = this.getSession(sessionId);
     const registeredTool = this.tools.get(toolId.trim());
     if (!registeredTool) {
@@ -1108,8 +1483,14 @@ export class Kernel {
     let executionInput: JsonObject;
     let publicInput: JsonObject;
     try {
-      executionInput = registeredTool.executor.validateInput?.(input, validationContext) ?? input;
-      publicInput = registeredTool.executor.toPublicInput?.(executionInput, validationContext) ?? executionInput;
+      executionInput =
+        registeredTool.executor.validateInput?.(input, validationContext) ??
+        input;
+      publicInput =
+        registeredTool.executor.toPublicInput?.(
+          executionInput,
+          validationContext,
+        ) ?? executionInput;
     } catch (error) {
       if (error instanceof ToolInputError) {
         throw new KernelError(error.message, error.statusCode);
@@ -1124,7 +1505,7 @@ export class Kernel {
       publicInput,
       executionInput,
       executionCwd,
-      settings: toolSettings
+      settings: toolSettings,
     });
     const now = new Date().toISOString();
     const run = this.createRun({
@@ -1135,7 +1516,13 @@ export class Kernel {
       segmentId: session.activeSegmentId,
       createdAt: now,
       updatedAt: now,
-      metadata: buildToolRunMetadata(registeredTool.definition, publicInput, caller, permission, executionCwd)
+      metadata: buildToolRunMetadata(
+        registeredTool.definition,
+        publicInput,
+        caller,
+        permission,
+        executionCwd,
+      ),
     });
     this.store.touchSession(sessionId, now);
 
@@ -1148,7 +1535,12 @@ export class Kernel {
       status: "streaming",
       createdAt: now,
       updatedAt: now,
-      metadata: buildToolMessageMetadata(registeredTool.definition, publicInput, caller, permission)
+      metadata: buildToolMessageMetadata(
+        registeredTool.definition,
+        publicInput,
+        caller,
+        permission,
+      ),
     });
 
     const invocation: ToolInvocation = {
@@ -1159,17 +1551,18 @@ export class Kernel {
       runId: run.id,
       messageId: assistantMessage.id,
       caller,
-      status: permission.decision === "allowed" ? "created" : "pending_permission",
+      status:
+        permission.decision === "allowed" ? "created" : "pending_permission",
       permissionDecision: permission.decision,
       input: publicInput,
       metadata: {
         toolSource: registeredTool.definition.source,
         executionCwd,
         permissionRuleId: permission.ruleId,
-        riskLevel: permission.riskLevel
+        riskLevel: permission.riskLevel,
       },
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     };
 
     this.emit(run, "run_started", {
@@ -1182,9 +1575,11 @@ export class Kernel {
       permissionDecision: permission.decision,
       permissionAction: permission.action,
       permissionRuleId: permission.ruleId,
-      riskLevel: permission.riskLevel
+      riskLevel: permission.riskLevel,
     });
-    this.emit(run, "assistant_message_created", { message: this.store.getMessage(assistantMessage.id)! });
+    this.emit(run, "assistant_message_created", {
+      message: this.store.getMessage(assistantMessage.id)!,
+    });
 
     const execution = this.getOrCreateExecution(run.id);
     const writer = new RunWriter({
@@ -1192,7 +1587,7 @@ export class Kernel {
       eventBus: this.eventBus,
       run,
       assistantMessageId: assistantMessage.id,
-      signal: execution.controller.signal
+      signal: execution.controller.signal,
     });
 
     const toolCallPart = writer.recordToolCall({
@@ -1201,27 +1596,33 @@ export class Kernel {
       toolName: registeredTool.definition.name,
       provider: toolProviderForPart(registeredTool.definition.id),
       input: publicInput,
-      inputSummary: summarizeToolInput(registeredTool.definition.id, publicInput),
+      inputSummary: summarizeToolInput(
+        registeredTool.definition.id,
+        publicInput,
+      ),
       metadata: {
         caller,
         permissionDecision: permission.decision,
         permissionAction: permission.action,
         permissionRuleId: permission.ruleId,
         riskLevel: permission.riskLevel,
-        toolSource: registeredTool.definition.source
-      }
+        toolSource: registeredTool.definition.source,
+      },
     });
 
-    const commandOutputPart = registeredTool.definition.id === "shell.exec" ? writer.recordCommandOutput({
-      callId: invocation.id,
-      stream: "combined",
-      text: "",
-      cwd: stringField(executionInput, "cwd"),
-      metadata: {
-        invocationId: invocation.id,
-        toolId: registeredTool.definition.id
-      }
-    }) : null;
+    const commandOutputPart =
+      registeredTool.definition.id === "shell.exec"
+        ? writer.recordCommandOutput({
+            callId: invocation.id,
+            stream: "combined",
+            text: "",
+            cwd: stringField(executionInput, "cwd"),
+            metadata: {
+              invocationId: invocation.id,
+              toolId: registeredTool.definition.id,
+            },
+          })
+        : null;
 
     return {
       registeredTool,
@@ -1238,11 +1639,13 @@ export class Kernel {
       commandOutputPart,
       createdAt: now,
       resumeAgentRun: false,
-      execution
+      execution,
     };
   }
 
-  private prepareToolInvocationFromPermission(request: StoredPermissionRequest): PreparedToolInvocation {
+  private prepareToolInvocationFromPermission(
+    request: StoredPermissionRequest,
+  ): PreparedToolInvocation {
     const registeredTool = this.tools.get(request.toolId);
     if (!registeredTool) {
       throw new KernelError("Tool not found for permission request", 404);
@@ -1250,20 +1653,35 @@ export class Kernel {
     const run = this.getRun(request.runId);
     const assistantMessage = this.store.getMessage(request.messageId);
     if (!assistantMessage) {
-      throw new KernelError("Assistant message for permission request not found", 404);
+      throw new KernelError(
+        "Assistant message for permission request not found",
+        404,
+      );
     }
-    const toolCallPart = assistantMessage.parts.find((part) => part.id === request.toolCallPartId);
+    const toolCallPart = assistantMessage.parts.find(
+      (part) => part.id === request.toolCallPartId,
+    );
     if (!toolCallPart) {
-      throw new KernelError("Tool call part for permission request not found", 404);
+      throw new KernelError(
+        "Tool call part for permission request not found",
+        404,
+      );
     }
     const commandOutputPart = request.commandOutputPartId
-      ? assistantMessage.parts.find((part) => part.id === request.commandOutputPartId) ?? null
+      ? (assistantMessage.parts.find(
+          (part) => part.id === request.commandOutputPartId,
+        ) ?? null)
       : null;
     if (!commandOutputPart && request.toolId === "shell.exec") {
-      throw new KernelError("Command output part for permission request not found", 404);
+      throw new KernelError(
+        "Command output part for permission request not found",
+        404,
+      );
     }
 
-    const executionCwd = stringField(request.metadata, "executionCwd") || this.getToolExecutionCwd(this.getSession(request.sessionId));
+    const executionCwd =
+      stringField(request.metadata, "executionCwd") ||
+      this.getToolExecutionCwd(this.getSession(request.sessionId));
     const permission = permissionEvaluationFromRequest(request, executionCwd);
     const invocation: ToolInvocation = {
       id: request.invocationId,
@@ -1278,7 +1696,7 @@ export class Kernel {
       input: request.publicInput,
       metadata: request.metadata,
       createdAt: request.createdAt,
-      updatedAt: request.updatedAt
+      updatedAt: request.updatedAt,
     };
 
     const execution = this.getOrCreateExecution(run.id);
@@ -1297,22 +1715,30 @@ export class Kernel {
         eventBus: this.eventBus,
         run,
         assistantMessageId: assistantMessage.id,
-        signal: execution.controller.signal
+        signal: execution.controller.signal,
       }),
       toolCallPart,
       commandOutputPart,
       createdAt: request.createdAt,
       resumeAgentRun: booleanField(request.metadata, "agentToolLoop") === true,
-      toolLoopIteration: numberField(request.metadata, "toolLoopIteration") ?? undefined,
-      providerToolCallName: stringField(request.metadata, "providerToolCallName") || undefined,
-      execution
+      toolLoopIteration:
+        numberField(request.metadata, "toolLoopIteration") ?? undefined,
+      providerToolCallName:
+        stringField(request.metadata, "providerToolCallName") || undefined,
+      execution,
     };
   }
 
-  private createPendingPermissionResponse(prepared: PreparedToolInvocation): InvokeToolResponse {
+  private createPendingPermissionResponse(
+    prepared: PreparedToolInvocation,
+  ): InvokeToolResponse {
     const now = new Date().toISOString();
     const executionCwd = prepared.executionCwd;
-    const toolCallPart = this.updateToolCallStatus(prepared.toolCallPart, "pending_permission", now);
+    const toolCallPart = this.updateToolCallStatus(
+      prepared.toolCallPart,
+      "pending_permission",
+      now,
+    );
     const permissionRequest = this.store.createPermissionRequest({
       id: randomUUID(),
       sessionId: prepared.invocation.sessionId,
@@ -1323,7 +1749,10 @@ export class Kernel {
       toolName: prepared.registeredTool.definition.name,
       caller: prepared.caller,
       permissionDecision: prepared.permission.decision,
-      inputSummary: summarizeToolInput(prepared.registeredTool.definition.id, prepared.publicInput),
+      inputSummary: summarizeToolInput(
+        prepared.registeredTool.definition.id,
+        prepared.publicInput,
+      ),
       publicInput: prepared.publicInput,
       executionInput: prepared.executionInput,
       riskLevel: prepared.permission.riskLevel,
@@ -1342,12 +1771,12 @@ export class Kernel {
               agentToolLoop: true,
               resumeOnApproval: true,
               toolLoopIteration: prepared.toolLoopIteration ?? null,
-              providerToolCallName: prepared.providerToolCallName ?? null
+              providerToolCallName: prepared.providerToolCallName ?? null,
             }
-          : {})
+          : {}),
       },
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     });
 
     this.emit(prepared.run, "permission.requested", {
@@ -1355,50 +1784,88 @@ export class Kernel {
       status: "requested",
       reason: permissionRequest.reason,
       riskLevel: permissionRequest.riskLevel,
-      request: toPublicPermissionRequest(permissionRequest)
+      request: toPublicPermissionRequest(permissionRequest),
     });
 
-    this.markRunWaitingForPermission(prepared.run, prepared.assistantMessage.id, permissionRequest.id);
+    this.markRunWaitingForPermission(
+      prepared.run,
+      prepared.assistantMessage.id,
+      permissionRequest.id,
+    );
     const waitingMessage = this.store.getMessage(prepared.assistantMessage.id);
     if (waitingMessage) {
-      this.emit(prepared.run, "assistant_message_updated", { message: waitingMessage });
+      this.emit(prepared.run, "assistant_message_updated", {
+        message: waitingMessage,
+      });
     }
     prepared.execution.phase = "waiting_permission";
     prepared.execution.toolId = prepared.registeredTool.definition.id;
 
     return {
       state: "pending_permission",
-      invocation: toPublicToolInvocation({ ...prepared.invocation, status: "pending_permission", updatedAt: now }),
+      invocation: toPublicToolInvocation({
+        ...prepared.invocation,
+        status: "pending_permission",
+        updatedAt: now,
+      }),
       permissionRequest: toPublicPermissionRequest(permissionRequest),
       run: this.toPublicRunSummary(this.store.getRun(prepared.run.id)!),
-      message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id)!),
+      message: toPublicMessage(
+        this.store.getMessage(prepared.assistantMessage.id)!,
+      ),
       toolCallPartId: toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart?.id
+      commandOutputPartId: prepared.commandOutputPart?.id,
     };
   }
 
   private async executePreparedToolInvocation(
     prepared: PreparedToolInvocation,
-    responseOptions: { state: "executed"; permissionRequest?: PermissionRequest; finishRun?: boolean }
+    responseOptions: {
+      state: "executed";
+      permissionRequest?: PermissionRequest;
+      finishRun?: boolean;
+    },
   ): Promise<InvokeToolResponse> {
     if (prepared.registeredTool.definition.id !== "shell.exec") {
       return this.executeGenericTool(prepared, responseOptions);
     }
-    const { registeredTool, executionInput, caller, permission, run, assistantMessage, invocation, writer } = prepared;
+    const {
+      registeredTool,
+      executionInput,
+      caller,
+      permission,
+      run,
+      assistantMessage,
+      invocation,
+      writer,
+    } = prepared;
     const execution = prepared.execution;
     execution.phase = "tool";
     execution.toolId = registeredTool.definition.id;
     const executionCwd = prepared.executionCwd;
-    const commandOutputMaxChars = commandOutputMaxCharsForTool(registeredTool.definition.id, this.getToolSettings());
+    const commandOutputMaxChars = commandOutputMaxCharsForTool(
+      registeredTool.definition.id,
+      this.getToolSettings(),
+    );
     let toolCallPart = prepared.toolCallPart;
-    if (!prepared.commandOutputPart) throw new Error("Shell output part is missing.");
+    if (!prepared.commandOutputPart)
+      throw new Error("Shell output part is missing.");
     let commandOutputPart: MessagePart = prepared.commandOutputPart;
-    let commandOutputText = partString(commandOutputPart, "text") || commandOutputPart.text || "";
+    let commandOutputText =
+      partString(commandOutputPart, "text") || commandOutputPart.text || "";
     let commandOutputTruncated = false;
 
     const startedAt = new Date().toISOString();
-    const runningInvocation: ToolInvocation = { ...invocation, status: "running", updatedAt: startedAt };
-    toolCallPart = this.updateToolCallStatus(toolCallPart, "running", startedAt);
+    const runningInvocation: ToolInvocation = {
+      ...invocation,
+      status: "running",
+      updatedAt: startedAt,
+    };
+    toolCallPart = this.updateToolCallStatus(
+      toolCallPart,
+      "running",
+      startedAt,
+    );
     this.emit(run, "tool.started", {
       messageId: assistantMessage.id,
       partId: toolCallPart.id,
@@ -1413,26 +1880,45 @@ export class Kernel {
       permissionAction: permission.action,
       permissionRuleId: permission.ruleId,
       riskLevel: permission.riskLevel,
-      status: "running"
+      status: "running",
     });
 
     const onToolEvent = (event: ToolExecutionEvent): void => {
       const currentRun = this.store.getRun(run.id);
-      if (execution.controller.signal.aborted || !currentRun || isTerminalRunStatus(currentRun.status)) {
+      if (
+        execution.controller.signal.aborted ||
+        !currentRun ||
+        new RunVO.Status(currentRun.status).isTerminal()
+      ) {
         return;
       }
-      if (event.type === "tool.stdout.delta" || event.type === "tool.stderr.delta") {
-        const delta = typeof event.payload.text === "string" ? event.payload.text : "";
+      if (
+        event.type === "tool.stdout.delta" ||
+        event.type === "tool.stderr.delta"
+      ) {
+        const delta =
+          typeof event.payload.text === "string" ? event.payload.text : "";
         if (!delta) {
           return;
         }
-        const nextOutput = appendLimitedText(commandOutputText, commandOutputTruncated, delta, commandOutputMaxChars, "command output");
+        const nextOutput = appendLimitedText(
+          commandOutputText,
+          commandOutputTruncated,
+          delta,
+          commandOutputMaxChars,
+          "command output",
+        );
         commandOutputText = nextOutput.text;
         commandOutputTruncated = nextOutput.truncated;
         const updatedAt = new Date().toISOString();
-        commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, updatedAt, {
-          truncated: commandOutputTruncated
-        });
+        commandOutputPart = this.updateCommandOutputPart(
+          commandOutputPart,
+          commandOutputText,
+          updatedAt,
+          {
+            truncated: commandOutputTruncated,
+          },
+        );
         this.emit(run, event.type, {
           ...event.payload,
           messageId: assistantMessage.id,
@@ -1440,7 +1926,7 @@ export class Kernel {
           part: commandOutputPart,
           callId: invocation.id,
           toolId: registeredTool.definition.id,
-          toolName: registeredTool.definition.name
+          toolName: registeredTool.definition.name,
         });
         return;
       }
@@ -1450,7 +1936,7 @@ export class Kernel {
         messageId: assistantMessage.id,
         callId: invocation.id,
         toolId: registeredTool.definition.id,
-        toolName: registeredTool.definition.name
+        toolName: registeredTool.definition.name,
       });
     };
 
@@ -1460,17 +1946,29 @@ export class Kernel {
         invocation: runningInvocation,
         cwd: executionCwd,
         signal: execution.controller.signal,
-        emit: onToolEvent
+        emit: onToolEvent,
       });
       if (execution.controller.signal.aborted) {
-        throw new ToolExecutionAbortError("Tool execution was cancelled.", output);
+        throw new ToolExecutionAbortError(
+          "Tool execution was cancelled.",
+          output,
+        );
       }
       const completedAt = new Date().toISOString();
-      result = buildToolExecutionResult(invocation, registeredTool.definition.id, output, startedAt, completedAt);
+      result = buildToolExecutionResult(
+        invocation,
+        registeredTool.definition.id,
+        output,
+        startedAt,
+        completedAt,
+      );
     } catch (error) {
       const completedAt = new Date().toISOString();
       const toolError = toError(error);
-      const cancelled = execution.controller.signal.aborted || error instanceof ToolExecutionAbortError || isAbortLike(error);
+      const cancelled =
+        execution.controller.signal.aborted ||
+        error instanceof ToolExecutionAbortError ||
+        isAbortLike(error);
       result = {
         invocationId: invocation.id,
         toolId: registeredTool.definition.id,
@@ -1479,27 +1977,36 @@ export class Kernel {
         error: toolError.message,
         startedAt,
         completedAt,
-        durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
+        durationMs: Math.max(
+          0,
+          Date.parse(completedAt) - Date.parse(startedAt),
+        ),
         metadata: {
-          ...(cancelled ? { cancelled: true } : { failedBeforeResult: true })
-        }
+          ...(cancelled ? { cancelled: true } : { failedBeforeResult: true }),
+        },
       };
     }
 
     const completedAt = result.completedAt;
-    const finalInvocation: ToolInvocation = { ...invocation, status: result.status, updatedAt: completedAt };
+    const finalInvocation: ToolInvocation = {
+      ...invocation,
+      status: result.status,
+      updatedAt: completedAt,
+    };
     const persistedRun = this.store.getRun(run.id);
     const terminating = execution.controller.signal.aborted;
-    if (!persistedRun || isTerminalRunStatus(persistedRun.status)) {
+    if (!persistedRun || new RunVO.Status(persistedRun.status).isTerminal()) {
       return {
         state: responseOptions.state,
         invocation: toPublicToolInvocation(finalInvocation),
         result: toPublicToolExecutionResult(result),
         permissionRequest: responseOptions.permissionRequest,
-        run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun ?? run),
+        run: this.toPublicRunSummary(
+          this.store.getRun(run.id) ?? persistedRun ?? run,
+        ),
         message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
         toolCallPartId: toolCallPart.id,
-        commandOutputPartId: commandOutputPart.id
+        commandOutputPartId: commandOutputPart.id,
       };
     }
     if (!terminating && persistedRun.status !== "running") {
@@ -1514,24 +2021,39 @@ export class Kernel {
         run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun),
         message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
         toolCallPartId: toolCallPart.id,
-        commandOutputPartId: commandOutputPart.id
+        commandOutputPartId: commandOutputPart.id,
       };
     }
-    commandOutputPart = this.updateCommandOutputPart(commandOutputPart, commandOutputText, completedAt, commandOutputMetadataFromResult(result, commandOutputTruncated));
-    toolCallPart = this.updateToolCallStatus(toolCallPart, terminating ? "cancelled" : result.status, completedAt);
-    this.emit(run, !terminating && result.status === "completed" ? "tool.completed" : "tool.failed", {
-      messageId: assistantMessage.id,
-      partId: toolCallPart.id,
-      part: toolCallPart,
-      outputPartId: commandOutputPart.id,
-      outputPart: commandOutputPart,
-      callId: invocation.id,
-      toolId: registeredTool.definition.id,
-      toolName: registeredTool.definition.name,
-      status: terminating ? "cancelled" : result.status,
-      error: result.error,
-      durationMs: result.durationMs
-    });
+    commandOutputPart = this.updateCommandOutputPart(
+      commandOutputPart,
+      commandOutputText,
+      completedAt,
+      commandOutputMetadataFromResult(result, commandOutputTruncated),
+    );
+    toolCallPart = this.updateToolCallStatus(
+      toolCallPart,
+      terminating ? "cancelled" : result.status,
+      completedAt,
+    );
+    this.emit(
+      run,
+      !terminating && result.status === "completed"
+        ? "tool.completed"
+        : "tool.failed",
+      {
+        messageId: assistantMessage.id,
+        partId: toolCallPart.id,
+        part: toolCallPart,
+        outputPartId: commandOutputPart.id,
+        outputPart: commandOutputPart,
+        callId: invocation.id,
+        toolId: registeredTool.definition.id,
+        toolName: registeredTool.definition.name,
+        status: terminating ? "cancelled" : result.status,
+        error: result.error,
+        durationMs: result.durationMs,
+      },
+    );
     const toolResultPart = writer.recordToolResult(
       {
         callId: invocation.id,
@@ -1550,13 +2072,13 @@ export class Kernel {
             ? {
                 agentToolLoop: true,
                 toolLoopIteration: prepared.toolLoopIteration ?? null,
-                providerToolCallName: prepared.providerToolCallName ?? null
+                providerToolCallName: prepared.providerToolCallName ?? null,
               }
             : {}),
-          ...(result.metadata ?? {})
-        }
+          ...(result.metadata ?? {}),
+        },
       },
-      { allowWhileTerminating: terminating }
+      { allowWhileTerminating: terminating },
     );
 
     if (terminating) {
@@ -1570,7 +2092,7 @@ export class Kernel {
         message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
         toolCallPartId: toolCallPart.id,
         commandOutputPartId: commandOutputPart.id,
-        toolResultPartId: toolResultPart.id
+        toolResultPartId: toolResultPart.id,
       };
     }
 
@@ -1597,103 +2119,164 @@ export class Kernel {
       message: toPublicMessage(this.store.getMessage(assistantMessage.id)!),
       toolCallPartId: toolCallPart.id,
       commandOutputPartId: commandOutputPart.id,
-      toolResultPartId: toolResultPart.id
+      toolResultPartId: toolResultPart.id,
     };
   }
 
   private async executeGenericTool(
     prepared: PreparedToolInvocation,
-    options: { state: "executed"; permissionRequest?: PermissionRequest; finishRun?: boolean }
+    options: {
+      state: "executed";
+      permissionRequest?: PermissionRequest;
+      finishRun?: boolean;
+    },
   ): Promise<InvokeToolResponse> {
     const { invocation, writer, run, execution } = prepared;
     execution.phase = "tool";
     execution.toolId = prepared.registeredTool.definition.id;
-    this.updateToolCallStatus(prepared.toolCallPart, "running", new Date().toISOString());
-    let output: JsonObject = {}, error: string | null = null;
+    this.updateToolCallStatus(
+      prepared.toolCallPart,
+      "running",
+      new Date().toISOString(),
+    );
+    let output: JsonObject = {},
+      error: string | null = null;
     try {
-      if (execution.controller.signal.aborted) throw new ToolExecutionAbortError();
-      if (invocation.toolId === "subsession.start" && !prepared.resumeAgentRun) throw new Error("Delegation requires an owning model run.");
-      output = await prepared.registeredTool.executor.execute(prepared.executionInput, {
-        invocation, cwd: prepared.executionCwd, signal: execution.controller.signal, emit: () => undefined
-      });
+      if (execution.controller.signal.aborted)
+        throw new ToolExecutionAbortError();
+      if (invocation.toolId === "subsession.start" && !prepared.resumeAgentRun)
+        throw new Error("Delegation requires an owning model run.");
+      output = await prepared.registeredTool.executor.execute(
+        prepared.executionInput,
+        {
+          invocation,
+          cwd: prepared.executionCwd,
+          signal: execution.controller.signal,
+          emit: () => undefined,
+        },
+      );
     } catch (failure) {
       error = sanitizedCompactionError(failure);
-      if (failure instanceof SubsessionAdmissionError) output = {code:failure.code,...failure.details};
+      if (failure instanceof SubsessionAdmissionError)
+        output = { code: failure.code, ...failure.details };
       if (failure instanceof ToolExecutionAbortError) output = failure.output;
     }
     const now = new Date().toISOString();
     const persistedRun = this.store.getRun(run.id);
-    const terminating = execution.controller.signal.aborted ||
-      persistedRun?.status === "cancelling" || persistedRun?.status === "cancelled" || persistedRun?.status === "interrupted";
+    const terminating =
+      execution.controller.signal.aborted ||
+      persistedRun?.status === "cancelling" ||
+      new RunVO.Status(persistedRun?.status).isStopped();
     const status = terminating ? "cancelled" : error ? "failed" : "completed";
-    const result: ToolExecutionResult = { invocationId: invocation.id, toolId: invocation.toolId, status,
-      output, error, metadata: {}, startedAt: prepared.createdAt, completedAt: now, durationMs: Math.max(0,Date.parse(now)-Date.parse(prepared.createdAt)) };
+    const result: ToolExecutionResult = {
+      invocationId: invocation.id,
+      toolId: invocation.toolId,
+      status,
+      output,
+      error,
+      metadata: {},
+      startedAt: prepared.createdAt,
+      completedAt: now,
+      durationMs: Math.max(0, Date.parse(now) - Date.parse(prepared.createdAt)),
+    };
     const response = (toolResultPartId?: string): InvokeToolResponse => ({
       state: "executed",
-      invocation: toPublicToolInvocation({ ...invocation, status, updatedAt: now }),
+      invocation: toPublicToolInvocation({
+        ...invocation,
+        status,
+        updatedAt: now,
+      }),
       result: toPublicToolExecutionResult(result),
       permissionRequest: options.permissionRequest,
-      run: this.toPublicRunSummary(this.store.getRun(run.id) ?? persistedRun ?? run),
+      run: this.toPublicRunSummary(
+        this.store.getRun(run.id) ?? persistedRun ?? run,
+      ),
       message: toPublicMessage(this.store.getMessage(writer.messageId)!),
       toolCallPartId: prepared.toolCallPart.id,
-      ...(toolResultPartId ? { toolResultPartId } : {})
+      ...(toolResultPartId ? { toolResultPartId } : {}),
     });
     // A terminal CAS winner owns final state. Late executors return a public result without further writes/events.
-    if (!persistedRun || isTerminalRunStatus(persistedRun.status)) return response();
+    if (!persistedRun || new RunVO.Status(persistedRun.status).isTerminal())
+      return response();
     if (!terminating && persistedRun.status !== "running") return response();
-    const part = writer.recordToolResult({ callId: invocation.id, toolId: invocation.toolId,
-      toolName: invocation.toolName, status, outputSummary: boundHistoricalContextText(JSON.stringify(error ? {error,...output} : output),6000),
-      ...(error ? { error } : {}) }, { allowWhileTerminating: terminating });
+    const part = writer.recordToolResult(
+      {
+        callId: invocation.id,
+        toolId: invocation.toolId,
+        toolName: invocation.toolName,
+        status,
+        outputSummary: boundHistoricalContextText(
+          JSON.stringify(error ? { error, ...output } : output),
+          6000,
+        ),
+        ...(error ? { error } : {}),
+      },
+      { allowWhileTerminating: terminating },
+    );
     this.updateToolCallStatus(prepared.toolCallPart, status, now);
-    this.emit(run, status === "completed" ? "tool.completed" : "tool.failed", { runId: run.id, messageId: writer.messageId, toolId: invocation.toolId, callId: invocation.id, status });
+    this.emit(run, status === "completed" ? "tool.completed" : "tool.failed", {
+      runId: run.id,
+      messageId: writer.messageId,
+      toolId: invocation.toolId,
+      callId: invocation.id,
+      status,
+    });
     if (terminating) this.finishAbortedWriter(execution, writer);
-    else if (options.finishRun !== false) { if (error) writer.fail(new Error(error)); else writer.complete(); }
+    else if (options.finishRun !== false) {
+      if (error) writer.fail(new Error(error));
+      else writer.complete();
+    }
     return response(part.id);
   }
 
   private denyPreparedToolInvocation(
     prepared: PreparedToolInvocation,
     request: StoredPermissionRequest | null,
-    options: { finishRun?: boolean } = {}
+    options: { finishRun?: boolean } = {},
   ): InvokeToolResponse {
     const now = new Date().toISOString();
     const executionCwd = prepared.executionCwd;
-    const permissionRequest = request ?? this.store.createPermissionRequest({
-      id: randomUUID(),
-      sessionId: prepared.invocation.sessionId,
-      runId: prepared.run.id,
-      messageId: prepared.assistantMessage.id,
-      invocationId: prepared.invocation.id,
-      toolId: prepared.registeredTool.definition.id,
-      toolName: prepared.registeredTool.definition.name,
-      caller: prepared.caller,
-      permissionDecision: prepared.permission.decision,
-      inputSummary: summarizeToolInput(prepared.registeredTool.definition.id, prepared.publicInput),
-      publicInput: prepared.publicInput,
-      executionInput: prepared.executionInput,
-      riskLevel: prepared.permission.riskLevel,
-      reason: prepared.permission.reason,
-      status: "denied",
-      toolCallPartId: prepared.toolCallPart.id,
-      commandOutputPartId: prepared.commandOutputPart?.id,
-      metadata: {
-        toolSource: prepared.registeredTool.definition.source,
-        executionCwd,
-        permissionAction: prepared.permission.action,
-        permissionRuleId: prepared.permission.ruleId,
-        policy: permissionPolicySummary(prepared.permission),
-        ...(prepared.resumeAgentRun
-          ? {
-              agentToolLoop: true,
-              toolLoopIteration: prepared.toolLoopIteration ?? null,
-              providerToolCallName: prepared.providerToolCallName ?? null
-            }
-          : {})
-      },
-      createdAt: now,
-      updatedAt: now,
-      resolvedAt: now
-    });
+    const permissionRequest =
+      request ??
+      this.store.createPermissionRequest({
+        id: randomUUID(),
+        sessionId: prepared.invocation.sessionId,
+        runId: prepared.run.id,
+        messageId: prepared.assistantMessage.id,
+        invocationId: prepared.invocation.id,
+        toolId: prepared.registeredTool.definition.id,
+        toolName: prepared.registeredTool.definition.name,
+        caller: prepared.caller,
+        permissionDecision: prepared.permission.decision,
+        inputSummary: summarizeToolInput(
+          prepared.registeredTool.definition.id,
+          prepared.publicInput,
+        ),
+        publicInput: prepared.publicInput,
+        executionInput: prepared.executionInput,
+        riskLevel: prepared.permission.riskLevel,
+        reason: prepared.permission.reason,
+        status: "denied",
+        toolCallPartId: prepared.toolCallPart.id,
+        commandOutputPartId: prepared.commandOutputPart?.id,
+        metadata: {
+          toolSource: prepared.registeredTool.definition.source,
+          executionCwd,
+          permissionAction: prepared.permission.action,
+          permissionRuleId: prepared.permission.ruleId,
+          policy: permissionPolicySummary(prepared.permission),
+          ...(prepared.resumeAgentRun
+            ? {
+                agentToolLoop: true,
+                toolLoopIteration: prepared.toolLoopIteration ?? null,
+                providerToolCallName: prepared.providerToolCallName ?? null,
+              }
+            : {}),
+        },
+        createdAt: now,
+        updatedAt: now,
+        resolvedAt: now,
+      });
 
     if (!request) {
       this.emit(prepared.run, "permission.denied", {
@@ -1701,7 +2284,7 @@ export class Kernel {
         status: "denied",
         reason: permissionRequest.reason,
         riskLevel: permissionRequest.riskLevel,
-        request: toPublicPermissionRequest(permissionRequest)
+        request: toPublicPermissionRequest(permissionRequest),
       });
     }
 
@@ -1712,15 +2295,20 @@ export class Kernel {
       request ? "denied" : prepared.permission.decision,
       prepared.permission.reason,
       prepared.createdAt,
-      completedAt
+      completedAt,
     );
-    const toolCallPart = this.updateToolCallStatus(prepared.toolCallPart, result.status, completedAt);
+    const toolCallPart = this.updateToolCallStatus(
+      prepared.toolCallPart,
+      result.status,
+      completedAt,
+    );
     const toolResultPart = prepared.writer.recordToolResult({
       callId: prepared.invocation.id,
       toolId: prepared.registeredTool.definition.id,
       toolName: prepared.registeredTool.definition.name,
       status: result.status,
-      outputSummary: result.error ?? "Tool execution denied by permission policy.",
+      outputSummary:
+        result.error ?? "Tool execution denied by permission policy.",
       error: result.error ?? undefined,
       metadata: {
         permissionDecision: prepared.permission.decision,
@@ -1732,25 +2320,35 @@ export class Kernel {
           ? {
               agentToolLoop: true,
               toolLoopIteration: prepared.toolLoopIteration ?? null,
-              providerToolCallName: prepared.providerToolCallName ?? null
+              providerToolCallName: prepared.providerToolCallName ?? null,
             }
-          : {})
-      }
+          : {}),
+      },
     });
     if (options.finishRun !== false) {
-      prepared.writer.fail(new Error(result.error ?? "Tool execution denied by permission policy."));
+      prepared.writer.fail(
+        new Error(
+          result.error ?? "Tool execution denied by permission policy.",
+        ),
+      );
     }
 
     return {
       state: "denied",
-      invocation: toPublicToolInvocation({ ...prepared.invocation, status: result.status, updatedAt: completedAt }),
+      invocation: toPublicToolInvocation({
+        ...prepared.invocation,
+        status: result.status,
+        updatedAt: completedAt,
+      }),
       result: toPublicToolExecutionResult(result),
       permissionRequest: toPublicPermissionRequest(permissionRequest),
       run: this.toPublicRunSummary(this.store.getRun(prepared.run.id)!),
-      message: toPublicMessage(this.store.getMessage(prepared.assistantMessage.id)!),
+      message: toPublicMessage(
+        this.store.getMessage(prepared.assistantMessage.id)!,
+      ),
       toolCallPartId: toolCallPart.id,
       commandOutputPartId: prepared.commandOutputPart?.id,
-      toolResultPartId: toolResultPart.id
+      toolResultPartId: toolResultPart.id,
     };
   }
 
@@ -1760,7 +2358,10 @@ export class Kernel {
       throw new KernelError("Permission request not found", 404);
     }
     if (request.status !== "pending") {
-      throw new KernelError(`Permission request is already ${request.status}.`, 409);
+      throw new KernelError(
+        `Permission request is already ${request.status}.`,
+        409,
+      );
     }
     return request;
   }
@@ -1777,7 +2378,7 @@ export class Kernel {
       providerId: null,
       toolId: null,
       termination: null,
-      activePromise: null
+      activePromise: null,
     };
     this.executions.set(runId, execution);
     return execution;
@@ -1792,7 +2393,7 @@ export class Kernel {
           "This session already has an active run. Reconnect to or cancel it before starting another run.",
           409,
           "active_run_exists",
-          { run: this.toPublicRunSummary(error.activeRun) }
+          { run: this.toPublicRunSummary(error.activeRun) },
         );
       }
       throw error;
@@ -1802,8 +2403,12 @@ export class Kernel {
   private toPublicRunSummary(run: Run): PublicRunSummary {
     const children = this.store.subsessions.list(run.id);
     return {
-      children: { unfinished: children.filter((item) => item.result === null).length,
-        pendingResults: children.filter((item) => item.result !== null && !item.acknowledged).length },
+      children: {
+        unfinished: children.filter((item) => item.result === null).length,
+        pendingResults: children.filter(
+          (item) => item.result !== null && !item.acknowledged,
+        ).length,
+      },
       id: run.id,
       sessionId: run.sessionId,
       provider: sanitizedPublicString(run.provider, 160) ?? "unknown",
@@ -1815,7 +2420,9 @@ export class Kernel {
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
       error: sanitizedPublicString(run.error, 1_000),
-      context: publicContextPlanSummary(contextPlanRecordObjects(run.metadata).at(-1))
+      context: publicContextPlanSummary(
+        contextPlanRecordObjects(run.metadata).at(-1),
+      ),
     };
   }
 
@@ -1831,25 +2438,41 @@ export class Kernel {
       return null;
     }
     const phase = this.executions.get(run.id)?.phase;
-    return phase === "provider" || phase === "tool" || phase === "compacting_context" ? phase : "running";
+    return phase === "provider" ||
+      phase === "tool" ||
+      phase === "compacting_context"
+      ? phase
+      : "running";
   }
 
   private assertAcceptingWork(): void {
     if (this.shuttingDown) {
-      throw new KernelError("The daemon is shutting down and is not accepting new work.", 503);
+      throw new KernelError(
+        "The daemon is shutting down and is not accepting new work.",
+        503,
+      );
     }
   }
 
-  private async trackExecution<T>(execution: RunExecution, operation: () => Promise<T>): Promise<T> {
+  private async trackExecution<T>(
+    execution: RunExecution,
+    operation: () => Promise<T>,
+  ): Promise<T> {
     if (execution.activePromise) {
-      throw new KernelError(`Run '${execution.runId}' already has active work.`, 409);
+      throw new KernelError(
+        `Run '${execution.runId}' already has active work.`,
+        409,
+      );
     }
 
     let activePromise: Promise<T> | null = null;
     try {
       const run = this.store.getRun(execution.runId);
       if (!run || run.status !== "running") {
-        throw new KernelError(`Run '${execution.runId}' is not available for execution.`, 409);
+        throw new KernelError(
+          `Run '${execution.runId}' is not available for execution.`,
+          409,
+        );
       }
       if (execution.controller.signal.aborted) {
         throw execution.controller.signal.reason instanceof Error
@@ -1868,7 +2491,8 @@ export class Kernel {
         execution.activePromise = null;
       }
       const run = this.store.getRun(execution.runId);
-      execution.phase = run?.status === "waiting_permission" ? "waiting_permission" : "idle";
+      execution.phase =
+        run?.status === "waiting_permission" ? "waiting_permission" : "idle";
       if (execution.phase === "idle") {
         execution.toolId = null;
       }
@@ -1878,7 +2502,10 @@ export class Kernel {
     }
   }
 
-  private finishAbortedWriter(execution: RunExecution, writer: RunWriter): void {
+  private finishAbortedWriter(
+    execution: RunExecution,
+    writer: RunWriter,
+  ): void {
     if (execution.termination === "interrupted") {
       writer.interrupt();
     } else {
@@ -1891,7 +2518,7 @@ export class Kernel {
       return;
     }
     const run = this.store.getRun(execution.runId);
-    if (!run || isTerminalRunStatus(run.status)) {
+    if (!run || new RunVO.Status(run.status).isTerminal()) {
       return;
     }
     if (execution.termination === "cancelled" && run.status !== "cancelling") {
@@ -1900,8 +2527,12 @@ export class Kernel {
     this.finalizeRunTermination(run, execution.termination);
   }
 
-  private finalizeRunTermination(run: Run, termination: RunTermination, reason?: string): void {
-    if (isTerminalRunStatus(run.status)) {
+  private finalizeRunTermination(
+    run: Run,
+    termination: RunTermination,
+    reason?: string,
+  ): void {
+    if (new RunVO.Status(run.status).isTerminal()) {
       return;
     }
     const assistantMessage = this.getLatestAssistantMessageForRun(run.id);
@@ -1910,7 +2541,7 @@ export class Kernel {
         store: this.store,
         eventBus: this.eventBus,
         run: this.store.getRun(run.id) ?? run,
-        assistantMessageId: assistantMessage.id
+        assistantMessageId: assistantMessage.id,
       });
       if (termination === "interrupted") {
         writer.interrupt(reason);
@@ -1921,22 +2552,30 @@ export class Kernel {
     }
 
     const updatedAt = new Date().toISOString();
-    const error = termination === "interrupted" ? reason ?? "The daemon stopped before the run reached a terminal state." : null;
+    const error =
+      termination === "interrupted"
+        ? (reason ??
+          "The daemon stopped before the run reached a terminal state.")
+        : null;
     const status = termination === "interrupted" ? "interrupted" : "cancelled";
     const result = this.store.finalizeRun({
       runId: run.id,
-      expectedStatuses: termination === "interrupted" ? ["running", "cancelling"] : ["running", "waiting_permission", "waiting_children", "cancelling"],
+      expectedStatuses:
+        termination === "interrupted"
+          ? ["running", "cancelling"]
+          : ["running", "waiting_permission", "waiting_children", "cancelling"],
       status,
       error,
       updatedAt,
       event: {
         id: randomUUID(),
-        type: termination === "interrupted" ? "run_interrupted" : "run_cancelled",
+        type:
+          termination === "interrupted" ? "run_interrupted" : "run_cancelled",
         payload: {
           ...(error ? { error } : {}),
-          runId: run.id
-        }
-      }
+          runId: run.id,
+        },
+      },
     });
     if (result) {
       this.eventBus.publish(result.event);
@@ -1945,27 +2584,45 @@ export class Kernel {
 
   private releaseTerminalExecution(execution: RunExecution): void {
     const run = this.store.getRun(execution.runId);
-    if (run && isTerminalRunStatus(run.status) && this.executions.get(execution.runId) === execution) {
+    if (
+      run &&
+      new RunVO.Status(run.status).isTerminal() &&
+      this.executions.get(execution.runId) === execution
+    ) {
       this.executions.delete(execution.runId);
     }
   }
 
-  private handleQueuedExecutionError(runId: string, execution: RunExecution, error: unknown): void {
-    if (error instanceof KernelError && error.statusCode === 409 && execution.activePromise) {
+  private handleQueuedExecutionError(
+    runId: string,
+    execution: RunExecution,
+    error: unknown,
+  ): void {
+    if (
+      error instanceof KernelError &&
+      error.statusCode === 409 &&
+      execution.activePromise
+    ) {
       return;
     }
     const run = this.store.getRun(runId);
-    if (!run || isTerminalRunStatus(run.status)) {
+    if (!run || new RunVO.Status(run.status).isTerminal()) {
       this.releaseTerminalExecution(execution);
       return;
     }
-    console.error("Agent run execution failed", { runId, error: toError(error).message });
+    console.error("Agent run execution failed", {
+      runId,
+      error: toError(error).message,
+    });
     this.finalizeExecutionError(execution, error);
   }
 
-  private finalizeExecutionError(execution: RunExecution, error: unknown): void {
+  private finalizeExecutionError(
+    execution: RunExecution,
+    error: unknown,
+  ): void {
     const run = this.store.getRun(execution.runId);
-    if (!run || isTerminalRunStatus(run.status)) {
+    if (!run || new RunVO.Status(run.status).isTerminal()) {
       return;
     }
     if (execution.controller.signal.aborted || isAbortLike(error)) {
@@ -1983,7 +2640,12 @@ export class Kernel {
     const runError = toError(error);
     const assistantMessage = this.getLatestAssistantMessageForRun(run.id);
     if (assistantMessage) {
-      new RunWriter({ store: this.store, eventBus: this.eventBus, run, assistantMessageId: assistantMessage.id }).fail(runError);
+      new RunWriter({
+        store: this.store,
+        eventBus: this.eventBus,
+        run,
+        assistantMessageId: assistantMessage.id,
+      }).fail(runError);
       return;
     }
     const result = this.store.finalizeRun({
@@ -1995,37 +2657,50 @@ export class Kernel {
       event: {
         id: randomUUID(),
         type: "run_failed",
-        payload: { runId: run.id, error: runError.message }
-      }
+        payload: { runId: run.id, error: runError.message },
+      },
     });
     if (result) {
       this.eventBus.publish(result.event);
     }
   }
 
-  private failResolvedPermissionPreparation(runId: string, error: unknown): void {
+  private failResolvedPermissionPreparation(
+    runId: string,
+    error: unknown,
+  ): void {
     const execution = this.getOrCreateExecution(runId);
     this.finalizeExecutionError(execution, error);
     this.releaseTerminalExecution(execution);
   }
 
   private getToolSettings(): ToolSettings {
-    return normalizeToolSettings(this.store.listSettings()[toolSettingsSettingKey]);
+    return normalizeToolSettings(
+      this.store.listSettings()[toolSettingsSettingKey],
+    );
   }
 
   private getToolExecutionCwd(session: Session): string {
-    const workingDirectory = resolve(session.workingDirectory || this.defaultWorkingDirectory);
+    const workingDirectory = resolve(
+      session.workingDirectory || this.defaultWorkingDirectory,
+    );
     assertExistingDirectory(workingDirectory, "Session workingDirectory");
     return workingDirectory;
   }
 
-  private normalizeWorkingDirectory(value: string | undefined, options: { allowDefault: boolean }): string {
+  private normalizeWorkingDirectory(
+    value: string | undefined,
+    options: { allowDefault: boolean },
+  ): string {
     const candidate = value?.trim();
     if (!candidate) {
       if (options.allowDefault) {
         return this.defaultWorkingDirectory;
       }
-      throw new KernelError("Session workingDirectory must be a non-empty path.", 400);
+      throw new KernelError(
+        "Session workingDirectory must be a non-empty path.",
+        400,
+      );
     }
 
     const workingDirectory = resolve(candidate);
@@ -2033,25 +2708,37 @@ export class Kernel {
     return workingDirectory;
   }
 
-  private updateToolCallStatus(part: MessagePart, status: ToolInvocationStatus | ToolResultStatus, updatedAt: string): MessagePart {
+  private updateToolCallStatus(
+    part: MessagePart,
+    status: ToolInvocationStatus | ToolResultStatus,
+    updatedAt: string,
+  ): MessagePart {
     return (
       this.store.updateMessagePart({
         id: part.id,
         text: part.text,
         content: { ...part.content, status },
         metadata: part.metadata,
-        updatedAt
+        updatedAt,
       }) ?? part
     );
   }
 
-  private updateCommandOutputPart(part: MessagePart, text: string, updatedAt: string, metadata: JsonObject = {}): MessagePart {
+  private updateCommandOutputPart(
+    part: MessagePart,
+    text: string,
+    updatedAt: string,
+    metadata: JsonObject = {},
+  ): MessagePart {
     const nextMetadata = { ...part.metadata, ...metadata };
     const nextContent: JsonObject = { ...part.content, text };
     if (typeof metadata.cwd === "string") {
       nextContent.cwd = metadata.cwd;
     }
-    if (typeof metadata.exitCode === "number" && Number.isFinite(metadata.exitCode)) {
+    if (
+      typeof metadata.exitCode === "number" &&
+      Number.isFinite(metadata.exitCode)
+    ) {
       nextContent.exitCode = metadata.exitCode;
     }
     if (typeof metadata.timedOut === "boolean") {
@@ -2073,7 +2760,7 @@ export class Kernel {
         text,
         content: nextContent,
         metadata: nextMetadata,
-        updatedAt
+        updatedAt,
       }) ?? part
     );
   }
@@ -2083,31 +2770,53 @@ export class Kernel {
     provider: ProviderAdapter,
     input: ProviderRunInput,
     execution: RunExecution,
-    writer: RunWriter
+    writer: RunWriter,
   ): Promise<void> {
     let activeWriter = writer;
     execution.providerId = provider.id;
     try {
-      await this.executeAgentToolLoop(run, provider, input, execution, writer, (nextWriter) => {
-        activeWriter = nextWriter;
-      });
+      await this.executeAgentToolLoop(
+        run,
+        provider,
+        input,
+        execution,
+        writer,
+        (nextWriter) => {
+          activeWriter = nextWriter;
+        },
+      );
     } catch (error) {
       if (execution.controller.signal.aborted || isAbortLike(error)) {
         this.finishAbortedWriter(execution, activeWriter);
       } else {
         const runError = toError(error);
         if (error instanceof ProviderContextLengthError) {
-          this.store.mergeRunMetadata(run.id, { errorCode: error.code, providerContextOverflow: true }, new Date().toISOString());
-        } else if (error instanceof KernelError && error.code === "context_budget_exceeded") {
-          this.store.mergeRunMetadata(run.id, { errorCode: error.code, contextPreflightOverflow: true }, new Date().toISOString());
+          this.store.mergeRunMetadata(
+            run.id,
+            { errorCode: error.code, providerContextOverflow: true },
+            new Date().toISOString(),
+          );
+        } else if (
+          error instanceof KernelError &&
+          error.code === "context_budget_exceeded"
+        ) {
+          this.store.mergeRunMetadata(
+            run.id,
+            { errorCode: error.code, contextPreflightOverflow: true },
+            new Date().toISOString(),
+          );
         }
         if (error instanceof NativeTranscriptError) {
-          this.store.mergeRunMetadata(run.id,{errorCode:error.code},new Date().toISOString());
+          this.store.mergeRunMetadata(
+            run.id,
+            { errorCode: error.code },
+            new Date().toISOString(),
+          );
         }
         console.error("Provider run failed", {
           runId: run.id,
           provider: provider.id,
-          error: runError.message
+          error: runError.message,
         });
         activeWriter.fail(runError);
       }
@@ -2121,7 +2830,7 @@ export class Kernel {
     execution: RunExecution,
     writer: RunWriter,
     onActiveWriterChange: (writer: RunWriter) => void,
-    startingIteration = numberField(run.metadata, "toolIterations") ?? 0
+    startingIteration = numberField(run.metadata, "toolIterations") ?? 0,
   ): Promise<void> {
     let iteration = startingIteration;
     let providerInput = input;
@@ -2130,16 +2839,28 @@ export class Kernel {
     while (true) {
       this.store.subsessions.reconcile();
       this.store.subsessions.deliver(run.id, currentWriter.messageId);
-      const deliveredIds = this.store.subsessions.list(run.id).filter((item) => item.deliveredPartId && !item.acknowledged).map((item) => item.id);
-      providerInput = this.withCurrentToolLoopContext(input, run.id, provider, iteration);
+      const deliveredIds = this.store.subsessions
+        .list(run.id)
+        .filter((item) => item.deliveredPartId && !item.acknowledged)
+        .map((item) => item.id);
+      providerInput = this.withCurrentToolLoopContext(
+        input,
+        run.id,
+        provider,
+        iteration,
+      );
       execution.phase = "provider";
       execution.toolId = null;
-      this.store.mergeMessageMetadata(currentWriter.messageId,{providerResponseBatchId:`${run.id}:${iteration+1}`},new Date().toISOString());
+      this.store.mergeMessageMetadata(
+        currentWriter.messageId,
+        { providerResponseBatchId: `${run.id}:${iteration + 1}` },
+        new Date().toISOString(),
+      );
       const result = await provider.run(providerInput, {
         signal: execution.controller.signal,
-        writer: currentWriter
+        writer: currentWriter,
       });
-      this.store.subsessions.acknowledge(run.id,deliveredIds);
+      this.store.subsessions.acknowledge(run.id, deliveredIds);
 
       if (execution.controller.signal.aborted) {
         this.finishAbortedWriter(execution, currentWriter);
@@ -2149,33 +2870,52 @@ export class Kernel {
       const toolCalls = result.toolCalls ?? [];
       if (toolCalls.length === 0) {
         const children = this.store.subsessions.list(run.id);
-        if (children.some((item) => item.result === null || !item.acknowledged)) {
+        if (
+          children.some((item) => item.result === null || !item.acknowledged)
+        ) {
           currentWriter.completeMessage();
-          const waiting = this.store.transitionRunStatus(run.id, ["running"], "waiting_children", null, new Date().toISOString());
-          if (waiting) this.emit(waiting, "run_waiting_children", { runId: run.id, sessionId: run.sessionId, status: "waiting_children", children: this.toPublicRunSummary(waiting).children });
+          const waiting = this.store.transitionRunStatus(
+            run.id,
+            ["running"],
+            "waiting_children",
+            null,
+            new Date().toISOString(),
+          );
+          if (waiting)
+            this.emit(waiting, "run_waiting_children", {
+              runId: run.id,
+              sessionId: run.sessionId,
+              status: "waiting_children",
+              children: this.toPublicRunSummary(waiting).children,
+            });
           this.subsessions.requestWake(run.id);
           return;
         }
         if (
-          providerInput.context.agent.contextPolicy?.automaticCompaction !== false &&
+          providerInput.context.agent.contextPolicy?.automaticCompaction !==
+            false &&
           providerInput.context.plan.compactionRecommended &&
           !execution.controller.signal.aborted
         ) {
           try {
             execution.phase = "compacting_context";
-            await this.coordinateCompaction(run.sessionId, this.store.getRun(run.id) ?? run, execution.controller.signal);
+            await this.coordinateCompaction(
+              run.sessionId,
+              this.store.getRun(run.id) ?? run,
+              execution.controller.signal,
+            );
           } catch (error) {
             if (!execution.controller.signal.aborted) {
               this.emit(run, "context_compaction_failed", {
                 runId: run.id,
                 sessionId: run.sessionId,
                 sourceSegmentId: providerInput.context.plan.activeSegmentId,
-                error: sanitizedCompactionError(error)
+                error: sanitizedCompactionError(error),
               });
               this.store.mergeRunMetadata(
                 run.id,
                 { contextCompactionWarning: sanitizedCompactionError(error) },
-                new Date().toISOString()
+                new Date().toISOString(),
               );
             }
           }
@@ -2185,7 +2925,10 @@ export class Kernel {
           this.finishAbortedWriter(execution, currentWriter);
           return;
         }
-        currentWriter.writeMetadata({ toolIterations: iteration, toolLoopState: "completed" });
+        currentWriter.writeMetadata({
+          toolIterations: iteration,
+          toolLoopState: "completed",
+        });
         currentWriter.complete();
         return;
       }
@@ -2194,7 +2937,7 @@ export class Kernel {
       currentWriter.writeMetadata({
         toolIterations: nextIteration,
         toolLoopState: "executing_tools",
-        modelToolCallCount: toolCalls.length
+        modelToolCallCount: toolCalls.length,
       });
 
       const assistantMessage = this.store.getMessage(currentWriter.messageId);
@@ -2202,7 +2945,13 @@ export class Kernel {
         throw new KernelError("Assistant message for run not found", 404);
       }
 
-      const step = await this.handleModelToolCalls(run, currentWriter, assistantMessage, toolCalls, nextIteration);
+      const step = await this.handleModelToolCalls(
+        run,
+        currentWriter,
+        assistantMessage,
+        toolCalls,
+        nextIteration,
+      );
       if (step === "waiting_permission") {
         return;
       }
@@ -2213,7 +2962,11 @@ export class Kernel {
 
       currentWriter.completeMessage();
       iteration = nextIteration;
-      currentWriter = this.createFollowUpAssistantWriter(run, iteration, execution);
+      currentWriter = this.createFollowUpAssistantWriter(
+        run,
+        iteration,
+        execution,
+      );
       onActiveWriterChange(currentWriter);
     }
   }
@@ -2223,17 +2976,30 @@ export class Kernel {
     writer: RunWriter,
     assistantMessage: Message,
     toolCalls: ProviderToolCall[],
-    iteration: number
+    iteration: number,
   ): Promise<"continue" | "waiting_permission"> {
-    if (toolCalls.length > 16) throw new KernelError("Provider tool batch exceeds the 16-call safety limit.",400);
+    if (toolCalls.length > 16)
+      throw new KernelError(
+        "Provider tool batch exceeds the 16-call safety limit.",
+        400,
+      );
     for (const [index, toolCall] of toolCalls.entries()) {
-      const prepared = this.prepareModelToolInvocation(run, assistantMessage, writer, toolCall, iteration);
+      const prepared = this.prepareModelToolInvocation(
+        run,
+        assistantMessage,
+        writer,
+        toolCall,
+        iteration,
+      );
       if (!prepared) {
         continue;
       }
 
       if (prepared.permission.decision === "allowed") {
-        await this.executePreparedToolInvocation(prepared, { state: "executed", finishRun: false });
+        await this.executePreparedToolInvocation(prepared, {
+          state: "executed",
+          finishRun: false,
+        });
         if (prepared.execution.controller.signal.aborted) {
           return "continue";
         }
@@ -2241,11 +3007,21 @@ export class Kernel {
       }
 
       if (prepared.permission.decision === "requires_approval") {
-        this.store.mergeRunMetadata(run.id, { queuedModelToolCalls: toolCalls.slice(index+1).map((call) => ({
-          id: call.id, name: call.name, arguments: call.arguments,
-          ...(call.argumentsText !== undefined ? { argumentsText: call.argumentsText } : {}),
-          ...(call.metadata ? { metadata: call.metadata } : {})
-        })) },new Date().toISOString());
+        this.store.mergeRunMetadata(
+          run.id,
+          {
+            queuedModelToolCalls: toolCalls.slice(index + 1).map((call) => ({
+              id: call.id,
+              name: call.name,
+              arguments: call.arguments,
+              ...(call.argumentsText !== undefined
+                ? { argumentsText: call.argumentsText }
+                : {}),
+              ...(call.metadata ? { metadata: call.metadata } : {}),
+            })),
+          },
+          new Date().toISOString(),
+        );
         this.createPendingPermissionResponse(prepared);
         return "waiting_permission";
       }
@@ -2261,23 +3037,40 @@ export class Kernel {
     assistantMessage: Message,
     writer: RunWriter,
     toolCall: ProviderToolCall,
-    iteration: number
+    iteration: number,
   ): PreparedToolInvocation | null {
     const providerToolName = toolCall.name.trim();
-    const canonicalToolId = providerToolNameToToolId(providerToolName) ?? providerToolName;
+    const canonicalToolId =
+      providerToolNameToToolId(providerToolName) ?? providerToolName;
     const registeredTool = this.tools.get(canonicalToolId);
     const callId = normalizeToolCallId(toolCall.id);
     const nativeToolCall: JsonObject = {
       id: toolCall.id || callId,
       name: providerToolName,
-      argumentsText: toolCall.argumentsText ?? JSON.stringify(toolCall.arguments),
+      argumentsText:
+        toolCall.argumentsText ?? JSON.stringify(toolCall.arguments),
       batchId: `${run.id}:${iteration}`,
-      ...(typeof toolCall.metadata?.nativeItemId === "string" ? { nativeItemId: toolCall.metadata.nativeItemId } : {})
+      ...(typeof toolCall.metadata?.nativeItemId === "string"
+        ? { nativeItemId: toolCall.metadata.nativeItemId }
+        : {}),
     };
-    if (this.listAssistantMessagesForRun(run.id).some((message) => message.parts.some((part) =>
-      part.type === "tool_call" && typeof part.metadata.nativeToolCall === "object" &&
-      part.metadata.nativeToolCall !== null && !Array.isArray(part.metadata.nativeToolCall) && part.metadata.nativeToolCall.id === nativeToolCall.id))) {
-      throw new KernelError("Provider repeated a native tool call ID; no duplicate tool was executed.",400,"duplicate_tool_call_id");
+    if (
+      this.listAssistantMessagesForRun(run.id).some((message) =>
+        message.parts.some(
+          (part) =>
+            part.type === "tool_call" &&
+            typeof part.metadata.nativeToolCall === "object" &&
+            part.metadata.nativeToolCall !== null &&
+            !Array.isArray(part.metadata.nativeToolCall) &&
+            part.metadata.nativeToolCall.id === nativeToolCall.id,
+        ),
+      )
+    ) {
+      throw new KernelError(
+        "Provider repeated a native tool call ID; no duplicate tool was executed.",
+        400,
+        "duplicate_tool_call_id",
+      );
     }
     const toolName = registeredTool?.definition.name ?? providerToolName;
 
@@ -2293,8 +3086,8 @@ export class Kernel {
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
-          unsupportedTool: true
-        }
+          unsupportedTool: true,
+        },
       });
       writer.recordToolResult({
         callId,
@@ -2305,17 +3098,23 @@ export class Kernel {
         outputSummary: `Unsupported model tool '${providerToolName || "unknown"}'.`,
         metadata: {
           toolCallPartId: toolCallPart.id,
-          toolLoopIteration: iteration
-        }
+          toolLoopIteration: iteration,
+        },
       });
       return null;
     }
 
     const agent = this.getAgentForRun(run);
-    const rootOnlyDenied = registeredTool.definition.id === "subsession.start" && Boolean(this.getSession(run.sessionId).parentSessionId);
-    if (rootOnlyDenied || !effectiveAgentToolIds(agent).includes(registeredTool.definition.id)) {
-      const denial = rootOnlyDenied ? "Only root Sessions may delegate; child re-delegation is forbidden regardless of Agent profile." :
-        `Agent profile '${agent.name}' does not allow tool '${registeredTool.definition.id}'.`;
+    const rootOnlyDenied =
+      registeredTool.definition.id === "subsession.start" &&
+      Boolean(this.getSession(run.sessionId).parentSessionId);
+    if (
+      rootOnlyDenied ||
+      !effectiveAgentToolIds(agent).includes(registeredTool.definition.id)
+    ) {
+      const denial = rootOnlyDenied
+        ? "Only root Sessions may delegate; child re-delegation is forbidden regardless of Agent profile."
+        : `Agent profile '${agent.name}' does not allow tool '${registeredTool.definition.id}'.`;
       const toolCallPart = writer.recordToolCall({
         callId,
         toolId: registeredTool.definition.id,
@@ -2329,8 +3128,8 @@ export class Kernel {
           toolLoopIteration: iteration,
           profileToolDenied: true,
           agentId: agent.id,
-          agentRevision: agent.revision
-        }
+          agentRevision: agent.revision,
+        },
       });
       writer.recordToolResult({
         callId,
@@ -2338,20 +3137,25 @@ export class Kernel {
         toolName: registeredTool.definition.name,
         status: "failed",
         error: denial,
-        outputSummary: rootOnlyDenied ? JSON.stringify({code:"subsession_root_only",error:denial}) : denial,
+        outputSummary: rootOnlyDenied
+          ? JSON.stringify({ code: "subsession_root_only", error: denial })
+          : denial,
         metadata: {
           toolCallPartId: toolCallPart.id,
           toolLoopIteration: iteration,
           profileToolDenied: true,
           agentId: agent.id,
-          agentRevision: agent.revision
-        }
+          agentRevision: agent.revision,
+        },
       });
       return null;
     }
 
     if (stringField(toolCall.metadata ?? {}, "argumentsParseError")) {
-      const parseError = stringField(toolCall.metadata ?? {}, "argumentsParseError");
+      const parseError = stringField(
+        toolCall.metadata ?? {},
+        "argumentsParseError",
+      );
       const toolCallPart = writer.recordToolCall({
         callId,
         toolId: registeredTool.definition.id,
@@ -2363,8 +3167,8 @@ export class Kernel {
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
-          argumentsParseError: parseError
-        }
+          argumentsParseError: parseError,
+        },
       });
       writer.recordToolResult({
         callId,
@@ -2375,21 +3179,34 @@ export class Kernel {
         outputSummary: parseError,
         metadata: {
           toolCallPartId: toolCallPart.id,
-          toolLoopIteration: iteration
-        }
+          toolLoopIteration: iteration,
+        },
       });
       return null;
     }
 
-    const executionCwd = stringField(run.metadata, "workingDirectory") || this.getToolExecutionCwd(this.getSession(run.sessionId));
+    const executionCwd =
+      stringField(run.metadata, "workingDirectory") ||
+      this.getToolExecutionCwd(this.getSession(run.sessionId));
     const validationContext = { cwd: executionCwd };
     let executionInput: JsonObject;
     let publicInput: JsonObject;
     try {
-      executionInput = registeredTool.executor.validateInput?.(toolCall.arguments, validationContext) ?? toolCall.arguments;
-      publicInput = registeredTool.executor.toPublicInput?.(executionInput, validationContext) ?? executionInput;
+      executionInput =
+        registeredTool.executor.validateInput?.(
+          toolCall.arguments,
+          validationContext,
+        ) ?? toolCall.arguments;
+      publicInput =
+        registeredTool.executor.toPublicInput?.(
+          executionInput,
+          validationContext,
+        ) ?? executionInput;
     } catch (error) {
-      const validationError = error instanceof ToolInputError ? new KernelError(error.message, error.statusCode) : toError(error);
+      const validationError =
+        error instanceof ToolInputError
+          ? new KernelError(error.message, error.statusCode)
+          : toError(error);
       const toolCallPart = writer.recordToolCall({
         callId,
         toolId: registeredTool.definition.id,
@@ -2401,8 +3218,8 @@ export class Kernel {
           caller: "model",
           providerToolCallName: providerToolName,
           toolLoopIteration: iteration,
-          validationError: validationError.message
-        }
+          validationError: validationError.message,
+        },
       });
       writer.recordToolResult({
         callId,
@@ -2413,8 +3230,8 @@ export class Kernel {
         outputSummary: validationError.message,
         metadata: {
           toolCallPartId: toolCallPart.id,
-          toolLoopIteration: iteration
-        }
+          toolLoopIteration: iteration,
+        },
       });
       return null;
     }
@@ -2425,7 +3242,7 @@ export class Kernel {
       publicInput,
       executionInput,
       executionCwd,
-      settings: this.getToolSettings()
+      settings: this.getToolSettings(),
     });
     const now = new Date().toISOString();
     const invocation: ToolInvocation = {
@@ -2436,7 +3253,8 @@ export class Kernel {
       runId: run.id,
       messageId: assistantMessage.id,
       caller: "model",
-      status: permission.decision === "allowed" ? "created" : "pending_permission",
+      status:
+        permission.decision === "allowed" ? "created" : "pending_permission",
       permissionDecision: permission.decision,
       input: publicInput,
       metadata: {
@@ -2446,10 +3264,10 @@ export class Kernel {
         riskLevel: permission.riskLevel,
         providerToolCallName: providerToolName,
         toolLoopIteration: iteration,
-        agentToolLoop: true
+        agentToolLoop: true,
       },
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
     };
     const toolCallPart = writer.recordToolCall({
       callId: invocation.id,
@@ -2457,7 +3275,10 @@ export class Kernel {
       toolName: registeredTool.definition.name,
       provider: toolProviderForPart(registeredTool.definition.id),
       input: publicInput,
-      inputSummary: summarizeToolInput(registeredTool.definition.id, publicInput),
+      inputSummary: summarizeToolInput(
+        registeredTool.definition.id,
+        publicInput,
+      ),
       metadata: {
         nativeToolCall,
         caller: "model",
@@ -2468,22 +3289,25 @@ export class Kernel {
         permissionRuleId: permission.ruleId,
         riskLevel: permission.riskLevel,
         toolSource: registeredTool.definition.source,
-        agentToolLoop: true
-      }
+        agentToolLoop: true,
+      },
     });
-    const commandOutputPart = registeredTool.definition.id === "shell.exec" ? writer.recordCommandOutput({
-      callId: invocation.id,
-      stream: "combined",
-      text: "",
-      cwd: stringField(executionInput, "cwd"),
-      metadata: {
-        invocationId: invocation.id,
-        toolId: registeredTool.definition.id,
-        caller: "model",
-        toolLoopIteration: iteration,
-        agentToolLoop: true
-      }
-    }) : null;
+    const commandOutputPart =
+      registeredTool.definition.id === "shell.exec"
+        ? writer.recordCommandOutput({
+            callId: invocation.id,
+            stream: "combined",
+            text: "",
+            cwd: stringField(executionInput, "cwd"),
+            metadata: {
+              invocationId: invocation.id,
+              toolId: registeredTool.definition.id,
+              caller: "model",
+              toolLoopIteration: iteration,
+              agentToolLoop: true,
+            },
+          })
+        : null;
 
     return {
       registeredTool,
@@ -2502,7 +3326,7 @@ export class Kernel {
       resumeAgentRun: true,
       toolLoopIteration: iteration,
       providerToolCallName: providerToolName,
-      execution: this.getOrCreateExecution(run.id)
+      execution: this.getOrCreateExecution(run.id),
     };
   }
 
@@ -2510,7 +3334,7 @@ export class Kernel {
     input: ProviderRunInput,
     runId: string,
     provider: ProviderAdapter,
-    toolIteration: number
+    toolIteration: number,
   ): ProviderRunInput {
     const assistantMessages = this.listAssistantMessagesForRun(runId);
     if (assistantMessages.length === 0) {
@@ -2520,7 +3344,9 @@ export class Kernel {
     if (syntheticToolMessages.length === 0) {
       return input;
     }
-    const currentUserMessageId = input.sourceMessages.find((message) => message.runId === runId && message.role === "user")?.id;
+    const currentUserMessageId = input.sourceMessages.find(
+      (message) => message.runId === runId && message.role === "user",
+    )?.id;
     const inheritedArtifact = input.context.plan.inheritedArtifactId
       ? this.store.getContextArtifact(input.context.plan.inheritedArtifactId)
       : null;
@@ -2531,20 +3357,25 @@ export class Kernel {
       providerProfileId: input.profile.id,
       runOptions: input.runOptions,
       availableTools: input.context.availableTools,
-      metadata: { runId, toolLoopSyntheticMessageCount: syntheticToolMessages.length },
-      activeSegmentId: input.context.plan.activeSegmentId ?? input.session.activeSegmentId,
+      metadata: {
+        runId,
+        toolLoopSyntheticMessageCount: syntheticToolMessages.length,
+      },
+      activeSegmentId:
+        input.context.plan.activeSegmentId ?? input.session.activeSegmentId,
       compactionArtifact: inheritedArtifact,
-      resolvedBudget: contextBudgetFromMetadata(input.context.plan) ?? undefined,
+      resolvedBudget:
+        contextBudgetFromMetadata(input.context.plan) ?? undefined,
       currentMessageId: currentUserMessageId,
       providerOverhead: provider.contextPlanning,
-      syntheticMessages: syntheticToolMessages
+      syntheticMessages: syntheticToolMessages,
     });
     const context = contextResult.context;
     this.appendContextPlanRecord(runId, context.plan, toolIteration);
     return {
       ...input,
       context,
-      messages: toProviderMessages(context)
+      messages: toProviderMessages(context),
     };
   }
 
@@ -2552,51 +3383,74 @@ export class Kernel {
     plan: ContextPlan,
     providerTurn: number,
     toolIteration: number,
-    createdAt = new Date().toISOString()
+    createdAt = new Date().toISOString(),
   ): ContextPlanRecord {
-    return { planId: randomUUID(), providerTurn, toolIteration, createdAt, plan };
+    return {
+      planId: randomUUID(),
+      providerTurn,
+      toolIteration,
+      createdAt,
+      plan,
+    };
   }
 
-  private appendContextPlanRecord(runId: string, plan: ContextPlan, toolIteration: number): void {
+  private appendContextPlanRecord(
+    runId: string,
+    plan: ContextPlan,
+    toolIteration: number,
+  ): void {
     const run = this.getRun(runId);
     const records = contextPlanRecordObjects(run.metadata);
     const last = records.at(-1);
     const providerTurn = integerJsonField(last, "providerTurn") + 1;
-    const record = this.createContextPlanRecord(plan, providerTurn, toolIteration);
+    const record = this.createContextPlanRecord(
+      plan,
+      providerTurn,
+      toolIteration,
+    );
     const serializedRecord = contextPlanRecordToJson(record);
     const boundedRecords =
-      records.length < 128 ? [...records, serializedRecord] : [records[0], ...records.slice(-126), serializedRecord];
+      records.length < 128
+        ? [...records, serializedRecord]
+        : [records[0], ...records.slice(-126), serializedRecord];
     this.store.mergeRunMetadata(
       runId,
-      { contextPlanRecords: boundedRecords, latestContextPlanId: record.planId },
-      record.createdAt
+      {
+        contextPlanRecords: boundedRecords,
+        latestContextPlanId: record.planId,
+      },
+      record.createdAt,
     );
   }
 
-  private markRunWaitingForPermission(run: Run, messageId: string, permissionRequestId: string): void {
+  private markRunWaitingForPermission(
+    run: Run,
+    messageId: string,
+    permissionRequestId: string,
+  ): void {
     const now = new Date().toISOString();
     this.store.mergeRunMetadata(
       run.id,
       {
         toolLoopState: "waiting_permission",
-        pendingPermissionRequestId: permissionRequestId
+        pendingPermissionRequestId: permissionRequestId,
       },
-      now
+      now,
     );
     this.store.mergeMessageMetadata(
       messageId,
       {
         toolLoopState: "waiting_permission",
-        pendingPermissionRequestId: permissionRequestId
+        pendingPermissionRequestId: permissionRequestId,
       },
-      now
+      now,
     );
     this.emit(run, "run_waiting_permission", {
       runId: run.id,
       sessionId: run.sessionId,
       messageId,
       permissionRequestId,
-      status: "waiting_permission"
+      status: "waiting_permission",
     });
   }
 
@@ -2606,8 +3460,10 @@ export class Kernel {
         return;
       }
       const execution = this.getOrCreateExecution(runId);
-      void this.trackExecution(execution, () => this.resumeAgentRun(runId, execution)).catch((error) =>
-        this.handleQueuedExecutionError(runId, execution, error)
+      void this.trackExecution(execution, () =>
+        this.resumeAgentRun(runId, execution),
+      ).catch((error) =>
+        this.handleQueuedExecutionError(runId, execution, error),
       );
     });
   }
@@ -2616,9 +3472,19 @@ export class Kernel {
     if (this.shuttingDown || this.executions.get(runId)?.activePromise) return;
     const run = this.store.getRun(runId);
     if (run?.status !== "waiting_children") return;
-    if (!this.store.subsessions.list(runId).some((item) => item.result !== null && !item.acknowledged)) return;
+    if (
+      !this.store.subsessions
+        .list(runId)
+        .some((item) => item.result !== null && !item.acknowledged)
+    )
+      return;
     if (!this.store.subsessions.wake(runId)) return;
-    this.emit(this.getRun(runId),"child_result_available",{ runId, sessionId: run.sessionId, status: "running", children: this.getPublicRun(runId).children });
+    this.emit(this.getRun(runId), "child_result_available", {
+      runId,
+      sessionId: run.sessionId,
+      status: "running",
+      children: this.getPublicRun(runId).children,
+    });
     this.queueResumeAgentRun(runId);
   }
 
@@ -2627,22 +3493,41 @@ export class Kernel {
     const run = this.getRun(runId);
     if (run.status !== "running") return;
     this.getOrCreateExecution(run.id);
-    await this.startRunAttempt(run.sessionId,this.store.subsessions.task(run.id),{},true,run.id);
+    await this.startRunAttempt(
+      run.sessionId,
+      this.store.subsessions.task(run.id),
+      {},
+      true,
+      run.id,
+    );
   }
 
   listSubsessions(sessionId: string) {
     this.getSession(sessionId);
-    return this.store.subsessions.list().filter((item) => item.parentSessionId === sessionId)
+    return this.store.subsessions
+      .list()
+      .filter((item) => item.parentSessionId === sessionId)
       .map((item) => {
         const child = this.store.getRun(item.childRunId);
         const snapshot = child ? agentFromRunMetadata(child.metadata) : null;
-        return { ...item, status: child?.status ?? item.status,
-          agentName: sanitizePublicText(snapshot?.name ?? item.agentId,120) ?? "Child",
-          taskPreview: sanitizePublicText(this.store.subsessions.task(item.childRunId),240) ?? "" };
+        return {
+          ...item,
+          status: child?.status ?? item.status,
+          agentName:
+            sanitizePublicText(snapshot?.name ?? item.agentId, 120) ?? "Child",
+          taskPreview:
+            sanitizePublicText(
+              this.store.subsessions.task(item.childRunId),
+              240,
+            ) ?? "",
+        };
       });
   }
 
-  private async resumeAgentRun(runId: string, execution: RunExecution): Promise<void> {
+  private async resumeAgentRun(
+    runId: string,
+    execution: RunExecution,
+  ): Promise<void> {
     const run = this.getRun(runId);
     if (run.status !== "running") {
       return;
@@ -2657,27 +3542,50 @@ export class Kernel {
     let writer = this.createFollowUpAssistantWriter(run, iteration, execution);
     const queued = run.metadata.queuedModelToolCalls;
     if (Array.isArray(queued) && queued.length > 0) {
-      this.store.mergeRunMetadata(run.id,{ queuedModelToolCalls: [] },new Date().toISOString());
+      this.store.mergeRunMetadata(
+        run.id,
+        { queuedModelToolCalls: [] },
+        new Date().toISOString(),
+      );
       const calls = queued as unknown as ProviderToolCall[];
-      const step = await this.handleModelToolCalls(run,writer,this.store.getMessage(writer.messageId)!,calls,numberField(run.metadata,"toolIterations") ?? 0);
+      const step = await this.handleModelToolCalls(
+        run,
+        writer,
+        this.store.getMessage(writer.messageId)!,
+        calls,
+        numberField(run.metadata, "toolIterations") ?? 0,
+      );
       if (step === "waiting_permission") return;
       if (execution.controller.signal.aborted) {
-        this.finishAbortedWriter(execution,writer);
+        this.finishAbortedWriter(execution, writer);
         return;
       }
       if (this.store.getRun(run.id)?.status !== "running") return;
       // This message owns only the remaining calls/results from the preceding provider batch.
       // The next model response must not append its text or calls to that same message.
       writer.completeMessage();
-      writer = this.createFollowUpAssistantWriter(run,iteration,execution);
+      writer = this.createFollowUpAssistantWriter(run, iteration, execution);
     }
-    await this.executeRun(this.store.getRun(run.id) ?? run, provider, input, execution, writer);
+    await this.executeRun(
+      this.store.getRun(run.id) ?? run,
+      provider,
+      input,
+      execution,
+      writer,
+    );
   }
 
-  private createFollowUpAssistantWriter(run: Run, iteration: number, execution: RunExecution): RunWriter {
+  private createFollowUpAssistantWriter(
+    run: Run,
+    iteration: number,
+    execution: RunExecution,
+  ): RunWriter {
     const runSnapshot = this.store.getRun(run.id) ?? run;
     const priorAssistantMessages = this.listAssistantMessagesForRun(run.id);
-    const createdAt = timestampAfter(runSnapshot.updatedAt, ...priorAssistantMessages.map((message) => message.updatedAt));
+    const createdAt = timestampAfter(
+      runSnapshot.updatedAt,
+      ...priorAssistantMessages.map((message) => message.updatedAt),
+    );
     const message = this.store.createMessage({
       id: randomUUID(),
       sessionId: runSnapshot.sessionId,
@@ -2692,8 +3600,8 @@ export class Kernel {
         contextMetadataOwner: "run",
         toolLoopIteration: iteration,
         toolLoopMessageKind: "assistant_followup",
-        toolLoopState: "awaiting_model_followup"
-      }
+        toolLoopState: "awaiting_model_followup",
+      },
     });
     this.store.touchSession(runSnapshot.sessionId, createdAt);
     this.emit(runSnapshot, "assistant_message_created", { message });
@@ -2702,7 +3610,7 @@ export class Kernel {
       eventBus: this.eventBus,
       run: runSnapshot,
       assistantMessageId: message.id,
-      signal: execution.controller.signal
+      signal: execution.controller.signal,
     });
   }
 
@@ -2715,7 +3623,7 @@ export class Kernel {
         store: this.store,
         eventBus: this.eventBus,
         run: this.store.getRun(run.id) ?? run,
-        assistantMessageId: message.id
+        assistantMessageId: message.id,
       }).completeMessage();
     }
   }
@@ -2732,41 +3640,68 @@ export class Kernel {
     }
     return this.store
       .listMessages(run.sessionId)
-      .filter((message) => message.runId === runId && message.role === "assistant")
+      .filter(
+        (message) => message.runId === runId && message.role === "assistant",
+      )
       .sort(compareMessagesForTimeline);
   }
 
-  private buildProviderInputForExistingRun(run: Run): { provider: ProviderAdapter; input: ProviderRunInput } {
+  private buildProviderInputForExistingRun(run: Run): {
+    provider: ProviderAdapter;
+    input: ProviderRunInput;
+  } {
     const currentSession = this.getSession(run.sessionId);
-    const session = { ...currentSession, workingDirectory: stringField(run.metadata,"workingDirectory") || currentSession.workingDirectory };
+    const session = {
+      ...currentSession,
+      workingDirectory:
+        stringField(run.metadata, "workingDirectory") ||
+        currentSession.workingDirectory,
+    };
     const agent = this.getAgentForRun(run);
     const executionSnapshot = executionSnapshotFromRunMetadata(run.metadata);
-    const providerProfileId = executionSnapshot?.providerProfileId ?? (stringField(run.metadata, "providerProfileId") || run.provider);
+    const providerProfileId =
+      executionSnapshot?.providerProfileId ??
+      (stringField(run.metadata, "providerProfileId") || run.provider);
     const resolvedProvider = this.resolveSavedProvider(providerProfileId);
-    const effectiveRunOptions = executionSnapshot?.runOptions ?? runOptionsFromJson(run.metadata.runOptions) ?? run.runOptions ?? {};
+    const effectiveRunOptions =
+      executionSnapshot?.runOptions ??
+      runOptionsFromJson(run.metadata.runOptions) ??
+      run.runOptions ??
+      {};
     const requestedRunOptions =
-      executionSnapshot?.requestedRunOptions ?? runOptionsFromJson(run.metadata.requestedRunOptions) ?? effectiveRunOptions;
+      executionSnapshot?.requestedRunOptions ??
+      runOptionsFromJson(run.metadata.requestedRunOptions) ??
+      effectiveRunOptions;
     const unsupportedRunOptions =
       executionSnapshot?.unsupportedRunOptions ??
       (Array.isArray(run.metadata.unsupportedRunOptions)
-        ? run.metadata.unsupportedRunOptions.filter((value): value is string => typeof value === "string")
+        ? run.metadata.unsupportedRunOptions.filter(
+            (value): value is string => typeof value === "string",
+          )
         : []);
     const contextHistory = this.contextHistoryForSession(session);
-    const sourceMessages = contextHistory.messages.filter((message) => message.runId !== run.id || message.role !== "assistant");
-    const currentUserMessageId = sourceMessages.find((message) => message.runId === run.id && message.role === "user")?.id;
+    const sourceMessages = contextHistory.messages.filter(
+      (message) => message.runId !== run.id || message.role !== "assistant",
+    );
+    const currentUserMessageId = sourceMessages.find(
+      (message) => message.runId === run.id && message.role === "user",
+    )?.id;
     const contextResult = this.buildContext({
       session,
       agent,
       messages: sourceMessages,
       providerProfileId: resolvedProvider.profile.id,
       runOptions: effectiveRunOptions,
-      availableTools: this.getAvailableToolsForAgent(agent,session),
+      availableTools: this.getAvailableToolsForAgent(agent, session),
       metadata: { runId: run.id, resumed: true },
       activeSegmentId: session.activeSegmentId,
       compactionArtifact: contextHistory.artifact,
-      resolvedBudget: contextBudgetFromMetadata(contextPlanObject(contextPlanRecordObjects(run.metadata).at(-1))) ?? undefined,
+      resolvedBudget:
+        contextBudgetFromMetadata(
+          contextPlanObject(contextPlanRecordObjects(run.metadata).at(-1)),
+        ) ?? undefined,
       currentMessageId: currentUserMessageId,
-      providerOverhead: resolvedProvider.adapter.contextPlanning
+      providerOverhead: resolvedProvider.adapter.contextPlanning,
     });
     return {
       provider: resolvedProvider.adapter,
@@ -2779,37 +3714,59 @@ export class Kernel {
         credential: resolvedProvider.credential,
         requestedRunOptions,
         runOptions: effectiveRunOptions,
-        unsupportedRunOptions
-      }
+        unsupportedRunOptions,
+      },
     };
   }
 
   private resolveSavedProvider(providerProfileId: string) {
-    const exactResolver = (this.providers as ProviderRegistry & { resolveRunExact?: ProviderRegistry["resolveRunExact"] }).resolveRunExact;
+    const exactResolver = (
+      this.providers as ProviderRegistry & {
+        resolveRunExact?: ProviderRegistry["resolveRunExact"];
+      }
+    ).resolveRunExact;
     if (typeof exactResolver === "function") {
       return exactResolver.call(this.providers, providerProfileId);
     }
     const resolved = this.providers.resolveRun({ providerProfileId });
-    if (resolved.profile.id !== providerProfileId || resolved.providerResolution.fallback) {
+    if (
+      resolved.profile.id !== providerProfileId ||
+      resolved.providerResolution.fallback
+    ) {
       throw new Error(
-        `Saved provider profile '${providerProfileId}' is unavailable; this run was not switched to fallback provider '${resolved.profile.id}'.`
+        `Saved provider profile '${providerProfileId}' is unavailable; this run was not switched to fallback provider '${resolved.profile.id}'.`,
       );
     }
     return resolved;
   }
 
-  private agentDefaultsForProvider(agent: AgentDefinition, resolvedProviderProfileId: string, options: StartRunOptions): RunOptions | null {
-    const hasProviderOverride = Boolean(options.provider?.trim() || options.providerProfileId?.trim());
+  private agentDefaultsForProvider(
+    agent: AgentDefinition,
+    resolvedProviderProfileId: string,
+    options: StartRunOptions,
+  ): RunOptions | null {
+    const hasProviderOverride = Boolean(
+      options.provider?.trim() || options.providerProfileId?.trim(),
+    );
     if (!hasProviderOverride) {
       return agent.defaultRunOptions;
     }
-    const profileProviderProfileId = agent.modelProfileId ?? this.providers.list().defaultProviderProfileId;
-    return profileProviderProfileId === resolvedProviderProfileId ? agent.defaultRunOptions : null;
+    const profileProviderProfileId =
+      agent.modelProfileId ?? this.providers.list().defaultProviderProfileId;
+    return profileProviderProfileId === resolvedProviderProfileId
+      ? agent.defaultRunOptions
+      : null;
   }
 
   private getAvailableToolsForAgent(agent: AgentDefinition, session: Session) {
     const toolIds = effectiveAgentToolIds(agent);
-    const tools = this.tools.list().filter((tool) => toolIds.includes(tool.id) && (!session.parentSessionId || tool.id !== "subsession.start"));
+    const tools = this.tools
+      .list()
+      .filter(
+        (tool) =>
+          toolIds.includes(tool.id) &&
+          (!session.parentSessionId || tool.id !== "subsession.start"),
+      );
     return tools.flatMap((tool) => {
       const modelTool = toModelToolDefinition(tool);
       return modelTool ? [modelTool] : [];
@@ -2825,7 +3782,9 @@ export class Kernel {
           error.message,
           400,
           error.code,
-          error instanceof ContextSummaryExceedsBudgetError ? { ...error.details, artifactId: error.artifactId } : error.details
+          error instanceof ContextSummaryExceedsBudgetError
+            ? { ...error.details, artifactId: error.artifactId }
+            : error.details,
         );
       }
       if (error instanceof InvalidContextPolicyError) {
@@ -2837,22 +3796,47 @@ export class Kernel {
 
   private contextHistoryForSession(session: Session) {
     const segment = this.store.getContextSegment(session.activeSegmentId);
-    if (!segment || segment.status !== "active" || segment.sessionId !== session.id) {
-      throw new KernelError("Session context segment is unavailable or inconsistent.", 409, "context_segment_mismatch");
+    if (
+      !segment ||
+      segment.status !== "active" ||
+      segment.sessionId !== session.id
+    ) {
+      throw new KernelError(
+        "Session context segment is unavailable or inconsistent.",
+        409,
+        "context_segment_mismatch",
+      );
     }
-    const artifact = segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null;
-    if (segment.inheritedArtifactId && (!artifact || artifact.status !== "completed" || artifact.targetSegmentId !== segment.id)) {
-      throw new KernelError("Inherited context artifact is unavailable or inconsistent.", 409, "context_artifact_mismatch");
+    const artifact = segment.inheritedArtifactId
+      ? this.store.getContextArtifact(segment.inheritedArtifactId)
+      : null;
+    if (
+      segment.inheritedArtifactId &&
+      (!artifact ||
+        artifact.status !== "completed" ||
+        artifact.targetSegmentId !== segment.id)
+    ) {
+      throw new KernelError(
+        "Inherited context artifact is unavailable or inconsistent.",
+        409,
+        "context_artifact_mismatch",
+      );
     }
     if (artifact) {
-      const sourceSegment = this.store.getContextSegment(artifact.sourceSegmentId);
+      const sourceSegment = this.store.getContextSegment(
+        artifact.sourceSegmentId,
+      );
       if (
         !sourceSegment ||
         sourceSegment.status !== "sealed" ||
         sourceSegment.firstMessageId !== artifact.sourceFirstMessageId ||
         sourceSegment.lastMessageId !== artifact.sourceLastMessageId
       ) {
-        throw new KernelError("Inherited context artifact source boundary is inconsistent.", 409, "context_artifact_mismatch");
+        throw new KernelError(
+          "Inherited context artifact source boundary is inconsistent.",
+          409,
+          "context_artifact_mismatch",
+        );
       }
     }
     return { messages: this.store.listMessagesBySegment(segment.id), artifact };
@@ -2861,31 +3845,50 @@ export class Kernel {
   private coordinateCompaction(
     sessionId: string,
     automaticRun: Run | null,
-    parentSignal?: AbortSignal
+    parentSignal?: AbortSignal,
   ): Promise<CompactContextResponse> {
     const existing = this.compactions.get(sessionId);
     if (existing) {
-      throw new KernelError("Context compaction is already in progress for this session.", 409, "context_compaction_conflict");
+      throw new KernelError(
+        "Context compaction is already in progress for this session.",
+        409,
+        "context_compaction_conflict",
+      );
     }
     const controller = new AbortController();
     const timeout = setTimeout(
-      () => controller.abort(new Error(`Context compaction timed out after ${compactionTimeoutMs / 1000}s.`)),
-      compactionTimeoutMs
+      () =>
+        controller.abort(
+          new Error(
+            `Context compaction timed out after ${compactionTimeoutMs / 1000}s.`,
+          ),
+        ),
+      compactionTimeoutMs,
     );
     if (parentSignal?.aborted) {
       controller.abort(parentSignal.reason);
     } else {
-      parentSignal?.addEventListener("abort", () => controller.abort(parentSignal.reason), { once: true });
+      parentSignal?.addEventListener(
+        "abort",
+        () => controller.abort(parentSignal.reason),
+        { once: true },
+      );
     }
     this.compactionControllers.set(sessionId, controller);
-    const operation = this.performContextCompaction(sessionId, automaticRun, controller.signal)
-      .catch((error) => this.recordEarlyCompactionFailure(sessionId, automaticRun, error))
+    const operation = this.performContextCompaction(
+      sessionId,
+      automaticRun,
+      controller.signal,
+    )
+      .catch((error) =>
+        this.recordEarlyCompactionFailure(sessionId, automaticRun, error),
+      )
       .finally(() => {
-      if (this.compactions.get(sessionId) === operation) {
-        clearTimeout(timeout);
-        this.compactions.delete(sessionId);
-        this.compactionControllers.delete(sessionId);
-      }
+        if (this.compactions.get(sessionId) === operation) {
+          clearTimeout(timeout);
+          this.compactions.delete(sessionId);
+          this.compactionControllers.delete(sessionId);
+        }
       });
     this.compactions.set(sessionId, operation);
     return operation;
@@ -2894,32 +3897,66 @@ export class Kernel {
   private async performContextCompaction(
     sessionId: string,
     automaticRun: Run | null,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): Promise<CompactContextResponse> {
     const session = this.getSession(sessionId);
     const segment = this.store.getContextSegment(session.activeSegmentId);
     if (!segment || segment.status !== "active") {
-      throw new KernelError("Active context segment is unavailable.", 409, "context_segment_mismatch");
+      throw new KernelError(
+        "Active context segment is unavailable.",
+        409,
+        "context_segment_mismatch",
+      );
     }
     const allMessages = this.store.listMessagesBySegment(segment.id);
-    const sourcePlan = selectCompactionSource(allMessages, automaticRun?.id ?? null);
-    if (sourcePlan.sourceMessages.length === 0 && !segment.inheritedArtifactId) {
-      return { state: "noop", segment, artifact: null, message: "No eligible finalized prefix is available." };
+    const sourcePlan = selectCompactionSource(
+      allMessages,
+      automaticRun?.id ?? null,
+    );
+    if (
+      sourcePlan.sourceMessages.length === 0 &&
+      !segment.inheritedArtifactId
+    ) {
+      return {
+        state: "noop",
+        segment,
+        artifact: null,
+        message: "No eligible finalized prefix is available.",
+      };
     }
-    const agent = automaticRun ? this.getAgentForRun(automaticRun) : this.resolveAgentForSession(session);
-    const executionSnapshot = automaticRun ? executionSnapshotFromRunMetadata(automaticRun.metadata) : null;
+    const agent = automaticRun
+      ? this.getAgentForRun(automaticRun)
+      : this.resolveAgentForSession(session);
+    const executionSnapshot = automaticRun
+      ? executionSnapshotFromRunMetadata(automaticRun.metadata)
+      : null;
     const recordedProviderProfileId =
-      executionSnapshot?.providerProfileId ?? (automaticRun ? stringField(automaticRun.metadata, "providerProfileId") : "");
-    const providerProfileId = recordedProviderProfileId || agent.modelProfileId || this.providers.list().defaultProviderProfileId;
+      executionSnapshot?.providerProfileId ??
+      (automaticRun
+        ? stringField(automaticRun.metadata, "providerProfileId")
+        : "");
+    const providerProfileId =
+      recordedProviderProfileId ||
+      agent.modelProfileId ||
+      this.providers.list().defaultProviderProfileId;
     const resolvedProvider = this.resolveSavedProvider(providerProfileId);
     const optionPlan = buildRunOptionPlan(
       resolvedProvider.profile,
-      executionSnapshot?.runOptions ?? automaticRun?.runOptions ?? agent.defaultRunOptions ?? {}
+      executionSnapshot?.runOptions ??
+        automaticRun?.runOptions ??
+        agent.defaultRunOptions ??
+        {},
     );
-    const model = optionPlan.runOptions.model ?? resolvedProvider.profile.model ?? null;
-    const capability = await this.getModelContextCapability(resolvedProvider.profile.id, model);
+    const model =
+      optionPlan.runOptions.model ?? resolvedProvider.profile.model ?? null;
+    const capability = await this.getModelContextCapability(
+      resolvedProvider.profile.id,
+      model,
+    );
     const budget = resolveContextBudget(capability, agent.contextPolicy);
-    const previousArtifact = segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null;
+    const previousArtifact = segment.inheritedArtifactId
+      ? this.store.getContextArtifact(segment.inheritedArtifactId)
+      : null;
     if (
       previousArtifact &&
       this.inheritedSummaryExceedsBudget(
@@ -2930,7 +3967,7 @@ export class Kernel {
         resolvedProvider.adapter,
         resolvedProvider.profile.id,
         optionPlan.runOptions,
-        budget
+        budget,
       )
     ) {
       return this.performSummaryOnlyRecovery({
@@ -2942,7 +3979,7 @@ export class Kernel {
         optionPlan,
         budget,
         signal,
-        automaticRun
+        automaticRun,
       });
     }
     if (sourcePlan.sourceMessages.length === 0) {
@@ -2951,10 +3988,15 @@ export class Kernel {
           runId: automaticRun.id,
           sessionId,
           segmentId: segment.id,
-          reason: "no_finalized_prefix"
+          reason: "no_finalized_prefix",
         });
       }
-      return { state: "noop", segment, artifact: null, message: "No eligible finalized prefix is available." };
+      return {
+        state: "noop",
+        segment,
+        artifact: null,
+        message: "No eligible finalized prefix is available.",
+      };
     }
     const createdAt = new Date().toISOString();
     const artifactId = randomUUID();
@@ -2965,7 +4007,7 @@ export class Kernel {
         artifactId,
         sourceSegmentId: segment.id,
         providerProfileId: resolvedProvider.profile.id,
-        model
+        model,
       });
     }
 
@@ -2973,7 +4015,10 @@ export class Kernel {
     let selectedMessages = selectedEntries.flatMap((entry) => entry.messages);
     let contextResult: ReturnType<typeof buildContext> | null = null;
     while (selectedMessages.length > 0) {
-      const summaryInput = buildCompactionInput(previousArtifact?.summary ?? null, selectedEntries);
+      const summaryInput = buildCompactionInput(
+        previousArtifact?.summary ?? null,
+        selectedEntries,
+      );
       try {
         contextResult = this.buildContext({
           session,
@@ -2982,21 +4027,27 @@ export class Kernel {
             systemPrompt: compactionSystemPrompt,
             toolIds: [],
             skillIds: [],
-            contextPolicy: agent.contextPolicy
+            contextPolicy: agent.contextPolicy,
           },
           messages: [],
-          currentMessage: { content: summaryInput, messageId: `compaction:${artifactId}` },
+          currentMessage: {
+            content: summaryInput,
+            messageId: `compaction:${artifactId}`,
+          },
           currentMessageId: `compaction:${artifactId}`,
           providerProfileId: resolvedProvider.profile.id,
           runOptions: { ...optionPlan.runOptions, temperature: 0 },
           availableTools: [],
           resolvedBudget: budget,
           providerOverhead: resolvedProvider.adapter.contextPlanning,
-          activeSegmentId: segment.id
+          activeSegmentId: segment.id,
         });
         break;
       } catch (error) {
-        if (!(error instanceof KernelError) || error.code !== "context_budget_exceeded") {
+        if (
+          !(error instanceof KernelError) ||
+          error.code !== "context_budget_exceeded"
+        ) {
           throw error;
         }
         selectedEntries = selectedEntries.slice(0, -1);
@@ -3015,20 +4066,34 @@ export class Kernel {
         providerProfileId: resolvedProvider.profile.id,
         model,
         error: "No eligible source prefix fits the compaction provider budget.",
-        automaticRun
+        automaticRun,
       });
     }
 
     const selectedIds = new Set(selectedMessages.map((message) => message.id));
-    const preservedMessageIds = allMessages.filter((message) => !selectedIds.has(message.id)).map((message) => message.id);
-    const segmentRuns = this.store.listRuns({ sessionId }).filter((candidate) => candidate.segmentId === segment.id);
-    const sourceRunIds = [...new Set(selectedMessages.flatMap((message) => (message.runId ? [message.runId] : [])))];
+    const preservedMessageIds = allMessages
+      .filter((message) => !selectedIds.has(message.id))
+      .map((message) => message.id);
+    const segmentRuns = this.store
+      .listRuns({ sessionId })
+      .filter((candidate) => candidate.segmentId === segment.id);
+    const sourceRunIds = [
+      ...new Set(
+        selectedMessages.flatMap((message) =>
+          message.runId ? [message.runId] : [],
+        ),
+      ),
+    ];
     const sourceRunSet = new Set(sourceRunIds);
-    const preservedRunIds = segmentRuns.filter((candidate) => !sourceRunSet.has(candidate.id)).map((candidate) => candidate.id);
+    const preservedRunIds = segmentRuns
+      .filter((candidate) => !sourceRunSet.has(candidate.id))
+      .map((candidate) => candidate.id);
     const collector = new CompactionCollector();
     try {
       if (signal.aborted) {
-        throw signal.reason instanceof Error ? signal.reason : new Error("Compaction cancelled.");
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Compaction cancelled.");
       }
       const providerInput: ProviderRunInput = {
         session,
@@ -3039,16 +4104,26 @@ export class Kernel {
         credential: resolvedProvider.credential,
         requestedRunOptions: optionPlan.requestedRunOptions,
         runOptions: { ...optionPlan.runOptions, temperature: 0 },
-        unsupportedRunOptions: optionPlan.unsupportedRunOptions
+        unsupportedRunOptions: optionPlan.unsupportedRunOptions,
       };
-      const result = await resolvedProvider.adapter.run(providerInput, { signal, writer: collector });
+      const result = await resolvedProvider.adapter.run(providerInput, {
+        signal,
+        writer: collector,
+      });
       if (signal.aborted) {
-        throw signal.reason instanceof Error ? signal.reason : new Error("Compaction cancelled.");
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new Error("Compaction cancelled.");
       }
       if (result.toolCalls.length > 0) {
-        throw new Error("Compaction provider returned a tool call instead of a summary.");
+        throw new Error(
+          "Compaction provider returned a tool call instead of a summary.",
+        );
       }
-      const summary = validatedCompactionSummary(collector.text, budget.inputBudgetTokens);
+      const summary = validatedCompactionSummary(
+        collector.text,
+        budget.inputBudgetTokens,
+      );
       const sourceMessageIds = selectedMessages.map((message) => message.id);
       const artifact: ContextArtifact = {
         id: artifactId,
@@ -3064,7 +4139,12 @@ export class Kernel {
         summary,
         strategyVersion: compactionStrategyVersion,
         estimatorVersion: contextEstimatorVersion,
-        estimatedTokensBefore: estimateTextTokens(buildCompactionInput(previousArtifact?.summary ?? null, selectedEntries)),
+        estimatedTokensBefore: estimateTextTokens(
+          buildCompactionInput(
+            previousArtifact?.summary ?? null,
+            selectedEntries,
+          ),
+        ),
         estimatedTokensAfter: estimateTextTokens(summary),
         resolvedWindowTokens: budget.windowTokens,
         windowSource: budget.windowSource,
@@ -3073,7 +4153,7 @@ export class Kernel {
         model,
         usage: collector.usage,
         error: null,
-        createdAt
+        createdAt,
       };
       const rotated = this.store.rotateContextSegment({
         sessionId,
@@ -3084,7 +4164,7 @@ export class Kernel {
         preservedRunIds,
         artifact,
         rotatedAt: new Date().toISOString(),
-        ...(automaticRun ? { allowedActiveRunId: automaticRun.id } : {})
+        ...(automaticRun ? { allowedActiveRunId: automaticRun.id } : {}),
       });
       if (!rotated) {
         throw new Error("Context segment rotation lost its concurrency check.");
@@ -3092,8 +4172,11 @@ export class Kernel {
       if (automaticRun) {
         this.store.mergeRunMetadata(
           automaticRun.id,
-          { contextCompactionArtifactId: artifact.id, contextCompactionUsage: runUsageToJson(collector.usage) },
-          new Date().toISOString()
+          {
+            contextCompactionArtifactId: artifact.id,
+            contextCompactionUsage: runUsageToJson(collector.usage),
+          },
+          new Date().toISOString(),
         );
         this.emit(automaticRun, "context_compaction_completed", {
           runId: automaticRun.id,
@@ -3105,17 +4188,21 @@ export class Kernel {
           estimatedTokensAfter: artifact.estimatedTokensAfter,
           providerProfileId: artifact.providerProfileId,
           model: artifact.model,
-          usage: artifact.usage
+          usage: artifact.usage,
         });
         this.emit(automaticRun, "segment_rotated", {
           runId: automaticRun.id,
           sessionId,
           artifactId: artifact.id,
           sourceSegmentId: segment.id,
-          targetSegmentId: rotated.segment.id
+          targetSegmentId: rotated.segment.id,
         });
       }
-      return { state: "completed", segment: rotated.segment, artifact: rotated.artifact };
+      return {
+        state: "completed",
+        segment: rotated.segment,
+        artifact: rotated.artifact,
+      };
     } catch (error) {
       return this.recordCompactionFailure({
         session,
@@ -3129,7 +4216,7 @@ export class Kernel {
         model,
         error: sanitizedCompactionError(error),
         usage: collector.usage,
-        automaticRun
+        automaticRun,
       });
     }
   }
@@ -3162,7 +4249,12 @@ export class Kernel {
       summary: "",
       strategyVersion: compactionStrategyVersion,
       estimatorVersion: contextEstimatorVersion,
-      estimatedTokensBefore: estimateTextTokens(buildCompactionInput(null, entriesFromCategories(input.sourceMessages, input.sourceCategories))),
+      estimatedTokensBefore: estimateTextTokens(
+        buildCompactionInput(
+          null,
+          entriesFromCategories(input.sourceMessages, input.sourceCategories),
+        ),
+      ),
       estimatedTokensAfter: 0,
       resolvedWindowTokens: input.budget.windowTokens,
       windowSource: input.budget.windowSource,
@@ -3171,7 +4263,7 @@ export class Kernel {
       model: input.model,
       usage: input.usage ?? null,
       error: input.error,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
     });
     if (input.automaticRun) {
       this.emit(input.automaticRun, "context_compaction_failed", {
@@ -3182,33 +4274,61 @@ export class Kernel {
         providerProfileId: input.providerProfileId,
         model: input.model,
         usage: artifact.usage,
-        error: artifact.error
+        error: artifact.error,
       });
     }
-    return { state: "failed", segment: this.store.getContextSegment(input.segmentId)!, artifact, message: input.error };
+    return {
+      state: "failed",
+      segment: this.store.getContextSegment(input.segmentId)!,
+      artifact,
+      message: input.error,
+    };
   }
 
-  private recordEarlyCompactionFailure(sessionId: string, automaticRun: Run | null, error: unknown): CompactContextResponse {
+  private recordEarlyCompactionFailure(
+    sessionId: string,
+    automaticRun: Run | null,
+    error: unknown,
+  ): CompactContextResponse {
     const session = this.getSession(sessionId);
     const segment = this.store.getContextSegment(session.activeSegmentId);
     if (!segment || segment.status !== "active") throw error;
-    const previous = segment.inheritedArtifactId ? this.store.getContextArtifact(segment.inheritedArtifactId) : null;
-    const sourcePlan = selectCompactionSource(this.store.listMessagesBySegment(segment.id), automaticRun?.id ?? null);
+    const previous = segment.inheritedArtifactId
+      ? this.store.getContextArtifact(segment.inheritedArtifactId)
+      : null;
+    const sourcePlan = selectCompactionSource(
+      this.store.listMessagesBySegment(segment.id),
+      automaticRun?.id ?? null,
+    );
     const sourceMessageIds =
-      sourcePlan.sourceMessages.length > 0 ? sourcePlan.sourceMessages.map((message) => message.id) : previous?.sourceMessageIds ?? [];
+      sourcePlan.sourceMessages.length > 0
+        ? sourcePlan.sourceMessages.map((message) => message.id)
+        : (previous?.sourceMessageIds ?? []);
     const sourceCategories =
       sourcePlan.entries.length > 0
         ? sourcePlan.entries.map((entry) => entry.category)
         : previous
-          ? [{ category: "summary_recovery" as const, messageIds: previous.sourceMessageIds, runId: null, status: "resolution_failed" }]
+          ? [
+              {
+                category: "summary_recovery" as const,
+                messageIds: previous.sourceMessageIds,
+                runId: null,
+                status: "resolution_failed",
+              },
+            ]
           : [];
-    const summaryRecoveryAttempt = sourcePlan.sourceMessages.length === 0 && previous !== null;
-    const agent = automaticRun ? this.getAgentForRun(automaticRun) : this.resolveAgentForSession(session);
+    const summaryRecoveryAttempt =
+      sourcePlan.sourceMessages.length === 0 && previous !== null;
+    const agent = automaticRun
+      ? this.getAgentForRun(automaticRun)
+      : this.resolveAgentForSession(session);
     const artifact = this.store.createContextArtifact({
       id: randomUUID(),
       kind: "compaction",
       sessionId,
-      sourceSegmentId: summaryRecoveryAttempt ? previous.sourceSegmentId : segment.id,
+      sourceSegmentId: summaryRecoveryAttempt
+        ? previous.sourceSegmentId
+        : segment.id,
       targetSegmentId: summaryRecoveryAttempt ? segment.id : null,
       previousArtifactId: previous?.id ?? null,
       sourceMessageIds,
@@ -3223,11 +4343,14 @@ export class Kernel {
       resolvedWindowTokens: 16_384,
       windowSource: "assumed",
       status: "failed",
-      providerProfileId: automaticRun ? stringField(automaticRun.metadata, "providerProfileId") || agent.modelProfileId : agent.modelProfileId,
+      providerProfileId: automaticRun
+        ? stringField(automaticRun.metadata, "providerProfileId") ||
+          agent.modelProfileId
+        : agent.modelProfileId,
       model: automaticRun?.model ?? agent.defaultRunOptions?.model ?? null,
       usage: null,
       error: sanitizedCompactionError(error),
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
     });
     if (automaticRun) {
       this.emit(automaticRun, "context_compaction_failed", {
@@ -3237,10 +4360,15 @@ export class Kernel {
         sourceSegmentId: artifact.sourceSegmentId,
         providerProfileId: artifact.providerProfileId,
         model: artifact.model,
-        error: artifact.error
+        error: artifact.error,
       });
     }
-    return { state: "failed", segment, artifact, message: artifact.error ?? undefined };
+    return {
+      state: "failed",
+      segment,
+      artifact,
+      message: artifact.error ?? undefined,
+    };
   }
 
   private inheritedSummaryExceedsBudget(
@@ -3251,7 +4379,7 @@ export class Kernel {
     adapter: ProviderAdapter,
     providerProfileId: string,
     runOptions: RunOptions,
-    budget: ReturnType<typeof resolveContextBudget>
+    budget: ReturnType<typeof resolveContextBudget>,
   ): boolean {
     try {
       this.buildContext({
@@ -3260,15 +4388,19 @@ export class Kernel {
         messages: [],
         providerProfileId,
         runOptions,
-        availableTools: this.getAvailableToolsForAgent(agent,session),
+        availableTools: this.getAvailableToolsForAgent(agent, session),
         resolvedBudget: budget,
         providerOverhead: adapter.contextPlanning,
         activeSegmentId,
-        compactionArtifact: artifact
+        compactionArtifact: artifact,
       });
       return false;
     } catch (error) {
-      if (error instanceof KernelError && error.code === "context_summary_exceeds_budget") return true;
+      if (
+        error instanceof KernelError &&
+        error.code === "context_summary_exceeds_budget"
+      )
+        return true;
       throw error;
     }
   }
@@ -3289,7 +4421,7 @@ export class Kernel {
       category: "summary_recovery",
       messageIds: input.previousArtifact.sourceMessageIds,
       runId: null,
-      status: "completed_artifact"
+      status: "completed_artifact",
     };
     if (input.automaticRun) {
       this.emit(input.automaticRun, "context_compaction_started", {
@@ -3300,22 +4432,36 @@ export class Kernel {
         targetSegmentId: input.segment.id,
         reason: "summary_only_recovery",
         providerProfileId: input.resolvedProvider.profile.id,
-        model: input.optionPlan.runOptions.model ?? input.resolvedProvider.profile.model ?? null
+        model:
+          input.optionPlan.runOptions.model ??
+          input.resolvedProvider.profile.model ??
+          null,
       });
     }
     let contextResult: ReturnType<typeof buildContext> | null = null;
     let reducedSource = input.previousArtifact.summary;
     let maxChars = reducedSource.length;
     while (maxChars >= 64) {
-      reducedSource = boundHistoricalContextText(input.previousArtifact.summary, maxChars);
+      reducedSource = boundHistoricalContextText(
+        input.previousArtifact.summary,
+        maxChars,
+      );
       try {
         contextResult = this.buildContext({
           session: input.session,
-          agent: { ...input.agent, systemPrompt: compactionSystemPrompt, toolIds: [], skillIds: [] },
+          agent: {
+            ...input.agent,
+            systemPrompt: compactionSystemPrompt,
+            toolIds: [],
+            skillIds: [],
+          },
           messages: [],
           currentMessage: {
-            content: buildSummaryRecoveryInput(input.previousArtifact.id, reducedSource),
-            messageId: `summary-recovery:${artifactId}`
+            content: buildSummaryRecoveryInput(
+              input.previousArtifact.id,
+              reducedSource,
+            ),
+            messageId: `summary-recovery:${artifactId}`,
           },
           currentMessageId: `summary-recovery:${artifactId}`,
           providerProfileId: input.resolvedProvider.profile.id,
@@ -3323,17 +4469,24 @@ export class Kernel {
           availableTools: [],
           resolvedBudget: input.budget,
           providerOverhead: input.resolvedProvider.adapter.contextPlanning,
-          activeSegmentId: input.segment.id
+          activeSegmentId: input.segment.id,
         });
         break;
       } catch (error) {
-        if (!(error instanceof KernelError) || error.code !== "context_budget_exceeded") throw error;
+        if (
+          !(error instanceof KernelError) ||
+          error.code !== "context_budget_exceeded"
+        )
+          throw error;
         maxChars = Math.floor(maxChars * 0.75);
       }
     }
     const collector = new CompactionCollector();
     try {
-      if (!contextResult) throw new Error("The inherited summary cannot fit the current provider budget even after deterministic reduction.");
+      if (!contextResult)
+        throw new Error(
+          "The inherited summary cannot fit the current provider budget even after deterministic reduction.",
+        );
       const providerInput: ProviderRunInput = {
         session: input.session,
         context: contextResult.context,
@@ -3343,12 +4496,22 @@ export class Kernel {
         credential: input.resolvedProvider.credential,
         requestedRunOptions: input.optionPlan.requestedRunOptions,
         runOptions: { ...input.optionPlan.runOptions, temperature: 0 },
-        unsupportedRunOptions: input.optionPlan.unsupportedRunOptions
+        unsupportedRunOptions: input.optionPlan.unsupportedRunOptions,
       };
-      const result = await input.resolvedProvider.adapter.run(providerInput, { signal: input.signal, writer: collector });
-      if (input.signal.aborted) throw input.signal.reason instanceof Error ? input.signal.reason : new Error("Summary recovery cancelled.");
-      if (result.toolCalls.length > 0) throw new Error("Summary recovery provider returned a tool call.");
-      const summary = validatedCompactionSummary(collector.text, input.budget.inputBudgetTokens);
+      const result = await input.resolvedProvider.adapter.run(providerInput, {
+        signal: input.signal,
+        writer: collector,
+      });
+      if (input.signal.aborted)
+        throw input.signal.reason instanceof Error
+          ? input.signal.reason
+          : new Error("Summary recovery cancelled.");
+      if (result.toolCalls.length > 0)
+        throw new Error("Summary recovery provider returned a tool call.");
+      const summary = validatedCompactionSummary(
+        collector.text,
+        input.budget.inputBudgetTokens,
+      );
       const artifact: ContextArtifact = {
         id: artifactId,
         kind: "compaction",
@@ -3363,25 +4526,33 @@ export class Kernel {
         summary,
         strategyVersion: "continuity-summary-recovery-v1",
         estimatorVersion: contextEstimatorVersion,
-        estimatedTokensBefore: estimateTextTokens(input.previousArtifact.summary),
+        estimatedTokensBefore: estimateTextTokens(
+          input.previousArtifact.summary,
+        ),
         estimatedTokensAfter: estimateTextTokens(summary),
         resolvedWindowTokens: input.budget.windowTokens,
         windowSource: input.budget.windowSource,
         status: "completed",
         providerProfileId: input.resolvedProvider.profile.id,
-        model: input.optionPlan.runOptions.model ?? input.resolvedProvider.profile.model ?? null,
+        model:
+          input.optionPlan.runOptions.model ??
+          input.resolvedProvider.profile.model ??
+          null,
         usage: collector.usage,
         error: null,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
       };
       const replaced = this.store.replaceInheritedContextArtifact({
         sessionId: input.session.id,
         expectedActiveSegmentId: input.segment.id,
         expectedArtifactId: input.previousArtifact.id,
         artifact,
-        updatedAt: artifact.createdAt
+        updatedAt: artifact.createdAt,
       });
-      if (!replaced) throw new Error("Inherited summary recovery lost its segment/artifact CAS.");
+      if (!replaced)
+        throw new Error(
+          "Inherited summary recovery lost its segment/artifact CAS.",
+        );
       if (input.automaticRun) {
         this.emit(input.automaticRun, "context_compaction_completed", {
           runId: input.automaticRun.id,
@@ -3394,10 +4565,14 @@ export class Kernel {
           estimatedTokensAfter: artifact.estimatedTokensAfter,
           providerProfileId: artifact.providerProfileId,
           model: artifact.model,
-          usage: artifact.usage
+          usage: artifact.usage,
         });
       }
-      return { state: "completed", segment: replaced.segment, artifact: replaced.artifact };
+      return {
+        state: "completed",
+        segment: replaced.segment,
+        artifact: replaced.artifact,
+      };
     } catch (error) {
       const failed = this.store.createContextArtifact({
         id: artifactId,
@@ -3413,16 +4588,21 @@ export class Kernel {
         summary: "",
         strategyVersion: "continuity-summary-recovery-v1",
         estimatorVersion: contextEstimatorVersion,
-        estimatedTokensBefore: estimateTextTokens(input.previousArtifact.summary),
+        estimatedTokensBefore: estimateTextTokens(
+          input.previousArtifact.summary,
+        ),
         estimatedTokensAfter: 0,
         resolvedWindowTokens: input.budget.windowTokens,
         windowSource: input.budget.windowSource,
         status: "failed",
         providerProfileId: input.resolvedProvider.profile.id,
-        model: input.optionPlan.runOptions.model ?? input.resolvedProvider.profile.model ?? null,
+        model:
+          input.optionPlan.runOptions.model ??
+          input.resolvedProvider.profile.model ??
+          null,
         usage: collector.usage,
         error: sanitizedCompactionError(error),
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
       });
       if (input.automaticRun) {
         this.emit(input.automaticRun, "context_compaction_failed", {
@@ -3432,26 +4612,49 @@ export class Kernel {
           sourceSegmentId: failed.sourceSegmentId,
           targetSegmentId: input.segment.id,
           reason: "summary_only_recovery",
-          error: failed.error
+          error: failed.error,
         });
       }
-      return { state: "failed", segment: this.store.getContextSegment(input.segment.id)!, artifact: failed, message: failed.error ?? undefined };
+      return {
+        state: "failed",
+        segment: this.store.getContextSegment(input.segment.id)!,
+        artifact: failed,
+        message: failed.error ?? undefined,
+      };
     }
   }
 
-  private async getModelContextCapability(providerProfileId: string, modelId: string | null | undefined) {
+  private async getModelContextCapability(
+    providerProfileId: string,
+    modelId: string | null | undefined,
+  ) {
     const registry = this.providers as ProviderRegistry & {
       resolveModelContextCapability?: ProviderRegistry["resolveModelContextCapability"];
       getModelContextCapability?: ProviderRegistry["getModelContextCapability"];
     };
     if (typeof registry.resolveModelContextCapability === "function") {
-      return registry.resolveModelContextCapability.call(this.providers, providerProfileId, modelId);
+      return registry.resolveModelContextCapability.call(
+        this.providers,
+        providerProfileId,
+        modelId,
+      );
     }
-    return registry.getModelContextCapability?.call(this.providers, providerProfileId, modelId) ?? null;
+    return (
+      registry.getModelContextCapability?.call(
+        this.providers,
+        providerProfileId,
+        modelId,
+      ) ?? null
+    );
   }
 
-  private resolveAgentForSession(session: Session, explicitAgentId?: string): AgentDefinition {
-    return this.getAgentDefinition(explicitAgentId?.trim() || session.agentId || defaultAgentId);
+  private resolveAgentForSession(
+    session: Session,
+    explicitAgentId?: string,
+  ): AgentDefinition {
+    return this.getAgentDefinition(
+      explicitAgentId?.trim() || session.agentId || defaultAgentId,
+    );
   }
 
   private getAgentForRun(run: Run): AgentDefinition {
@@ -3460,48 +4663,89 @@ export class Kernel {
       return snapshot;
     }
     const agentId = stringField(run.metadata, "agentId") || defaultAgentId;
-    const fallback = this.store.getAgentDefinition(agentId) ?? this.store.getAgentDefinition(defaultAgentId);
+    const fallback =
+      this.store.getAgentDefinition(agentId) ??
+      this.store.getAgentDefinition(defaultAgentId);
     if (!fallback) {
-      throw new KernelError("Agent snapshot and fallback profile are unavailable for this legacy run.", 409);
+      throw new KernelError(
+        "Agent snapshot and fallback profile are unavailable for this legacy run.",
+        409,
+      );
     }
     this.store.mergeRunMetadata(
       run.id,
       {
         agentSnapshotFallback: "legacy-current-profile",
-        agentSnapshotFallbackAgentId: fallback.id
+        agentSnapshotFallbackAgentId: fallback.id,
       },
-      new Date().toISOString()
+      new Date().toISOString(),
     );
     return fallback;
   }
 
   private normalizeAgentDefinition(
     input: CreateAgentDefinitionOptions,
-    existingId?: string
-  ): Omit<CreateAgentDefinitionInput, "id" | "metadata" | "createdAt" | "updatedAt"> {
+    existingId?: string,
+  ): Omit<
+    CreateAgentDefinitionInput,
+    "id" | "metadata" | "createdAt" | "updatedAt"
+  > {
     const name = input.name.trim();
     if (!name || name.length > 120 || hasControlCharacters(name)) {
-      throw new KernelError("Agent name must be 1-120 characters without control characters.", 400);
+      throw new KernelError(
+        "Agent name must be 1-120 characters without control characters.",
+        400,
+      );
     }
     const duplicate = this.store
       .listAgentDefinitions()
-      .find((agent) => agent.id !== existingId && agent.name.trim().toLocaleLowerCase() === name.toLocaleLowerCase());
+      .find(
+        (agent) =>
+          agent.id !== existingId &&
+          agent.name.trim().toLocaleLowerCase() === name.toLocaleLowerCase(),
+      );
     if (duplicate) {
-      throw new KernelError(`Agent profile name '${name}' is already in use.`, 409, "duplicate_agent_name");
+      throw new KernelError(
+        `Agent profile name '${name}' is already in use.`,
+        409,
+        "duplicate_agent_name",
+      );
     }
 
     const systemPrompt = input.systemPrompt;
-    if (!systemPrompt.trim() || systemPrompt.length > 20_000 || hasUnsafeTextControlCharacters(systemPrompt)) {
-      throw new KernelError("Agent systemPrompt must be 1-20000 characters without unsafe control characters.", 400);
+    if (
+      !systemPrompt.trim() ||
+      systemPrompt.length > 20_000 ||
+      hasUnsafeTextControlCharacters(systemPrompt)
+    ) {
+      throw new KernelError(
+        "Agent systemPrompt must be 1-20000 characters without unsafe control characters.",
+        400,
+      );
     }
     const description = input.description?.trim() || null;
-    if ((description?.length ?? 0) > 1_000 || (description ? hasUnsafeTextControlCharacters(description) : false)) {
-      throw new KernelError("Agent description must be 1000 characters or fewer without unsafe control characters.", 400);
+    if (
+      (description?.length ?? 0) > 1_000 ||
+      (description ? hasUnsafeTextControlCharacters(description) : false)
+    ) {
+      throw new KernelError(
+        "Agent description must be 1000 characters or fewer without unsafe control characters.",
+        400,
+      );
     }
 
     const modelProfileId = input.modelProfileId?.trim() || null;
-    if (modelProfileId && !this.providers.list().providers.some((profile) => profile.id === modelProfileId)) {
-      throw new KernelError(`Provider profile '${modelProfileId}' was not found.`, 400, "unknown_provider_profile");
+    if (
+      modelProfileId &&
+      !this.providers
+        .list()
+        .providers.some((profile) => profile.id === modelProfileId)
+    ) {
+      throw new KernelError(
+        `Provider profile '${modelProfileId}' was not found.`,
+        400,
+        "unknown_provider_profile",
+      );
     }
 
     const defaultRunOptions = normalizeAgentRunOptions(input.defaultRunOptions);
@@ -3510,7 +4754,11 @@ export class Kernel {
     const toolIds = normalizeAgentIdList(input.toolIds ?? [], "toolIds");
     for (const toolId of toolIds) {
       if (!this.tools.get(toolId)) {
-        throw new KernelError(`Tool '${toolId}' is not registered.`, 400, "unknown_tool");
+        throw new KernelError(
+          `Tool '${toolId}' is not registered.`,
+          400,
+          "unknown_tool",
+        );
       }
     }
 
@@ -3522,12 +4770,16 @@ export class Kernel {
       defaultRunOptions,
       contextPolicy,
       skillIds,
-      toolIds
+      toolIds,
     };
   }
 
   private nextAgentCopyName(sourceName: string): string {
-    const names = new Set(this.store.listAgentDefinitions().map((agent) => agent.name.trim().toLocaleLowerCase()));
+    const names = new Set(
+      this.store
+        .listAgentDefinitions()
+        .map((agent) => agent.name.trim().toLocaleLowerCase()),
+    );
     for (let suffix = 1; suffix <= 10_000; suffix += 1) {
       const copySuffix = ` Copy${suffix === 1 ? "" : ` ${suffix}`}`;
       const candidate = `${sourceName.slice(0, 120 - copySuffix.length).trimEnd()}${copySuffix}`;
@@ -3535,7 +4787,10 @@ export class Kernel {
         return candidate;
       }
     }
-    throw new KernelError("Unable to allocate a unique cloned agent name.", 409);
+    throw new KernelError(
+      "Unable to allocate a unique cloned agent name.",
+      409,
+    );
   }
 
   private emit(run: Run, type: RunEventType, payload: unknown): RunEvent {
@@ -3545,14 +4800,16 @@ export class Kernel {
       sessionId: run.sessionId,
       type,
       createdAt: new Date().toISOString(),
-      payload
+      payload,
     });
     this.eventBus.publish(event);
     return event;
   }
 }
 
-function normalizeAgentRunOptions(value: RunOptions | null | undefined): RunOptions | null {
+function normalizeAgentRunOptions(
+  value: RunOptions | null | undefined,
+): RunOptions | null {
   if (!value) {
     return null;
   }
@@ -3560,52 +4817,95 @@ function normalizeAgentRunOptions(value: RunOptions | null | undefined): RunOpti
   const model = value.model?.trim();
   if (model) {
     if (model.length > 200 || hasControlCharacters(model)) {
-      throw new KernelError("Agent default model must be 200 characters or fewer without control characters.", 400);
+      throw new KernelError(
+        "Agent default model must be 200 characters or fewer without control characters.",
+        400,
+      );
     }
     options.model = model;
   }
   const reasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
-  if (value.reasoningEffort && (!reasoningEffort || value.reasoningEffort.length > maxReasoningEffortLength)) {
-    throw new KernelError(`Agent default reasoning effort must be ${maxReasoningEffortLength} characters or fewer.`, 400);
+  if (
+    value.reasoningEffort &&
+    (!reasoningEffort ||
+      value.reasoningEffort.length > maxReasoningEffortLength)
+  ) {
+    throw new KernelError(
+      `Agent default reasoning effort must be ${maxReasoningEffortLength} characters or fewer.`,
+      400,
+    );
   }
   if (reasoningEffort) {
     options.reasoningEffort = reasoningEffort;
   }
   if (value.temperature !== undefined) {
-    if (!Number.isFinite(value.temperature) || value.temperature < 0 || value.temperature > 2) {
-      throw new KernelError("Agent default temperature must be between 0 and 2.", 400);
+    if (
+      !Number.isFinite(value.temperature) ||
+      value.temperature < 0 ||
+      value.temperature > 2
+    ) {
+      throw new KernelError(
+        "Agent default temperature must be between 0 and 2.",
+        400,
+      );
     }
     options.temperature = value.temperature;
   }
   return Object.keys(options).length > 0 ? options : null;
 }
 
-function normalizeAgentContextPolicy(value: AgentDefinition["contextPolicy"] | undefined): AgentDefinition["contextPolicy"] {
+function normalizeAgentContextPolicy(
+  value: AgentDefinition["contextPolicy"] | undefined,
+): AgentDefinition["contextPolicy"] {
   if (!value) {
     return null;
   }
   const policy: NonNullable<AgentDefinition["contextPolicy"]> = {};
   if (value.contextWindowTokensOverride !== undefined) {
-    if (!Number.isInteger(value.contextWindowTokensOverride) || value.contextWindowTokensOverride < 1_024 || value.contextWindowTokensOverride > 2_000_000) {
-      throw new KernelError("Agent context window override must be an integer between 1024 and 2000000 tokens.", 400);
+    if (
+      !Number.isInteger(value.contextWindowTokensOverride) ||
+      value.contextWindowTokensOverride < 1_024 ||
+      value.contextWindowTokensOverride > 2_000_000
+    ) {
+      throw new KernelError(
+        "Agent context window override must be an integer between 1024 and 2000000 tokens.",
+        400,
+      );
     }
     policy.contextWindowTokensOverride = value.contextWindowTokensOverride;
   }
   if (value.reservedOutputTokens !== undefined) {
-    if (!Number.isInteger(value.reservedOutputTokens) || value.reservedOutputTokens < 128 || value.reservedOutputTokens > 500_000) {
-      throw new KernelError("Agent reserved output tokens must be an integer between 128 and 500000.", 400);
+    if (
+      !Number.isInteger(value.reservedOutputTokens) ||
+      value.reservedOutputTokens < 128 ||
+      value.reservedOutputTokens > 500_000
+    ) {
+      throw new KernelError(
+        "Agent reserved output tokens must be an integer between 128 and 500000.",
+        400,
+      );
     }
     policy.reservedOutputTokens = value.reservedOutputTokens;
   }
   if (value.safetyMarginRatio !== undefined) {
-    if (!Number.isFinite(value.safetyMarginRatio) || value.safetyMarginRatio < 0 || value.safetyMarginRatio > 0.5) {
-      throw new KernelError("Agent context safety margin ratio must be between 0 and 0.5.", 400);
+    if (
+      !Number.isFinite(value.safetyMarginRatio) ||
+      value.safetyMarginRatio < 0 ||
+      value.safetyMarginRatio > 0.5
+    ) {
+      throw new KernelError(
+        "Agent context safety margin ratio must be between 0 and 0.5.",
+        400,
+      );
     }
     policy.safetyMarginRatio = value.safetyMarginRatio;
   }
   if (value.automaticCompaction !== undefined) {
     if (typeof value.automaticCompaction !== "boolean") {
-      throw new KernelError("Agent automatic compaction must be a boolean.", 400);
+      throw new KernelError(
+        "Agent automatic compaction must be a boolean.",
+        400,
+      );
     }
     policy.automaticCompaction = value.automaticCompaction;
   }
@@ -3614,12 +4914,18 @@ function normalizeAgentContextPolicy(value: AgentDefinition["contextPolicy"] | u
     policy.reservedOutputTokens !== undefined &&
     policy.reservedOutputTokens >= policy.contextWindowTokensOverride
   ) {
-    throw new KernelError("Agent reserved output tokens must be smaller than the context window override.", 400);
+    throw new KernelError(
+      "Agent reserved output tokens must be smaller than the context window override.",
+      400,
+    );
   }
   return Object.keys(policy).length > 0 ? policy : null;
 }
 
-function normalizeAgentIdList(values: string[], field: "skillIds" | "toolIds"): string[] {
+function normalizeAgentIdList(
+  values: string[],
+  field: "skillIds" | "toolIds",
+): string[] {
   if (values.length > 100) {
     throw new KernelError(`Agent ${field} must contain 100 IDs or fewer.`, 400);
   }
@@ -3627,10 +4933,16 @@ function normalizeAgentIdList(values: string[], field: "skillIds" | "toolIds"): 
   for (const value of values) {
     const id = value.trim();
     if (!id || id.length > 120 || hasControlCharacters(id)) {
-      throw new KernelError(`Agent ${field} must contain non-empty IDs of 120 characters or fewer.`, 400);
+      throw new KernelError(
+        `Agent ${field} must contain non-empty IDs of 120 characters or fewer.`,
+        400,
+      );
     }
     if (output.includes(id)) {
-      throw new KernelError(`Agent ${field} contains duplicate ID '${id}'.`, 400);
+      throw new KernelError(
+        `Agent ${field} contains duplicate ID '${id}'.`,
+        400,
+      );
     }
     output.push(id);
   }
@@ -3654,10 +4966,16 @@ function assertExistingDirectory(path: string, label: string): void {
 }
 
 function compareMessagesForTimeline(a: Message, b: Message): number {
-  return a.createdAt.localeCompare(b.createdAt) || a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id);
+  return (
+    a.createdAt.localeCompare(b.createdAt) ||
+    a.updatedAt.localeCompare(b.updatedAt) ||
+    a.id.localeCompare(b.id)
+  );
 }
 
-function timestampAfter(...timestamps: Array<string | null | undefined>): string {
+function timestampAfter(
+  ...timestamps: Array<string | null | undefined>
+): string {
   const latestTimestamp = timestamps.reduce((latest, timestamp) => {
     if (!timestamp) {
       return latest;
@@ -3669,7 +4987,10 @@ function timestampAfter(...timestamps: Array<string | null | undefined>): string
 }
 
 function isAbortLike(error: unknown): boolean {
-  return error instanceof Error && (error.name === "AbortError" || /aborted/i.test(error.message));
+  return (
+    error instanceof Error &&
+    (error.name === "AbortError" || /aborted/i.test(error.message))
+  );
 }
 
 function toError(error: unknown): Error {
@@ -3689,7 +5010,10 @@ function publicRunOptions(options: RunOptions | null): RunOptions | null {
   if (reasoningEffort) {
     output.reasoningEffort = reasoningEffort;
   }
-  if (typeof options.temperature === "number" && Number.isFinite(options.temperature)) {
+  if (
+    typeof options.temperature === "number" &&
+    Number.isFinite(options.temperature)
+  ) {
     output.temperature = options.temperature;
   }
   return Object.keys(output).length > 0 ? output : null;
@@ -3705,13 +5029,13 @@ const compactionSummaryHeadings = [
   "Current implementation and changed files",
   "Validation and results",
   "Open issues and next work",
-  "Important tool results"
+  "Important tool results",
 ];
 const compactionSystemPrompt = [
   "Create a cumulative continuity summary for a later model context.",
   `Return plain text with these headings: ${compactionSummaryHeadings.join("; ")}.`,
   "Preserve concrete identifiers and unresolved constraints. Do not call tools, include hidden reasoning, credentials, or raw provider payloads.",
-  "The previous summary is authoritative continuity. Merge it with only the supplied new source messages."
+  "The previous summary is authoritative continuity. Merge it with only the supplied new source messages.",
 ].join("\n");
 
 class CompactionCollector implements ProviderRunWriter {
@@ -3720,7 +5044,10 @@ class CompactionCollector implements ProviderRunWriter {
 
   writeDelta(text: string): void {
     if (this.text.length <= compactionSummaryMaxChars) {
-      this.text += text.slice(0, compactionSummaryMaxChars + 1 - this.text.length);
+      this.text += text.slice(
+        0,
+        compactionSummaryMaxChars + 1 - this.text.length,
+      );
     }
   }
 
@@ -3737,7 +5064,10 @@ interface CompactionSourceEntry {
   hardBoundary: boolean;
 }
 
-function selectCompactionSource(messages: Message[], activeRunId: string | null): {
+function selectCompactionSource(
+  messages: Message[],
+  activeRunId: string | null,
+): {
   entries: CompactionSourceEntry[];
   sourceMessages: Message[];
   preservedMessages: Message[];
@@ -3760,13 +5090,21 @@ function selectCompactionSource(messages: Message[], activeRunId: string | null)
       grouped.push([message]);
     }
   }
-  const entries = grouped.map((group) => classifyCompactionEntry(group, activeRunId));
-  const successfulCount = entries.filter((entry) => entry.category.category === "completed_turn").length;
+  const entries = grouped.map((group) =>
+    classifyCompactionEntry(group, activeRunId),
+  );
+  const successfulCount = entries.filter(
+    (entry) => entry.category.category === "completed_turn",
+  ).length;
   let remainingSuccessful = successfulCount;
   const selected: CompactionSourceEntry[] = [];
   for (const entry of entries) {
     if (entry.hardBoundary) break;
-    if (entry.category.category === "completed_turn" && remainingSuccessful <= 2) break;
+    if (
+      entry.category.category === "completed_turn" &&
+      remainingSuccessful <= 2
+    )
+      break;
     selected.push(entry);
     if (entry.category.category === "completed_turn") remainingSuccessful -= 1;
   }
@@ -3775,22 +5113,33 @@ function selectCompactionSource(messages: Message[], activeRunId: string | null)
   return {
     entries: selected,
     sourceMessages,
-    preservedMessages: messages.filter((message) => !sourceIds.has(message.id))
+    preservedMessages: messages.filter((message) => !sourceIds.has(message.id)),
   };
 }
 
-function classifyCompactionEntry(messages: Message[], activeRunId: string | null): CompactionSourceEntry {
+function classifyCompactionEntry(
+  messages: Message[],
+  activeRunId: string | null,
+): CompactionSourceEntry {
   const first = messages[0];
   const runId = first?.runId ?? null;
   const hardBoundary = messages.some(
-    (message) => (activeRunId !== null && message.runId === activeRunId) || message.status === "streaming"
+    (message) =>
+      (activeRunId !== null && message.runId === activeRunId) ||
+      message.status === "streaming",
   );
   const successfulAssistant = messages.find(
-    (message) => message.role === "assistant" && message.status === "completed" && !message.error
+    (message) =>
+      message.role === "assistant" &&
+      message.status === "completed" &&
+      !message.error,
   );
   const terminalFailure = messages.find(
     (message) =>
-      message.status === "failed" || message.status === "cancelled" || message.status === "interrupted" || Boolean(message.error)
+      message.status === "failed" ||
+      message.status === "cancelled" ||
+      message.status === "interrupted" ||
+      Boolean(message.error),
   );
   let category: ContextArtifactSourceCategory["category"];
   let status: string;
@@ -3799,8 +5148,16 @@ function classifyCompactionEntry(messages: Message[], activeRunId: string | null
     status = "completed";
   } else if (first?.role === "user") {
     category = "unsuccessful_turn";
-    status = terminalFailure?.status ?? (hardBoundary ? "active" : "terminal_without_completed_assistant");
-  } else if (messages.some((message) => message.parts.some((part) => part.type === "tool_result" || part.type === "command_output"))) {
+    status =
+      terminalFailure?.status ??
+      (hardBoundary ? "active" : "terminal_without_completed_assistant");
+  } else if (
+    messages.some((message) =>
+      message.parts.some(
+        (part) => part.type === "tool_result" || part.type === "command_output",
+      ),
+    )
+  ) {
     category = "standalone_tool";
     status = terminalFailure?.status ?? first?.status ?? "completed";
   } else {
@@ -3810,40 +5167,69 @@ function classifyCompactionEntry(messages: Message[], activeRunId: string | null
   return {
     messages,
     hardBoundary,
-    category: { category, messageIds: messages.map((message) => message.id), runId, status }
+    category: {
+      category,
+      messageIds: messages.map((message) => message.id),
+      runId,
+      status,
+    },
   };
 }
 
-function buildCompactionInput(previousSummary: string | null, entries: CompactionSourceEntry[]): string {
+function buildCompactionInput(
+  previousSummary: string | null,
+  entries: CompactionSourceEntry[],
+): string {
   const messageText = entries.map(compactionEntryText).join("\n\n");
   return [
     "Previous cumulative summary:",
     previousSummary?.trim() || "(none)",
     "",
     "New finalized source messages:",
-    messageText
+    messageText,
   ].join("\n");
 }
 
-function buildSummaryRecoveryInput(previousArtifactId: string, summary: string): string {
+function buildSummaryRecoveryInput(
+  previousArtifactId: string,
+  summary: string,
+): string {
   return [
     `Previous completed artifact: ${previousArtifactId}`,
     "Create a smaller cumulative continuity summary from this previous summary only.",
     "Do not infer or request sealed raw messages.",
     "",
-    summary
+    summary,
   ].join("\n");
 }
 
-function validatedCompactionSummary(raw: string, inputBudgetTokens: number): string {
+function validatedCompactionSummary(
+  raw: string,
+  inputBudgetTokens: number,
+): string {
   const summary = sanitizeCompactionSummary(raw).trim();
-  if (!summary) throw new Error("Compaction provider returned an empty summary.");
-  if (!compactionSummaryHeadings.every((heading) => summary.toLowerCase().includes(heading.toLowerCase()))) {
-    throw new Error("Compaction provider summary did not contain the required continuity sections.");
+  if (!summary)
+    throw new Error("Compaction provider returned an empty summary.");
+  if (
+    !compactionSummaryHeadings.every((heading) =>
+      summary.toLowerCase().includes(heading.toLowerCase()),
+    )
+  ) {
+    throw new Error(
+      "Compaction provider summary did not contain the required continuity sections.",
+    );
   }
-  const summaryTokenLimit = Math.min(compactionSummaryMaxTokens, Math.max(256, Math.floor(inputBudgetTokens * 0.4)));
-  if (summary.length > compactionSummaryMaxChars || estimateTextTokens(summary) > summaryTokenLimit) {
-    throw new Error("Compaction provider summary exceeded the bounded artifact limit.");
+  const summaryTokenLimit = Math.min(
+    compactionSummaryMaxTokens,
+    Math.max(256, Math.floor(inputBudgetTokens * 0.4)),
+  );
+  if (
+    summary.length > compactionSummaryMaxChars ||
+    estimateTextTokens(summary) > summaryTokenLimit
+  ) {
+    throw new Error(
+      "Compaction provider summary exceeded the bounded artifact limit.",
+    );
   }
   return summary;
 }
@@ -3854,19 +5240,29 @@ function compactionEntryText(entry: CompactionSourceEntry): string {
     return `${header}\nAudit-only orphan record; raw content intentionally omitted.`;
   }
   if (entry.category.category === "unsuccessful_turn") {
-    const users = projectStoredMessagesForContext(entry.messages.filter((message) => message.role === "user"));
-    const intent = users.map((message) => boundHistoricalContextText(message.content)).join("\n");
+    const users = projectStoredMessagesForContext(
+      entry.messages.filter((message) => message.role === "user"),
+    );
+    const intent = users
+      .map((message) => boundHistoricalContextText(message.content))
+      .join("\n");
     const error = entry.messages.map((message) => message.error).find(Boolean);
     return `${header}\nUser intent: ${intent || "(unavailable)"}\nTerminal result: ${entry.category.status}${error ? ` · ${sanitizedCompactionError(error)}` : ""}`;
   }
   const projected = projectStoredMessagesForContext(entry.messages);
   const body = projected
-    .map((message) => `[${message.role} · ${message.messageId ?? "unknown"}]\n${boundHistoricalContextText(message.content)}`)
+    .map(
+      (message) =>
+        `[${message.role} · ${message.messageId ?? "unknown"}]\n${boundHistoricalContextText(message.content)}`,
+    )
     .join("\n\n");
   return `${header}\n${body || "(no provider-visible content)"}`;
 }
 
-function entriesFromCategories(messages: Message[], categories: ContextArtifactSourceCategory[]): CompactionSourceEntry[] {
+function entriesFromCategories(
+  messages: Message[],
+  categories: ContextArtifactSourceCategory[],
+): CompactionSourceEntry[] {
   const byId = new Map(messages.map((message) => [message.id, message]));
   return categories.map((category) => ({
     category,
@@ -3874,13 +5270,21 @@ function entriesFromCategories(messages: Message[], categories: ContextArtifactS
     messages: category.messageIds.flatMap((id) => {
       const message = byId.get(id);
       return message ? [message] : [];
-    })
+    }),
   }));
 }
 
-function mergeCompactionUsage(current: RunUsage | null, update: RunUsage): RunUsage {
+function mergeCompactionUsage(
+  current: RunUsage | null,
+  update: RunUsage,
+): RunUsage {
   const output: RunUsage = { ...(current ?? {}) };
-  for (const key of ["inputTokens", "outputTokens", "reasoningTokens", "totalTokens"] as const) {
+  for (const key of [
+    "inputTokens",
+    "outputTokens",
+    "reasoningTokens",
+    "totalTokens",
+  ] as const) {
     if (typeof update[key] === "number") {
       output[key] = update[key];
     }
@@ -3893,14 +5297,22 @@ function runUsageToJson(usage: RunUsage | null): JsonObject {
 }
 
 function sanitizedCompactionError(error: unknown): string {
-  return sanitizedPublicString(error instanceof Error ? error.message : String(error), 800) ?? "Context compaction failed.";
+  return (
+    sanitizedPublicString(
+      error instanceof Error ? error.message : String(error),
+      800,
+    ) ?? "Context compaction failed."
+  );
 }
 
 function sanitizeCompactionSummary(value: string): string {
   return value
     .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED]")
-    .replace(/("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi, "$1[REDACTED]$2")
+    .replace(
+      /("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi,
+      "$1[REDACTED]$2",
+    )
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_API_KEY]")
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
 }
@@ -3919,7 +5331,8 @@ function publicContextPlanSummary(value: unknown): PublicRunSummary["context"] {
   const toolIteration = numberField(record, "toolIteration");
   const inputBudgetTokens = numberField(object, "inputBudgetTokens");
   const estimatedInputTokens = numberField(object, "estimatedInputTokens");
-  const providerNeutralTokens = numberField(object, "providerNeutralTokens") ?? estimatedInputTokens;
+  const providerNeutralTokens =
+    numberField(object, "providerNeutralTokens") ?? estimatedInputTokens;
   const nativeOverheadTokens = numberField(object, "nativeOverheadTokens") ?? 0;
   const trimmingApplied = booleanField(object, "trimmingApplied");
   const capabilityStale = booleanField(object, "capabilityStale") ?? false;
@@ -3935,7 +5348,10 @@ function publicContextPlanSummary(value: unknown): PublicRunSummary["context"] {
     trimmingApplied === null ||
     estimatedInputTokens !== providerNeutralTokens + nativeOverheadTokens ||
     estimatedInputTokens > inputBudgetTokens ||
-    (windowSource !== "provider" && windowSource !== "adapter" && windowSource !== "user" && windowSource !== "assumed")
+    (windowSource !== "provider" &&
+      windowSource !== "adapter" &&
+      windowSource !== "user" &&
+      windowSource !== "assumed")
   ) {
     return null;
   }
@@ -3949,53 +5365,73 @@ function publicContextPlanSummary(value: unknown): PublicRunSummary["context"] {
     nativeOverheadTokens,
     trimmingApplied,
     windowSource,
-    capabilityStale
+    capabilityStale,
   };
 }
 
 function contextPlanRecordObjects(metadata: JsonObject): JsonObject[] {
   const records = metadata.contextPlanRecords;
   if (Array.isArray(records)) {
-    return records.filter((record): record is JsonObject => Boolean(record && typeof record === "object" && !Array.isArray(record)));
+    return records.filter((record): record is JsonObject =>
+      Boolean(record && typeof record === "object" && !Array.isArray(record)),
+    );
   }
   const legacyPlan = metadata.contextPlan;
-  return legacyPlan && typeof legacyPlan === "object" && !Array.isArray(legacyPlan)
+  return legacyPlan &&
+    typeof legacyPlan === "object" &&
+    !Array.isArray(legacyPlan)
     ? [
         {
           planId: "legacy-context-plan",
           providerTurn: 0,
           toolIteration: 0,
           createdAt: "1970-01-01T00:00:00.000Z",
-          plan: legacyPlan
-        }
+          plan: legacyPlan,
+        },
       ]
     : [];
 }
 
 function contextPlanObject(record: JsonObject | undefined): JsonObject | null {
   const plan = record?.plan;
-  return plan && typeof plan === "object" && !Array.isArray(plan) ? (plan as JsonObject) : null;
+  return plan && typeof plan === "object" && !Array.isArray(plan)
+    ? (plan as JsonObject)
+    : null;
 }
 
 function integerJsonField(object: JsonObject | undefined, key: string): number {
   const value = object?.[key];
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : -1;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : -1;
 }
 
-function sanitizedPublicString(value: string | null | undefined, maxLength: number): string | null {
+function sanitizedPublicString(
+  value: string | null | undefined,
+  maxLength: number,
+): string | null {
   if (typeof value !== "string") {
     return null;
   }
   const redacted = value
     .replace(/(Authorization\s*[:=]\s*Bearer\s+)[^\s"']+/gi, "$1[REDACTED]")
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED]")
-    .replace(/("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi, "$1[REDACTED]$2")
+    .replace(
+      /("(?:access|refresh|id)_?token"\s*:\s*")[^"]+("|$)/gi,
+      "$1[REDACTED]$2",
+    )
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED_API_KEY]");
-  const sanitized = redacted.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLength);
+  const sanitized = redacted
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, maxLength);
   return sanitized || null;
 }
 
-async function settleWithin(promises: readonly Promise<unknown>[], timeoutMs: number): Promise<void> {
+async function settleWithin(
+  promises: readonly Promise<unknown>[],
+  timeoutMs: number,
+): Promise<void> {
   if (promises.length === 0) {
     return;
   }
@@ -4006,7 +5442,7 @@ async function settleWithin(promises: readonly Promise<unknown>[], timeoutMs: nu
       Promise.allSettled(promises).then(() => undefined),
       new Promise<void>((resolvePromise) => {
         timeout = setTimeout(resolvePromise, Math.max(0, timeoutMs));
-      })
+      }),
     ]);
   } finally {
     if (timeout) {

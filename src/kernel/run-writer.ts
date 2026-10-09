@@ -9,12 +9,11 @@ import type {
   Run,
   RunEvent,
   RunEventType,
-  RunStatus,
   RunUsage,
-  TerminalRunEventType,
-  TerminalRunStatus
+  TerminalRunEventType
 } from "../shared/types";
-import { isTerminalRunStatus } from "../shared/types";
+import { RunType } from "@/run/type";
+import { RunVO } from "@/run/vo";
 import type {
   ProviderMessagePartInput,
   ProviderReasoningDetailRecord,
@@ -54,7 +53,7 @@ export class RunWriter implements ProviderRunWriter {
     this.run = options.run;
     this.assistantMessageId = options.assistantMessageId;
     this.signal = options.signal;
-    this.terminal = isTerminalRunStatus(options.run.status);
+    this.terminal = new RunVO.Status(options.run.status).isTerminal();
     const assistantMessage = options.store.getMessage(options.assistantMessageId);
     this.text = assistantMessage?.parts.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
     this.priorUsage = options.run.usage ? { ...options.run.usage } : null;
@@ -336,7 +335,7 @@ export class RunWriter implements ProviderRunWriter {
     this.finish("interrupted", "run_interrupted", payload);
   }
 
-  private finish(status: TerminalRunStatus, eventType: TerminalRunEventType, payload: unknown): void {
+  private finish(status: RunType.TerminalStatus, eventType: TerminalRunEventType, payload: unknown): void {
     if (this.isFinished()) {
       return;
     }
@@ -394,7 +393,7 @@ export class RunWriter implements ProviderRunWriter {
       return true;
     }
     const run = this.store.getRun(this.run.id);
-    if (!run || isTerminalRunStatus(run.status)) {
+    if (!run || new RunVO.Status(run.status).isTerminal()) {
       this.terminal = true;
       return true;
     }
@@ -407,7 +406,7 @@ export class RunWriter implements ProviderRunWriter {
     }
     const run = this.store.getRun(this.run.id);
     if (!run || run.status !== "running") {
-      if (!run || isTerminalRunStatus(run.status)) {
+      if (!run || new RunVO.Status(run.status).isTerminal()) {
         this.terminal = true;
       }
       return false;
@@ -442,7 +441,7 @@ function terminalPayload(messageId: string, usage: RunUsage | null): JsonObject 
   return payload;
 }
 
-function expectedRunStatuses(status: TerminalRunStatus): readonly RunStatus[] {
+function expectedRunStatuses(status: RunType.TerminalStatus): readonly RunType.Status[] {
   if (status === "cancelled") {
     return ["running", "waiting_permission", "waiting_children", "cancelling"];
   }

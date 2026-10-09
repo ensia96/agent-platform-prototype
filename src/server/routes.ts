@@ -19,7 +19,8 @@ import type {
   ToolSettings,
   ToolSettingsResponse
 } from "../shared/types";
-import { isTerminalRunEventType, isTerminalRunStatus } from "../shared/types";
+import { isTerminalRunEventType } from "../shared/types";
+import { RunVO } from "@/run/vo";
 import {
   extractSettingsPatch,
   normalizeSettingsPatch,
@@ -489,7 +490,7 @@ function registerRunRoutes(app: Express, dependencies: ApiRouteDependencies): vo
       } catch (error) {
         throw new KernelError(error instanceof Error ? error.message : "Invalid event cursor.", 400);
       }
-      const cursorPlan = planRunEventCursor(requestedAfter, kernel.getLatestRunEventSeq(runId), isTerminalRunStatus(run.status));
+      const cursorPlan = planRunEventCursor(requestedAfter, kernel.getLatestRunEventSeq(runId), new RunVO.Status(run.status).isTerminal());
       if (cursorPlan.noContent) {
         res.setHeader("Cache-Control", "no-store");
         res.status(204).end();
@@ -539,7 +540,7 @@ function registerRunRoutes(app: Express, dependencies: ApiRouteDependencies): vo
       req.once("close", () => close(false));
       replay.replay(kernel.listRunEvents(runId, cursorPlan.after));
 
-      if (!closed && isTerminalRunStatus(kernel.getRun(runId).status)) {
+      if (!closed && new RunVO.Status(kernel.getRun(runId).status).isTerminal()) {
         close(true);
       }
 
