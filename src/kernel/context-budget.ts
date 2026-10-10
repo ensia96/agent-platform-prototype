@@ -11,7 +11,7 @@ import type {
   ProviderContextPlanningProfile
 } from "../shared/types";
 import { toolExchangeText } from "./tool-transcript";
-import { MessageVO } from "@/message/vo";
+import { MessageVO } from "@/kernel/message/vo";
 
 export const contextEstimatorVersion = "conservative-utf8-v1";
 export const assumedContextWindowTokens = 16_384;

@@ -2,7 +2,7 @@ import type { StoreAdapter } from "../store/types";
 import type { AgentDefinition, JsonObject, SubsessionDelegation } from "../shared/types";
 import type { RegisteredTool } from "../tools/types";
 import { ToolInputError } from "../tools/types";
-import { RunVO } from "@/run/vo";
+import { RunVO } from "@/kernel/run/vo";
 import { agentRunSnapshotToJson } from "./kernel-metadata";
 
 export const subsessionToolId = "subsession.start";

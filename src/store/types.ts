@@ -1,6 +1,6 @@
-import { RunType } from "@/run/type";
-import { MessageType } from "@/message/type";
-import { PermissionRequestType } from "@/permission-request/type";
+import { RunType } from "@/kernel/run/type";
+import { MessageType } from "@/kernel/message/type";
+import { PermissionRequestType } from "@/kernel/permission-request/type";
 import type {
   AgentDefinition,
   ContextArtifact,

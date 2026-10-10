@@ -23,7 +23,7 @@ import type {
   ToolDefinition,
   ToolListResponse
 } from "../shared/types";
-import { RunVO } from "@/run/vo";
+import { RunVO } from "@/kernel/run/vo";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 import { ChatHeader } from "./ChatHeader";
 import { SubsessionPanel } from "./SubsessionPanel";

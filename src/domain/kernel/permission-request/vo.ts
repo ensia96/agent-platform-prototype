@@ -1,6 +1,6 @@
 import { ValueObject } from "@/_/vo";
-import { PERMISSION_REQUEST_CONSTANT } from "@/permission-request/constant";
-import { PermissionRequestType } from "@/permission-request/type";
+import { PERMISSION_REQUEST_CONSTANT } from "@/kernel/permission-request/constant";
+import { PermissionRequestType } from "@/kernel/permission-request/type";
 
 export namespace PermissionRequestVO {
   export class ResolvedStatus extends ValueObject<PermissionRequestType.ResolvedStatus> {

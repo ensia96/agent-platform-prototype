@@ -12,8 +12,8 @@ import type {
   RunUsage,
   TerminalRunEventType
 } from "../shared/types";
-import { RunType } from "@/run/type";
-import { RunVO } from "@/run/vo";
+import { RunType } from "@/kernel/run/type";
+import { RunVO } from "@/kernel/run/vo";
 import type {
   ProviderMessagePartInput,
   ProviderReasoningDetailRecord,

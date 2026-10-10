@@ -20,7 +20,7 @@ import type {
   ToolSettingsResponse
 } from "../shared/types";
 import { isTerminalRunEventType } from "../shared/types";
-import { RunVO } from "@/run/vo";
+import { RunVO } from "@/kernel/run/vo";
 import {
   extractSettingsPatch,
   normalizeSettingsPatch,

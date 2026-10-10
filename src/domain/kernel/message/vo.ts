@@ -1,6 +1,6 @@
 import { ValueObject } from "@/_/vo";
-import { MESSAGE_CONSTANT } from "@/message/constant";
-import { MessageType } from "@/message/type";
+import { MESSAGE_CONSTANT } from "@/kernel/message/constant";
+import { MessageType } from "@/kernel/message/type";
 
 export namespace MessageVO {
   export class Status extends ValueObject<MessageType.Status> {

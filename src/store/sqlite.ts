@@ -55,12 +55,12 @@ import type {
   ToolPermissionDecision
 } from "../shared/types";
 import { isTerminalRunEventType } from "../shared/types";
-import { RunType } from "@/run/type";
-import { RunVO } from "@/run/vo";
-import { MessageType } from "@/message/type";
-import { MessageVO } from "@/message/vo";
-import { PermissionRequestType } from "@/permission-request/type";
-import { PermissionRequestVO } from "@/permission-request/vo";
+import { RunType } from "@/kernel/run/type";
+import { RunVO } from "@/kernel/run/vo";
+import { MessageType } from "@/kernel/message/type";
+import { MessageVO } from "@/kernel/message/vo";
+import { PermissionRequestType } from "@/kernel/permission-request/type";
+import { PermissionRequestVO } from "@/kernel/permission-request/vo";
 import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 

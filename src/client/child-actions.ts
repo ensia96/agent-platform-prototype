@@ -1,6 +1,6 @@
 import type { InvokeToolResponse, PermissionListResponse, PermissionRequest, PublicRunSummary, SubsessionDelegation } from "../shared/types";
-import { RunVO } from "@/run/vo";
-import { PermissionRequestVO } from "@/permission-request/vo";
+import { RunVO } from "@/kernel/run/vo";
+import { PermissionRequestVO } from "@/kernel/permission-request/vo";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 
 export interface ChildActionView {

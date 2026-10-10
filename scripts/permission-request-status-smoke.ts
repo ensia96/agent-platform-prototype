@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { ValueObject } from "@/_/vo";
-import { PERMISSION_REQUEST_CONSTANT } from "@/permission-request/constant";
-import { PermissionRequestType } from "@/permission-request/type";
-import { PermissionRequestVO } from "@/permission-request/vo";
+import { PERMISSION_REQUEST_CONSTANT } from "@/kernel/permission-request/constant";
+import { PermissionRequestType } from "@/kernel/permission-request/type";
+import { PermissionRequestVO } from "@/kernel/permission-request/vo";
 
 const states = ["pending", "approved", "denied", "expired"] as const;
 const resolved = ["approved", "denied", "expired"] as const;

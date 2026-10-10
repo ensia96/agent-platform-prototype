@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { ValueObject } from "@/_/vo";
-import { MESSAGE_CONSTANT } from "@/message/constant";
-import { MessageType } from "@/message/type";
-import { MessageVO } from "@/message/vo";
+import { MESSAGE_CONSTANT } from "@/kernel/message/constant";
+import { MessageType } from "@/kernel/message/type";
+import { MessageVO } from "@/kernel/message/vo";
 
 const states = ["completed", "streaming", "cancelled", "failed", "interrupted"] as const;
 const stopped = ["cancelled", "interrupted"] as const;

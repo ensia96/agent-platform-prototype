@@ -146,11 +146,11 @@ import type {
   ToolSettings,
   ToolResultStatus,
 } from "../shared/types";
-import { RUN_CONSTANT } from "@/run/constant";
-import { RunVO } from "@/run/vo";
-import { MessageVO } from "@/message/vo";
-import { PermissionRequestType } from "@/permission-request/type";
-import { PermissionRequestVO } from "@/permission-request/vo";
+import { RUN_CONSTANT } from "@/kernel/run/constant";
+import { RunVO } from "@/kernel/run/vo";
+import { MessageVO } from "@/kernel/message/vo";
+import { PermissionRequestType } from "@/kernel/permission-request/type";
+import { PermissionRequestVO } from "@/kernel/permission-request/vo";
 
 export interface StartRunOptions {
   agentId?: string;

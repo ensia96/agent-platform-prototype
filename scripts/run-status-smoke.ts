@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { ValueObject } from "@/_/vo";
-import { RunType } from "@/run/type";
-import { RUN_CONSTANT } from "@/run/constant";
-import { RunVO } from "@/run/vo";
+import { RunType } from "@/kernel/run/type";
+import { RUN_CONSTANT } from "@/kernel/run/constant";
+import { RunVO } from "@/kernel/run/vo";
 
 const states = ["running", "waiting_permission", "waiting_children", "cancelling", "completed", "cancelled", "failed", "interrupted"] as const;
 const waiting = ["waiting_children", "waiting_permission"] as const;

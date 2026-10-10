@@ -1,6 +1,6 @@
 import { ValueObject } from "@/_/vo";
-import { RUN_CONSTANT } from "@/run/constant";
-import { RunType } from "@/run/type";
+import { RUN_CONSTANT } from "@/kernel/run/constant";
+import { RunType } from "@/kernel/run/type";
 
 export namespace RunVO {
   export class ActiveStatus extends ValueObject<RunType.ActiveStatus> {

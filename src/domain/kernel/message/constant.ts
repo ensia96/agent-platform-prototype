@@ -1,4 +1,4 @@
-import { MessageType } from "@/message/type";
+import { MessageType } from "@/kernel/message/type";
 
 export namespace MESSAGE_CONSTANT {
   export const STOPPED_STATUS: MessageType.StoppedStatus[] = [

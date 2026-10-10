@@ -8,10 +8,10 @@ import type {
   RunEvent
 } from "../shared/types";
 import { isTerminalRunEventType } from "../shared/types";
-import { RunType } from "@/run/type";
-import { RunVO } from "@/run/vo";
-import { MessageType } from "@/message/type";
-import { MessageVO } from "@/message/vo";
+import { RunType } from "@/kernel/run/type";
+import { RunVO } from "@/kernel/run/vo";
+import { MessageType } from "@/kernel/message/type";
+import { MessageVO } from "@/kernel/message/vo";
 
 export type RunConnectionState = "idle" | "connecting" | "connected" | "reconnecting";
 export type RunStatusTone = "idle" | "running" | "waiting" | "reconnecting" | "cancelling" | "terminal" | "error";

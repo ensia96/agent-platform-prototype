@@ -1,5 +1,5 @@
 import type { PublicRunSummary } from "../shared/types";
-import { RunVO } from "@/run/vo";
+import { RunVO } from "@/kernel/run/vo";
 
 export function RunActionButton({
   activeRun,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { RunType } from "@/run/type";
+import { RunType } from "@/kernel/run/type";
 import Database from "better-sqlite3";
 import { type ChildProcess, type spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";

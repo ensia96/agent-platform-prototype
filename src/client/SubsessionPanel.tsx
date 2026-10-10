@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PermissionRequest, Session, SubsessionDelegation } from "../shared/types";
-import { RunVO } from "@/run/vo";
+import { RunVO } from "@/kernel/run/vo";
 import { ChildActionsController, type ChildActionView } from "./child-actions";
 
 export function SubsessionPanel({ session, onOpen, parentRunId = null, generation = 0, isCurrent = () => true }: {

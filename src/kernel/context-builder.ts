@@ -16,7 +16,7 @@ import type {
   Session
 } from "../shared/types";
 import { normalizeReasoningEffort } from "../shared/run-options";
-import { MessageVO } from "@/message/vo";
+import { MessageVO } from "@/kernel/message/vo";
 import { boundHistoricalContextText, planContext, resolveContextBudget, type ResolvedContextBudget } from "./context-budget";
 
 export const defaultAgentId = "main";

@@ -1,6 +1,6 @@
 import { KernelError } from "../kernel/kernel";
-import { PermissionRequestType } from "@/permission-request/type";
-import { PermissionRequestVO } from "@/permission-request/vo";
+import { PermissionRequestType } from "@/kernel/permission-request/type";
+import { PermissionRequestVO } from "@/kernel/permission-request/vo";
 import {
   defaultShellToolSettings,
   normalizeToolSettings,

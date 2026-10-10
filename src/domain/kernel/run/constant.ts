@@ -1,4 +1,4 @@
-import { RunType } from "@/run/type";
+import { RunType } from "@/kernel/run/type";
 
 export namespace RUN_CONSTANT {
   export const STOPPED_STATUS: RunType.StoppedStatus[] = [
