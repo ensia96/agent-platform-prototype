@@ -4,7 +4,7 @@ import { MessageType } from "@/message/type";
 
 export namespace MessageVO {
   export class Status extends ValueObject<MessageType.Status> {
-    static isStreaming(value: unknown): value is "streaming" {
+    static isStreaming(value: unknown) {
       return value === "streaming";
     }
 
@@ -16,23 +16,23 @@ export namespace MessageVO {
       return Status.looksLike(value);
     }
 
-    isCompleted(): this is this & { value: "completed" } {
+    isCompleted() {
       return this.isValid() && TerminalStatus.isCompleted(this.value);
     }
 
-    isFailed(): this is this & { value: "failed" } {
+    isFailed() {
       return this.isValid() && TerminalStatus.isFailed(this.value);
     }
 
-    isStopped(): this is this & { value: MessageType.StoppedStatus } {
+    isStopped() {
       return this.isValid() && StoppedStatus.looksLike(this.value);
     }
 
-    isStreaming(): this is this & { value: "streaming" } {
+    isStreaming() {
       return this.isValid() && Status.isStreaming(this.value);
     }
 
-    isTerminal(): this is this & { value: MessageType.TerminalStatus } {
+    isTerminal() {
       return this.isValid() && TerminalStatus.looksLike(this.value);
     }
   }
@@ -50,11 +50,11 @@ export namespace MessageVO {
   }
 
   export class TerminalStatus extends ValueObject<MessageType.TerminalStatus> {
-    static isCompleted(value: unknown): value is "completed" {
+    static isCompleted(value: unknown) {
       return value === "completed";
     }
 
-    static isFailed(value: unknown): value is "failed" {
+    static isFailed(value: unknown) {
       return value === "failed";
     }
 
@@ -70,15 +70,15 @@ export namespace MessageVO {
       return TerminalStatus.looksLike(value);
     }
 
-    isCompleted(): this is this & { value: "completed" } {
+    isCompleted() {
       return this.isValid() && TerminalStatus.isCompleted(this.value);
     }
 
-    isFailed(): this is this & { value: "failed" } {
+    isFailed() {
       return this.isValid() && TerminalStatus.isFailed(this.value);
     }
 
-    isStopped(): this is this & { value: MessageType.StoppedStatus } {
+    isStopped() {
       return this.isValid() && StoppedStatus.looksLike(this.value);
     }
   }

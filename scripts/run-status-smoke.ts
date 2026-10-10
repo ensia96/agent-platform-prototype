@@ -43,7 +43,17 @@ type TypeContracts = [
   Assert<Equal<typeof RunVO.Status.looksLike, (value: unknown) => value is RunType.Status>>,
   Assert<Equal<ConstructorParameters<typeof RunVO.Status>, [props: unknown]>>,
   Assert<Equal<RunVO.Status["value"], RunType.Status>>,
-  Assert<Equal<ReturnType<RunVO.Status["isActive"]>, boolean>>,
+  Assert<Equal<RunVO.ActiveStatus["isCancelling"], () => boolean>>,
+  Assert<Equal<RunVO.ActiveStatus["isRunning"], () => boolean>>,
+  Assert<Equal<RunVO.ActiveStatus["isWaiting"], () => boolean>>,
+  Assert<Equal<RunVO.Status["isActive"], () => boolean>>,
+  Assert<Equal<RunVO.Status["isCancelling"], () => boolean>>,
+  Assert<Equal<RunVO.Status["isFailed"], () => boolean>>,
+  Assert<Equal<RunVO.Status["isRunning"], () => boolean>>,
+  Assert<Equal<RunVO.Status["isStopped"], () => boolean>>,
+  Assert<Equal<RunVO.Status["isWaiting"], () => boolean>>,
+  Assert<Equal<RunVO.TerminalStatus["isFailed"], () => boolean>>,
+  Assert<Equal<RunVO.TerminalStatus["isStopped"], () => boolean>>,
   Assert<Equal<ReturnType<RunVO.Status["isTerminal"]>, boolean>>,
   Assert<Equal<RunVO.Status["canTransitionTo"], (target: RunVO.Status) => boolean>>
 ];
@@ -114,28 +124,23 @@ for (const input of [...states, ...invalidInputs]) {
   assert.equal(activeValue.isCancelling(), input === "cancelling");
   assert.equal(activeValue.isRunning(), input === "running");
   if (activeValue.isCancelling()) {
-    const narrowed: "cancelling" = activeValue.value;
-    assert.equal(narrowed, input);
+    assert.equal(activeValue.value, input);
   }
   if (activeValue.isRunning()) {
-    const narrowed: "running" = activeValue.value;
-    assert.equal(narrowed, input);
+    assert.equal(activeValue.value, input);
   }
   assert.equal(activeValue.isWaiting(), waiting.some((state) => state === input));
   if (activeValue.isWaiting()) {
-    const narrowed: RunType.WaitingStatus = activeValue.value;
-    assert.ok(RUN_CONSTANT.WAITING_STATUS.includes(narrowed));
+    assert.ok(RUN_CONSTANT.WAITING_STATUS.some((state) => state === activeValue.value));
   }
   const terminalValue = new RunVO.TerminalStatus(input);
   assert.equal(terminalValue.isFailed(), input === "failed");
   if (terminalValue.isFailed()) {
-    const narrowed: "failed" = terminalValue.value;
-    assert.equal(narrowed, input);
+    assert.equal(terminalValue.value, input);
   }
   assert.equal(terminalValue.isStopped(), stopped.some((state) => state === input));
   if (terminalValue.isStopped()) {
-    const narrowed: RunType.StoppedStatus = terminalValue.value;
-    assert.ok(RUN_CONSTANT.STOPPED_STATUS.includes(narrowed));
+    assert.ok(RUN_CONSTANT.STOPPED_STATUS.some((state) => state === terminalValue.value));
   }
   if (RunVO.ActiveStatus.looksLike(input)) {
     const narrowed: RunType.ActiveStatus = input;
@@ -174,16 +179,13 @@ for (const from of states) {
   assert.equal(value.isFailed(), from === "failed");
   assert.equal(value.isRunning(), from === "running");
   if (value.isCancelling()) {
-    const narrowed: "cancelling" = value.value;
-    assert.equal(narrowed, from);
+    assert.equal(value.value, from);
   }
   if (value.isFailed()) {
-    const narrowed: "failed" = value.value;
-    assert.equal(narrowed, from);
+    assert.equal(value.value, from);
   }
   if (value.isRunning()) {
-    const narrowed: "running" = value.value;
-    assert.equal(narrowed, from);
+    assert.equal(value.value, from);
   }
   assert.equal(value instanceof RunVO.ActiveStatus, false);
   assert.equal(value instanceof RunVO.TerminalStatus, false);
@@ -193,8 +195,7 @@ for (const from of states) {
     assert.equal(value.canTransitionTo(new RunVO.Status(to)), expected[from][column] === 1, `VO ${from} → ${to}`);
   }
   if (value.isActive()) {
-    const narrowed: RunType.ActiveStatus = value.value;
-    assert.ok(RUN_CONSTANT.ACTIVE_STATUS.includes(narrowed));
+    assert.ok(RUN_CONSTANT.ACTIVE_STATUS.some((state) => state === value.value));
     assert.equal(value.canTransitionTo(new RunVO.Status("running")), expected[from][0] === 1);
   }
   if (value.isTerminal()) {
@@ -203,13 +204,11 @@ for (const from of states) {
     assert.equal(value.canTransitionTo(new RunVO.Status("running")), false);
   }
   if (value.isWaiting()) {
-    const narrowed: RunType.WaitingStatus = value.value;
-    assert.ok(RUN_CONSTANT.WAITING_STATUS.includes(narrowed));
+    assert.ok(RUN_CONSTANT.WAITING_STATUS.some((state) => state === value.value));
     assert.equal(value.canTransitionTo(new RunVO.Status("running")), true);
   }
   if (value.isStopped()) {
-    const narrowed: RunType.StoppedStatus = value.value;
-    assert.ok(RUN_CONSTANT.STOPPED_STATUS.includes(narrowed));
+    assert.ok(RUN_CONSTANT.STOPPED_STATUS.some((state) => state === value.value));
     assert.equal(value.canTransitionTo(new RunVO.Status("running")), false);
   }
 }
@@ -236,4 +235,4 @@ for (const input of invalidInputs) {
     assert.equal(invalid.canTransitionTo(valid), false);
   }
 }
-console.log("Run status smoke passed: subgroup and named predicates, bottom-up composition, 64 transitions, invalid Status cases, constant order and value narrowing.");
+console.log("Run status smoke passed: subgroup and named predicates, bottom-up composition, 64 transitions, invalid Status cases, inferred booleans and required terminal value narrowing.");

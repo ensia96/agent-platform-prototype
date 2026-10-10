@@ -20,7 +20,13 @@ type TypeContracts = [
   Assert<Equal<PermissionRequestVO.Status["value"], PermissionRequestType.Status>>,
   Assert<Equal<PermissionRequestVO.ResolvedStatus["value"], PermissionRequestType.ResolvedStatus>>,
   Assert<Equal<typeof PermissionRequestVO.Status.looksLike, (value: unknown) => value is PermissionRequestType.Status>>,
-  Assert<Equal<typeof PermissionRequestVO.ResolvedStatus.looksLike, (value: unknown) => value is PermissionRequestType.ResolvedStatus>>
+  Assert<Equal<typeof PermissionRequestVO.ResolvedStatus.looksLike, (value: unknown) => value is PermissionRequestType.ResolvedStatus>>,
+  Assert<Equal<typeof PermissionRequestVO.ResolvedStatus.isApproved, (value: unknown) => value is "approved">>,
+  Assert<Equal<typeof PermissionRequestVO.Status.isPending, (value: unknown) => value is "pending">>,
+  Assert<Equal<PermissionRequestVO.ResolvedStatus["isApproved"], () => boolean>>,
+  Assert<Equal<PermissionRequestVO.Status["isApproved"], () => boolean>>,
+  Assert<Equal<PermissionRequestVO.Status["isPending"], () => boolean>>,
+  Assert<Equal<PermissionRequestVO.Status["isResolved"], () => boolean>>
 ];
 
 const expected: Record<PermissionRequestType.Status, [approved: boolean, pending: boolean, resolved: boolean]> = {
@@ -72,21 +78,17 @@ for (const input of [...states, ...invalidInputs]) {
   assert.equal(PermissionRequestVO.Status.looksLike(input), PermissionRequestVO.Status.isPending(input) || PermissionRequestVO.ResolvedStatus.looksLike(input));
   assert.equal("canTransitionTo" in value, false);
   if (value.isApproved()) {
-    const narrowed: "approved" = value.value;
-    assert.equal(narrowed, input);
+    assert.equal(value.value, input);
   }
   if (value.isPending()) {
-    const narrowed: "pending" = value.value;
-    assert.equal(narrowed, input);
+    assert.equal(value.value, input);
   }
   if (value.isResolved()) {
-    const narrowed: PermissionRequestType.ResolvedStatus = value.value;
-    assert.ok(PERMISSION_REQUEST_CONSTANT.RESOLVED_STATUS.includes(narrowed));
+    assert.ok(PERMISSION_REQUEST_CONSTANT.RESOLVED_STATUS.some((state) => state === value.value));
   }
   if (resolvedValue.isApproved()) {
-    const narrowed: "approved" = resolvedValue.value;
-    assert.equal(narrowed, input);
+    assert.equal(resolvedValue.value, input);
   }
 }
 
-console.log("Permission request status smoke passed: four unchanged values, resolved composition, invalid VO handling, approved/pending/resolved classifications and value narrowing; no transition policy.");
+console.log("Permission request status smoke passed: four unchanged values, resolved composition, invalid VO handling, approved/pending/resolved classifications, inferred booleans and static predicates; no transition policy.");

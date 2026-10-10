@@ -4,7 +4,7 @@ import { PermissionRequestType } from "@/permission-request/type";
 
 export namespace PermissionRequestVO {
   export class ResolvedStatus extends ValueObject<PermissionRequestType.ResolvedStatus> {
-    static isApproved(value: unknown): value is "approved" {
+    static isApproved(value: unknown) {
       return value === "approved";
     }
 
@@ -22,13 +22,13 @@ export namespace PermissionRequestVO {
       return ResolvedStatus.looksLike(value);
     }
 
-    isApproved(): this is this & { value: "approved" } {
+    isApproved() {
       return this.isValid() && ResolvedStatus.isApproved(this.value);
     }
   }
 
   export class Status extends ValueObject<PermissionRequestType.Status> {
-    static isPending(value: unknown): value is "pending" {
+    static isPending(value: unknown) {
       return value === "pending";
     }
 
@@ -40,17 +40,15 @@ export namespace PermissionRequestVO {
       return Status.looksLike(value);
     }
 
-    isApproved(): this is this & { value: "approved" } {
+    isApproved() {
       return this.isValid() && ResolvedStatus.isApproved(this.value);
     }
 
-    isPending(): this is this & { value: "pending" } {
+    isPending() {
       return this.isValid() && Status.isPending(this.value);
     }
 
-    isResolved(): this is this & {
-      value: PermissionRequestType.ResolvedStatus;
-    } {
+    isResolved() {
       return this.isValid() && ResolvedStatus.looksLike(this.value);
     }
   }

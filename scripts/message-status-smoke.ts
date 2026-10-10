@@ -26,7 +26,18 @@ type TypeContracts = [
   Assert<Equal<MessageVO.TerminalStatus["value"], MessageType.TerminalStatus>>,
   Assert<Equal<typeof MessageVO.Status.looksLike, (value: unknown) => value is MessageType.Status>>,
   Assert<Equal<typeof MessageVO.StoppedStatus.looksLike, (value: unknown) => value is MessageType.StoppedStatus>>,
-  Assert<Equal<typeof MessageVO.TerminalStatus.looksLike, (value: unknown) => value is MessageType.TerminalStatus>>
+  Assert<Equal<typeof MessageVO.TerminalStatus.looksLike, (value: unknown) => value is MessageType.TerminalStatus>>,
+  Assert<Equal<typeof MessageVO.Status.isStreaming, (value: unknown) => value is "streaming">>,
+  Assert<Equal<typeof MessageVO.TerminalStatus.isCompleted, (value: unknown) => value is "completed">>,
+  Assert<Equal<typeof MessageVO.TerminalStatus.isFailed, (value: unknown) => value is "failed">>,
+  Assert<Equal<MessageVO.Status["isCompleted"], () => boolean>>,
+  Assert<Equal<MessageVO.Status["isFailed"], () => boolean>>,
+  Assert<Equal<MessageVO.Status["isStopped"], () => boolean>>,
+  Assert<Equal<MessageVO.Status["isStreaming"], () => boolean>>,
+  Assert<Equal<MessageVO.Status["isTerminal"], () => boolean>>,
+  Assert<Equal<MessageVO.TerminalStatus["isCompleted"], () => boolean>>,
+  Assert<Equal<MessageVO.TerminalStatus["isFailed"], () => boolean>>,
+  Assert<Equal<MessageVO.TerminalStatus["isStopped"], () => boolean>>
 ];
 
 const expected: Record<MessageType.Status, [completed: boolean, failed: boolean, stopped: boolean, streaming: boolean, terminal: boolean]> = {
@@ -81,25 +92,20 @@ for (const input of [...states, ...invalidInputs]) {
   assert.equal(MessageVO.Status.looksLike(input), MessageVO.Status.isStreaming(input) || MessageVO.TerminalStatus.looksLike(input));
   assert.equal("canTransitionTo" in value, false);
   if (value.isCompleted()) {
-    const narrowed: "completed" = value.value;
-    assert.equal(narrowed, input);
+    assert.equal(value.value, input);
   }
   if (value.isFailed()) {
-    const narrowed: "failed" = value.value;
-    assert.equal(narrowed, input);
+    assert.equal(value.value, input);
   }
   if (value.isStopped()) {
-    const narrowed: MessageType.StoppedStatus = value.value;
-    assert.ok(MESSAGE_CONSTANT.STOPPED_STATUS.includes(narrowed));
+    assert.ok(MESSAGE_CONSTANT.STOPPED_STATUS.some((state) => state === value.value));
   }
   if (value.isStreaming()) {
-    const narrowed: "streaming" = value.value;
-    assert.equal(narrowed, input);
+    assert.equal(value.value, input);
   }
   if (value.isTerminal()) {
-    const narrowed: MessageType.TerminalStatus = value.value;
-    assert.ok(MESSAGE_CONSTANT.TERMINAL_STATUS.includes(narrowed));
+    assert.ok(MESSAGE_CONSTANT.TERMINAL_STATUS.some((state) => state === value.value));
   }
 }
 
-console.log("Message status smoke passed: five unchanged values, terminal/stopped composition, invalid VO handling, classifications and value narrowing; no transition policy.");
+console.log("Message status smoke passed: five unchanged values, terminal/stopped composition, invalid VO handling, classifications, inferred booleans and static predicates; no transition policy.");

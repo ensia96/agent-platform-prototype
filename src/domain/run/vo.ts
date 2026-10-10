@@ -4,11 +4,11 @@ import { RunType } from "@/run/type";
 
 export namespace RunVO {
   export class ActiveStatus extends ValueObject<RunType.ActiveStatus> {
-    static isCancelling(value: unknown): value is "cancelling" {
+    static isCancelling(value: unknown) {
       return value === "cancelling";
     }
 
-    static isRunning(value: unknown): value is "running" {
+    static isRunning(value: unknown) {
       return value === "running";
     }
 
@@ -24,15 +24,15 @@ export namespace RunVO {
       return ActiveStatus.looksLike(value);
     }
 
-    isCancelling(): this is this & { value: "cancelling" } {
+    isCancelling() {
       return this.isValid() && ActiveStatus.isCancelling(this.value);
     }
 
-    isRunning(): this is this & { value: "running" } {
+    isRunning() {
       return this.isValid() && ActiveStatus.isRunning(this.value);
     }
 
-    isWaiting(): this is this & { value: RunType.WaitingStatus } {
+    isWaiting() {
       return this.isValid() && WaitingStatus.looksLike(this.value);
     }
   }
@@ -57,23 +57,23 @@ export namespace RunVO {
       );
     }
 
-    isActive(): this is this & { value: RunType.ActiveStatus } {
+    isActive() {
       return this.isValid() && ActiveStatus.looksLike(this.value);
     }
 
-    isCancelling(): this is this & { value: "cancelling" } {
+    isCancelling() {
       return this.isValid() && ActiveStatus.isCancelling(this.value);
     }
 
-    isFailed(): this is this & { value: "failed" } {
+    isFailed() {
       return this.isValid() && TerminalStatus.isFailed(this.value);
     }
 
-    isRunning(): this is this & { value: "running" } {
+    isRunning() {
       return this.isValid() && ActiveStatus.isRunning(this.value);
     }
 
-    isStopped(): this is this & { value: RunType.StoppedStatus } {
+    isStopped() {
       return this.isValid() && StoppedStatus.looksLike(this.value);
     }
 
@@ -81,7 +81,7 @@ export namespace RunVO {
       return this.isValid() && TerminalStatus.looksLike(this.value);
     }
 
-    isWaiting(): this is this & { value: RunType.WaitingStatus } {
+    isWaiting() {
       return this.isValid() && WaitingStatus.looksLike(this.value);
     }
   }
@@ -99,7 +99,7 @@ export namespace RunVO {
   }
 
   export class TerminalStatus extends ValueObject<RunType.TerminalStatus> {
-    static isFailed(value: unknown): value is "failed" {
+    static isFailed(value: unknown) {
       return value === "failed";
     }
 
@@ -115,11 +115,11 @@ export namespace RunVO {
       return TerminalStatus.looksLike(value);
     }
 
-    isFailed(): this is this & { value: "failed" } {
+    isFailed() {
       return this.isValid() && TerminalStatus.isFailed(this.value);
     }
 
-    isStopped(): this is this & { value: RunType.StoppedStatus } {
+    isStopped() {
       return this.isValid() && StoppedStatus.looksLike(this.value);
     }
   }
