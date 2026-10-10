@@ -115,6 +115,22 @@ export namespace RunVO {
       return TerminalStatus.looksLike(value);
     }
 
+    get finalizableStatus(): RunType.ActiveStatus[] {
+      const status = this.value;
+      if (status === "cancelled") {
+        return [
+          "running",
+          "waiting_permission",
+          "waiting_children",
+          "cancelling",
+        ];
+      }
+      if (status === "interrupted") {
+        return ["running", "cancelling"];
+      }
+      return ["running"];
+    }
+
     isFailed() {
       return this.isValid() && TerminalStatus.isFailed(this.value);
     }

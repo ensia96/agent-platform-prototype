@@ -345,7 +345,7 @@ export class RunWriter implements ProviderRunWriter {
     const error = (status === "failed" || status === "interrupted") && isErrorPayload(payload) ? payload.error : null;
     const result = this.store.finalizeRun({
       runId: this.run.id,
-      expectedStatuses: expectedRunStatuses(status),
+      expectedStatuses: new RunVO.TerminalStatus(status).finalizableStatus,
       status,
       error,
       updatedAt: now,
@@ -439,16 +439,6 @@ function terminalPayload(messageId: string, usage: RunUsage | null): JsonObject 
     payload.usage = runUsageToJsonObject(usage);
   }
   return payload;
-}
-
-function expectedRunStatuses(status: RunType.TerminalStatus): readonly RunType.Status[] {
-  if (status === "cancelled") {
-    return ["running", "waiting_permission", "waiting_children", "cancelling"];
-  }
-  if (status === "interrupted") {
-    return ["running", "cancelling"];
-  }
-  return ["running"];
 }
 
 function structuredPartFallbackText(type: MessagePartType, content: JsonObject): string {

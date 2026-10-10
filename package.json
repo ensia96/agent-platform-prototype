@@ -13,6 +13,7 @@
     "status": "node scripts/daemon.mjs status",
     "smoke:kernel": "tsx scripts/kernel-smoke.ts",
     "smoke:run-status": "tsx scripts/run-status-smoke.ts",
+    "smoke:run-finalization-policy": "tsx scripts/run-finalization-policy-smoke.ts",
     "smoke:message-status": "tsx scripts/message-status-smoke.ts",
     "smoke:permission-request-status": "tsx scripts/permission-request-status-smoke.ts",
     "smoke:agent-profiles": "tsx scripts/agent-profiles-smoke.ts",
