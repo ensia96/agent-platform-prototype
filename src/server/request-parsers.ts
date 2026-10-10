@@ -1,4 +1,6 @@
 import { KernelError } from "../kernel/kernel";
+import { PermissionRequestType } from "@/permission-request/type";
+import { PermissionRequestVO } from "@/permission-request/vo";
 import {
   defaultShellToolSettings,
   normalizeToolSettings,
@@ -11,7 +13,6 @@ import type {
   CreateSessionRequest,
   JsonObject,
   JsonValue,
-  PermissionRequestStatus,
   RunOptions,
   ShellExecRequest,
   ToolSettings,
@@ -146,15 +147,16 @@ export function parseShellExecRequest(body: Record<string, unknown>): ShellExecR
   return input;
 }
 
-export function parsePermissionStatus(value: unknown): PermissionRequestStatus | undefined {
+export function parsePermissionStatus(value: unknown): PermissionRequestType.Status | undefined {
   if (value === undefined || value === null || value === "") {
     return undefined;
   }
   if (Array.isArray(value)) {
     throw new KernelError("Permission status query must be a single value.", 400);
   }
-  if (value === "pending" || value === "approved" || value === "denied" || value === "expired") {
-    return value;
+  const status = new PermissionRequestVO.Status(value);
+  if (status.isValid()) {
+    return status.value;
   }
   throw new KernelError("Permission status must be one of pending, approved, denied, expired.", 400);
 }

@@ -1,5 +1,6 @@
 import { RunType } from "@/run/type";
 import { MessageType } from "@/message/type";
+import { PermissionRequestType } from "@/permission-request/type";
 
 export type ISODateString = string;
 
@@ -41,7 +42,6 @@ export type ToolInvocationCaller = "manual" | "model" | "system";
 export type ToolInvocationStatus = "created" | "pending_permission" | "running" | "completed" | "failed" | "cancelled";
 export type ToolResultStatus = "completed" | "failed" | "cancelled";
 export type ToolPermissionDecision = "allowed" | "requires_approval" | "denied";
-export type PermissionRequestStatus = "pending" | "approved" | "denied" | "expired";
 export type PermissionRiskLevel = "low" | "medium" | "high" | "critical";
 export type PermissionPolicyAction = "allow" | "ask" | "deny";
 export type ToolSettingsPatternField = "denyPatternsText" | "askPatternsText" | "allowPatternsText";
@@ -269,7 +269,7 @@ export interface PermissionRequest {
   input?: JsonObject;
   riskLevel: PermissionRiskLevel;
   reason: string;
-  status: PermissionRequestStatus;
+  status: PermissionRequestType.Status;
   createdAt: ISODateString;
   resolvedAt?: ISODateString | null;
 }

@@ -35,6 +35,7 @@ import type { OpenAIChatGPTCredential, OpenAIChatGPTCredentialStore } from "../s
 import type { ProviderRegistry } from "../src/providers/registry";
 import type { ProviderAdapter, ProviderCredential, ProviderRunContext, ProviderRunInput, ProviderRunWriter } from "../src/providers/types";
 import { DatabaseLease } from "../src/server/database-lease";
+import { parsePermissionStatus } from "../src/server/request-parsers";
 import { OrderedRunEventReplay, planRunEventCursor, resolveRunEventCursor, runEventCursorControl } from "../src/server/run-event-replay";
 import { toolSettingsSettingKey } from "../src/shared/tool-settings";
 import {
@@ -1662,6 +1663,22 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+function permissionStatusQueryScenario(): void {
+  for (const input of [undefined, null, ""]) {
+    assert.equal(parsePermissionStatus(input), undefined, "absent status must preserve the unfiltered query");
+  }
+  for (const input of ["pending", "approved", "denied", "expired"]) {
+    assert.equal(parsePermissionStatus(input), input);
+  }
+  for (const input of [[], ["pending"], ["pending", "approved"]]) {
+    assert.throws(() => parsePermissionStatus(input), (error: unknown) => error instanceof KernelError && error.statusCode === 400 && error.message === "Permission status query must be a single value.");
+  }
+  for (const input of [false, 0, {}, "unknown", " pending", "pending ", "PENDING", "allow", "deny"]) {
+    assert.throws(() => parsePermissionStatus(input), (error: unknown) => error instanceof KernelError && error.statusCode === 400 && error.message === "Permission status must be one of pending, approved, denied, expired.");
+  }
+}
+
+permissionStatusQueryScenario();
 await providerCancellationScenario();
 await restartAndPermissionScenario();
 await boundedShutdownScenario();

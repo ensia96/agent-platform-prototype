@@ -44,7 +44,6 @@ import type {
   MessagePart,
   MessagePartType,
   MessageRole,
-  PermissionRequestStatus,
   PermissionRiskLevel,
   Run,
   RunEvent,
@@ -60,6 +59,8 @@ import { RunType } from "@/run/type";
 import { RunVO } from "@/run/vo";
 import { MessageType } from "@/message/type";
 import { MessageVO } from "@/message/vo";
+import { PermissionRequestType } from "@/permission-request/type";
+import { PermissionRequestVO } from "@/permission-request/vo";
 import { defaultMainAgentToolIds } from "../shared/model-tools";
 import { normalizeReasoningEffort } from "../shared/run-options";
 
@@ -198,7 +199,7 @@ type PermissionRequestRow = {
   execution_input_json: string;
   risk_level: PermissionRiskLevel;
   reason: string;
-  status: PermissionRequestStatus;
+  status: PermissionRequestType.Status;
   tool_call_part_id: string;
   command_output_part_id: string | null;
   metadata_json: string;
@@ -1214,7 +1215,7 @@ export class SQLiteStore implements StoreAdapter {
           resolvedAt: input.resolvedAt ?? null
         });
 
-      if (input.status === "pending") {
+      if (new PermissionRequestVO.Status(input.status).isPending()) {
         const runUpdate = this.db
           .prepare("UPDATE runs SET status = 'waiting_permission', error = NULL, updated_at = ? WHERE id = ? AND status = 'running'")
           .run(input.updatedAt, input.runId);
@@ -1259,12 +1260,12 @@ export class SQLiteStore implements StoreAdapter {
 
   resolvePermissionRequest(
     id: string,
-    status: Exclude<PermissionRequestStatus, "pending">,
+    status: PermissionRequestType.ResolvedStatus,
     resolvedAt: string
   ): StoredPermissionRequest | null {
     const resolveRequest = this.db.transaction((): StoredPermissionRequest | null => {
       const request = this.getPermissionRequest(id);
-      if (!request || request.status !== "pending") {
+      if (!request || !new PermissionRequestVO.Status(request.status).isPending()) {
         return null;
       }
 

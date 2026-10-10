@@ -1,5 +1,6 @@
 import type { InvokeToolResponse, PermissionListResponse, PermissionRequest, PublicRunSummary, SubsessionDelegation } from "../shared/types";
 import { RunVO } from "@/run/vo";
+import { PermissionRequestVO } from "@/permission-request/vo";
 import { ApiRequestError, requestJson, toErrorMessage } from "./api";
 
 export interface ChildActionView {
@@ -15,7 +16,7 @@ export function scopeChildPermissions(sessionId: string, parentRunId: string | n
   const related = children.filter((child) => child.parentSessionId === sessionId);
   const ownerRunId = parentRunId ?? [...related].sort((a,b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0]?.parentRunId ?? null;
   const owned = related.filter((child) => child.parentRunId === ownerRunId);
-  return {ownerRunId,children:owned,permissions:permissions.filter((p) => p.status === "pending" &&
+  return {ownerRunId,children:owned,permissions:permissions.filter((p) => new PermissionRequestVO.Status(p.status).isPending() &&
     owned.some((child) => child.childSessionId === p.sessionId && child.childRunId === p.runId))};
 }
 

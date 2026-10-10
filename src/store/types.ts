@@ -1,5 +1,6 @@
 import { RunType } from "@/run/type";
 import { MessageType } from "@/message/type";
+import { PermissionRequestType } from "@/permission-request/type";
 import type {
   AgentDefinition,
   ContextArtifact,
@@ -12,7 +13,6 @@ import type {
   MessagePartType,
   MessageRole,
   PermissionRequest,
-  PermissionRequestStatus,
   PermissionRiskLevel,
   Run,
   RunEvent,
@@ -175,7 +175,7 @@ export interface CreatePermissionRequestInput {
   executionInput: JsonObject;
   riskLevel: PermissionRiskLevel;
   reason: string;
-  status: PermissionRequestStatus;
+  status: PermissionRequestType.Status;
   toolCallPartId: string;
   commandOutputPartId?: string | null;
   metadata?: JsonObject;
@@ -200,7 +200,7 @@ export interface StoredPermissionRequest extends PermissionRequest {
 }
 
 export interface ListPermissionRequestsFilter {
-  status?: PermissionRequestStatus;
+  status?: PermissionRequestType.Status;
   sessionId?: string;
 }
 
@@ -338,7 +338,7 @@ export interface StoreAdapter {
   getPermissionRequest(id: string): StoredPermissionRequest | null;
   listPermissionRequests(filter?: ListPermissionRequestsFilter): StoredPermissionRequest[];
   /** Resolves only a pending request whose run is waiting, and atomically resumes that run. */
-  resolvePermissionRequest(id: string, status: Exclude<PermissionRequestStatus, "pending">, resolvedAt: ISODateString): StoredPermissionRequest | null;
+  resolvePermissionRequest(id: string, status: PermissionRequestType.ResolvedStatus, resolvedAt: ISODateString): StoredPermissionRequest | null;
 
   getDaemonLease(): DaemonLeaseRecord | null;
   createDaemonLease(input: DaemonLeaseRecord): boolean;

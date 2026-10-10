@@ -14,6 +14,7 @@
     "smoke:kernel": "tsx scripts/kernel-smoke.ts",
     "smoke:run-status": "tsx scripts/run-status-smoke.ts",
     "smoke:message-status": "tsx scripts/message-status-smoke.ts",
+    "smoke:permission-request-status": "tsx scripts/permission-request-status-smoke.ts",
     "smoke:agent-profiles": "tsx scripts/agent-profiles-smoke.ts",
     "smoke:context-budget": "tsx scripts/context-budget-smoke.ts",
     "smoke:context-compaction": "tsx scripts/context-compaction-smoke.ts",

@@ -128,7 +128,6 @@ import type {
   Message,
   MessagePart,
   PermissionRequest,
-  PermissionRequestStatus,
   PublicRunPhase,
   PublicRunSummary,
   ProviderResolution,
@@ -150,6 +149,8 @@ import type {
 import { RUN_CONSTANT } from "@/run/constant";
 import { RunVO } from "@/run/vo";
 import { MessageVO } from "@/message/vo";
+import { PermissionRequestType } from "@/permission-request/type";
+import { PermissionRequestVO } from "@/permission-request/vo";
 
 export interface StartRunOptions {
   agentId?: string;
@@ -1313,7 +1314,7 @@ export class Kernel {
   }
 
   listPermissionRequests(
-    status?: PermissionRequestStatus,
+    status?: PermissionRequestType.Status,
   ): PermissionRequest[] {
     return this.store
       .listPermissionRequests(status ? { status } : {})
@@ -1692,7 +1693,7 @@ export class Kernel {
       runId: request.runId,
       messageId: request.messageId,
       caller: request.caller,
-      status: request.status === "approved" ? "created" : "pending_permission",
+      status: new PermissionRequestVO.Status(request.status).isApproved() ? "created" : "pending_permission",
       permissionDecision: request.permissionDecision,
       input: request.publicInput,
       metadata: request.metadata,
@@ -2358,7 +2359,7 @@ export class Kernel {
     if (!request) {
       throw new KernelError("Permission request not found", 404);
     }
-    if (request.status !== "pending") {
+    if (!new PermissionRequestVO.Status(request.status).isPending()) {
       throw new KernelError(
         `Permission request is already ${request.status}.`,
         409,
